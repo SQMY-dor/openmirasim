@@ -18,8 +18,9 @@ pub struct StoredWorkspace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredWorktree {
     pub info: WorktreeInfo,
-    /// The worktree's private git admin dir (`<common>/worktrees/<name>`), recorded at
-    /// creation so the server never trusts the agent-writable `.git` file in the checkout.
+    /// The session's own git dir (`<root>/gitdirs/<key>`, or for checkouts made before
+    /// review P0-1 `<common>/worktrees/<name>`), recorded at creation so the server never
+    /// trusts the agent-writable `.git` file in the checkout.
     pub git_dir: Option<String>,
     /// Private HOME bound into the sandbox.
     pub home_path: Option<String>,
@@ -61,11 +62,36 @@ fn row_to_worktree(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredWorktree> {
 }
 
 impl Db {
-    /// Registers a repository. Names are unique per space.
+    /// Registers a repository. Names are unique per space, and a repository (its git
+    /// common dir) can be registered once across all spaces: two registrations sharing
+    /// or nesting git dirs would share refs and objects.
     pub async fn create_workspace(&self, ws: StoredWorkspace) -> CoreResult<StoredWorkspace> {
         self.write(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            {
+                let mut stmt = tx
+                    .prepare("SELECT git_common_dir FROM workspaces")
+                    .map_err(storage)?;
+                let existing = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(storage)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(storage)?;
+                let new_common = std::path::Path::new(&ws.git_common_dir);
+                for common in existing {
+                    let c = std::path::Path::new(&common);
+                    if c.starts_with(new_common) || new_common.starts_with(c) {
+                        return Err(CoreError::InvalidInput(
+                            "a workspace for this repository (or one sharing its git dir) already exists"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             let s = &ws.summary;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO workspaces (id, space_id, name, repo_path, git_common_dir,
                                          default_branch, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -81,15 +107,21 @@ impl Db {
             )
             .map_err(|e| match e {
                 rusqlite::Error::SqliteFailure(f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
                 {
                     CoreError::InvalidInput(format!(
                         "a workspace named `{}` already exists in this space",
                         ws.summary.name
                     ))
                 }
+                rusqlite::Error::SqliteFailure(f, _)
+                    if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+                {
+                    CoreError::NotFound(format!("space {}", ws.summary.space_id))
+                }
                 other => storage(other),
             })?;
+            tx.commit().map_err(storage)?;
             Ok(ws)
         })
         .await

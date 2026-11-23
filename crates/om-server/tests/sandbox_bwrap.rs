@@ -112,7 +112,7 @@ async fn namespaces_are_private() {
     let dir = tempfile::tempdir().unwrap();
     let script = "hostname 2>/dev/null || cat /proc/sys/kernel/hostname; \
                   ls /proc | grep -c '^[0-9]'; \
-                  grep -c ':' /proc/net/dev; \
+                  grep ':' /proc/net/dev | grep -vE '^ *(lo|sit0|tunl0|ip6tnl0|gre0|gretap0|erspan0|ip_vti0|ip6_vti0|ip6gre0):' | wc -l; \
                   if unshare -U true 2>/dev/null; then echo NESTED-USERNS; fi; true";
     let out = run(&sb, &worktree_spec(dir.path()), script, None).await;
     assert!(out.ok, "{}", out.stderr);
@@ -125,8 +125,8 @@ async fn namespaces_are_private() {
     );
     assert_eq!(
         lines[2].trim(),
-        "1",
-        "only loopback without network: {}",
+        "0",
+        "only loopback (and the kernel's default tunnel devices) without network: {}",
         out.stdout
     );
     assert!(!out.stdout.contains("NESTED-USERNS"));

@@ -81,6 +81,9 @@ pub struct BwrapConfig {
     /// Defaults applied when a [`SandboxSpec`] sets no limit of its own.
     pub default_limits: ResourceLimits,
     pub hostname: String,
+    /// Size cap for the sandbox's `/tmp` and `/run` tmpfs (bubblewrap >= 0.9's
+    /// `--size`). [`BwrapSandbox::probe`] turns this off if unsupported.
+    pub tmpfs_size_bytes: Option<u64>,
 }
 
 impl Default for BwrapConfig {
@@ -97,6 +100,7 @@ impl Default for BwrapConfig {
             disable_nested_userns: true,
             default_limits: ResourceLimits::default(),
             hostname: "om-sandbox".into(),
+            tmpfs_size_bytes: Some(1 << 30),
         }
     }
 }
@@ -144,6 +148,11 @@ impl BwrapSandbox {
             Ok(()) => return Ok(self),
             Err(e) => e,
         };
+        if self.config.tmpfs_size_bytes.is_some() && err.contains("--size") {
+            self.config.tmpfs_size_bytes = None;
+            tracing::warn!("bubblewrap lacks --size; the sandbox tmpfs is not size-capped");
+            return Box::pin(self.probe()).await;
+        }
         if self.config.disable_nested_userns && err.contains("disable-userns") {
             self.config.disable_nested_userns = false;
             if run(attempt(&self)?).await.is_ok() {
@@ -195,10 +204,14 @@ impl BwrapSandbox {
     }
 
     fn is_covered(&self, path: &Path, extra: &[PathBuf]) -> bool {
+        let Some(path) = lexical(path) else {
+            return false;
+        };
         self.config
             .system_paths
             .iter()
             .chain(extra)
+            .filter_map(|root| lexical(root))
             .any(|root| path.starts_with(root))
     }
 
@@ -246,6 +259,53 @@ impl BwrapSandbox {
         a.push("--".into());
         Ok(a)
     }
+}
+
+/// Lexically resolves `.` and `..` in an absolute path; `None` if it climbs above `/`.
+fn lexical(p: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::RootDir | Component::Prefix(_) => out.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() || out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    Some(out)
+}
+
+/// What to bind so `program` can run: the resolved file itself and, for a script
+/// installed as an npm package (`.../node_modules/<pkg>/...`), that package's directory.
+/// Never the program's whole parent directory (e.g. all of `~/.local/bin`).
+fn program_binds(program: &Path) -> Vec<PathBuf> {
+    let real = program
+        .canonicalize()
+        .unwrap_or_else(|_| program.to_path_buf());
+    let mut binds = vec![real.clone()];
+    let comps: Vec<_> = real.components().collect();
+    if let Some(i) = comps.iter().rposition(|c| c.as_os_str() == "node_modules") {
+        let mut end = i + 2;
+        if comps
+            .get(i + 1)
+            .is_some_and(|c| c.as_os_str().to_string_lossy().starts_with('@'))
+        {
+            end += 1;
+        }
+        if end < comps.len() {
+            binds = vec![comps[..end].iter().collect()];
+        }
+    }
+    if real != program {
+        // Keep the name the agent was configured with resolvable too.
+        binds.push(program.to_path_buf());
+    }
+    binds
 }
 
 fn absolute(p: &Path, what: &str) -> CoreResult<String> {
@@ -303,12 +363,12 @@ impl Sandbox for BwrapSandbox {
             "--dev".into(),
             "/dev".into(),
         ]);
-        args.extend([
-            "--tmpfs".into(),
-            "/tmp".into(),
-            "--tmpfs".into(),
-            "/run".into(),
-        ]);
+        for dir in ["/tmp", "/run"] {
+            if let Some(size) = self.config.tmpfs_size_bytes {
+                args.extend(["--size".into(), size.to_string()]);
+            }
+            args.extend(["--tmpfs".into(), dir.into()]);
+        }
         self.system_binds(&mut args);
 
         // Environment: explicit allowlist, never the server's full environment.
@@ -349,10 +409,26 @@ impl Sandbox for BwrapSandbox {
         };
         // Read-only paths go last so they can overlay parts of writable binds
         // (e.g. `.git/config` inside a writable `.git`).
+        // Explicit read-only paths are bound with `--ro-bind` (fail closed), never
+        // `--ro-bind-try`.
         for p in &spec.readonly_paths {
             let s = absolute(p, "read-only path")?;
+            if std::fs::symlink_metadata(p).is_err() {
+                // Nothing to expose; but an overlay meant to protect part of a writable
+                // bind must exist, or the path underneath would stay writable.
+                if spec.writable_paths.iter().any(|w| {
+                    lexical(p)
+                        .zip(lexical(w))
+                        .is_some_and(|(p, w)| p.starts_with(w))
+                }) {
+                    return Err(CoreError::Sandbox(format!(
+                        "read-only overlay does not exist: {s}"
+                    )));
+                }
+                continue;
+            }
             if seen.insert(s.clone()) {
-                args.extend(["--ro-bind-try".into(), s.clone(), s]);
+                args.extend(["--ro-bind".into(), s.clone(), s]);
                 exposed.push(p.clone());
             }
         }
@@ -362,11 +438,13 @@ impl Sandbox for BwrapSandbox {
         // Make sure the agent binary itself is visible.
         let program = self.resolve_program(&cmd.program, env.get("PATH").map(String::as_str))?;
         if !self.is_covered(&program, &exposed) {
-            let dir = program
-                .parent()
-                .ok_or_else(|| CoreError::Sandbox("program has no parent directory".into()))?;
-            let d = dir.to_string_lossy().into_owned();
-            args.extend(["--ro-bind".into(), d.clone(), d]);
+            for b in program_binds(&program) {
+                if !self.is_covered(&b, &exposed) {
+                    let d = b.to_string_lossy().into_owned();
+                    args.extend(["--ro-bind".into(), d.clone(), d]);
+                    exposed.push(b);
+                }
+            }
         }
 
         if let Some(cwd) = &cmd.cwd {
@@ -378,11 +456,24 @@ impl Sandbox for BwrapSandbox {
             }
             args.extend(["--chdir".into(), s]);
         }
+        let mut full = self.cgroup_prefix(&spec.limits)?;
+        // `systemd-run --user` needs the user manager's runtime dir and bus; hand them to
+        // systemd-run but strip them before the agent starts.
+        if !full.is_empty() && self.config.cgroups == CgroupMode::SystemdUserScope {
+            for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+                if env.contains_key(key) {
+                    continue;
+                }
+                if let Ok(v) = std::env::var(key) {
+                    env.insert(key.into(), v);
+                    args.extend(["--unsetenv".into(), key.into()]);
+                }
+            }
+        }
         args.push("--".into());
         args.push(program.to_string_lossy().into_owned());
         args.extend(cmd.args);
 
-        let mut full = self.cgroup_prefix(&spec.limits)?;
         let bwrap = self.config.bwrap_path.to_string_lossy().into_owned();
         let program = if full.is_empty() {
             bwrap
