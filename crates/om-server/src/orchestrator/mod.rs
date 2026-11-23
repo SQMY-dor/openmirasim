@@ -18,6 +18,7 @@ mod hub;
 pub use hub::Subscription;
 
 use crate::db::Db;
+pub use crate::harness::HarnessRegistry;
 use actor::{ActorSpec, Command};
 use hub::EventHub;
 use om_core::approval::{ApprovalDecision, ApprovalRecord};
@@ -31,35 +32,6 @@ use om_core::{CoreError, CoreResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
-
-/// Registered harnesses, keyed by [`Harness::id`].
-#[derive(Default, Clone)]
-pub struct HarnessRegistry {
-    harnesses: HashMap<String, Arc<dyn Harness>>,
-}
-
-impl HarnessRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers (or replaces) a harness under its id.
-    pub fn register(&mut self, harness: Arc<dyn Harness>) -> &mut Self {
-        self.harnesses.insert(harness.id().to_owned(), harness);
-        self
-    }
-
-    pub fn get(&self, id: &str) -> Option<Arc<dyn Harness>> {
-        self.harnesses.get(id).cloned()
-    }
-
-    /// Registered ids, sorted.
-    pub fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<_> = self.harnesses.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-}
 
 /// Orchestrator settings.
 #[derive(Debug, Clone)]
@@ -90,7 +62,7 @@ type Live = Arc<Mutex<HashMap<SessionId, mpsc::Sender<Command>>>>;
 pub struct Orchestrator {
     db: Db,
     hub: Arc<EventHub>,
-    registry: Arc<HarnessRegistry>,
+    registry: HarnessRegistry,
     config: OrchestratorConfig,
     live: Live,
 }
@@ -100,7 +72,7 @@ impl Orchestrator {
         Self {
             db,
             hub: Arc::new(EventHub::new(config.broadcast_capacity)),
-            registry: Arc::new(registry),
+            registry,
             config,
             live: Live::default(),
         }
@@ -110,8 +82,9 @@ impl Orchestrator {
         &self.db
     }
 
-    pub fn harness_ids(&self) -> Vec<String> {
-        self.registry.ids()
+    /// The harness registry (for listing available harnesses).
+    pub fn registry(&self) -> &HarnessRegistry {
+        &self.registry
     }
 
     /// Marks sessions left live by a previous process as `Failed`. Call once at startup,
@@ -134,9 +107,7 @@ impl Orchestrator {
     }
 
     fn harness_for(&self, id: &str) -> CoreResult<Arc<dyn Harness>> {
-        self.registry
-            .get(id)
-            .ok_or_else(|| CoreError::NotFound(format!("harness `{id}`")))
+        self.registry.require(id)
     }
 
     fn spawn_actor(&self, spec: ActorSpec) {
