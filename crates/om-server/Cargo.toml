@@ -1,0 +1,10 @@
+[package]
+name = "om-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux bare-metal central server for OpenMirasim"
+
+[dependencies]
+om-core.workspace = true

@@ -1,22 +1,20 @@
 # OpenMirasim 系统架构设计
 
-本文档定义 OpenMirasim 的总体架构、核心领域模型、通信协议、存储与安全边界以及 Monorepo 结构规划。项目定位为**以单台服务器为中心的团队协作式 C/S 架构跨平台 AI Agent 工作台**，借鉴 Mirasim 的多 Agent 并发编排、多端无缝接续与脚本化控制体验，并面向开源自托管团队场景进行重构。
+本文档定义 OpenMirasim 的总体架构、核心领域模型、通信协议、Agent 接入策略、Linux 裸金属沙箱安全边界以及 Monorepo 结构规划。已吸纳 [`design-review.md`](design-review.md) 中全部评审决议（R1–R7）。
 
 ---
 
-## 1. 设计目标与架构原则
+## 1. 目标定位与设计约束
 
-1. **Single-Server-Centric（单机中心化）**
-   - 所有长期运行的状态（Agent 会话、PTY 进程、Git Worktree、文件变更、事件流、团队聊天与定时任务）全部驻留在中心服务器。
-   - 任意客户端关闭、休眠或切网都不会中断 Agent 执行；任意端重新连接即可从事件流恢复完整上下文（Zero Context Loss）。
-2. **Team-First Multiplayer（原生团队协作）**
-   - 以 **Team Space** 为协作边界，支持多成员共享工作区、实时观察同一会话输出、向运行中的会话排队/插队指令（Queue & Steer）以及协同审批高危操作。
-3. **Thin & Consistent Clients（轻量一致的多端形态）**
-   - 桌面端（Tauri v2）、Web 工作台、移动端（Tauri v2 Mobile）共享同一套 React/TypeScript UI 与状态同步协议；CLI/TUI 通过同一服务端 API 提供完整自动化与运维能力。
-4. **Protocol-First（协议先行）**
-   - 使用 Protobuf + Buf 定义控制面与事件流契约，为 Rust 服务端、Tauri Core、CLI 与 TypeScript 前端生成强类型接口。
-5. **Harness & Model Agnostic（Agent 与模型无关）**
-   - 通过统一的 Harness 适配层兼容外部 CLI Agent（如 Claude Code、Codex、OpenCode 等）与原生 LLM API Agent，支持团队统一路由或个人 BYOK 凭证隔离。
+- **核心定位**：以**单台 Linux 裸金属服务器**为核心的团队协作式 C/S 架构跨平台 AI Agent 工作台（借鉴 Mirasim 的多 Agent 编排、断线续传与脚本化控制理念）。
+- **团队规模**：面向 **30 人以内**团队自托管场景。
+- **服务端平台**：**仅支持 Linux**（充分利用 `bubblewrap`、cgroups v2、POSIX PTY 与 Unix Domain Socket）。
+- **架构原则**：
+  1. **Single-Server-Centric**：所有会话、Worktree、Agent 进程、事件流与审计记录驻留中心服务器，客户端无状态且可随时通过 `last_seq` 追平恢复。
+  2. **Vertical Slice First**：先以 Phase 0 跑通单 Agent + Web 闭环，再逐层叠加沙箱、团队协作、多端壳与生态扩展。
+  3. **Rust Single Source of Truth**：Phase 0–2 采用 Axum REST + WebSocket，由 `om-core` 的 Rust 类型经 `ts-rs` 导出 TypeScript 契约，避免过早引入双传输栈。
+  4. **Structured Agent Protocol First**：优先使用 **ACP（Agent Client Protocol）** 接入 Agent，次选各 CLI 的 `stream-json`，PTY 仅作原生终端视图与兜底；GUI 类 Agent（Antigravity GUI）通过独立外置桥接进程接入，不污染核心服务端。
+  5. **Defense in Depth**：Git Worktree 负责代码隔离，Linux 沙箱（`bwrap` + cgroups v2）负责进程/文件/资源隔离，BYOK + 宿主机鉴权代理负责凭证安全。
 
 ---
 
@@ -25,52 +23,53 @@
 ```mermaid
 flowchart TB
     subgraph Clients["跨平台客户端（无状态 / 轻量缓存）"]
-        Desktop["Desktop App · Tauri v2 + React/TS (macOS / Windows / Linux)"]
-        Mobile["Mobile App · Tauri v2 Mobile (Android / iOS)"]
-        Web["Web Workbench · React/TS SPA (浏览器直连)"]
-        CLI["CLI / TUI · Rust + Clap + Ratatui (终端与脚本控制)"]
+        Web["Web Workbench & PWA · React + TS + Vite (桌面浏览器 / 移动端 Web Push)"]
+        Desktop["Desktop Thin Shell · Tauri v2 (Phase 3 · 托盘 / Keychain / 通知 / 多服切换)"]
+        CLI["CLI & TUI · om-cli (serve / ctl JSON 控制面 / Ratatui TUI)"]
     end
 
-    subgraph Transport["统一接入层（TLS / Token Auth）"]
-        Gateway["API Gateway · Axum HTTP/WS + Tonic gRPC (静态前端 / 事件流 / PTY 流)"]
+    subgraph Transport["统一接入层（Axum · TLS / Token Auth）"]
+        API["Axum Gateway · REST 控制面 + /ws/events (JSON 文本帧) + /ws/pty/:id (Binary 帧) + 静态 Web 托管"]
     end
 
-    subgraph Server["单台中心服务器（openmirasim-server）"]
-        Auth["Auth & RBAC · 成员 / 角色 / 设备配对"]
-        SpaceMgr["Team Space & Presence · 空间 / 共享会话 / 在线协作"]
-        Orchestrator["Session Orchestrator · 并发调度 / Queue & Steer / 分支重跑 / 审批门控"]
-        HarnessMgr["Agent Harness & PTY Manager · CLI Agent (PTY) / LLM / MCP Hub / Skills"]
-        WorkspaceMgr["Workspace & Git Engine · 仓库管理 / Git Worktree 隔离 / 文件与 Diff API"]
-        Automation["Scheduler & Rules · 定时触发 / 目标循环 / Webhook"]
-        ModelRouter["Model & Quota Router · BYOK Provider / 团队额度 / 用量统计"]
+    subgraph Server["单台 Linux 裸金属中心服务器（om-server）"]
+        Auth["Auth & RBAC · 30 人团队成员 / 角色 / 设备 Token / 审计"]
+        Orchestrator["Session Orchestrator · 单会话 Tokio Actor / seq 分配 / Queue & Steer / 审批状态机"]
+        WorkspaceMgr["Workspace & Git Worktree · 仓库注册 / 分支隔离 / 文件与 Diff"]
+        Sandbox["Linux Execution Sandbox · bubblewrap (bwrap) + systemd-run (cgroups v2)"]
+        KeyProxy["Host Auth Proxy (Phase 2) · 宿主机注入 BYOK Key / 沙箱仅持短期 Token"]
+        HarnessLayer["Harness Trait 适配层 · AcpHarness (opencode/dsh/cc/codexcli) / StreamJson / Pty / External Bridge"]
+    end
+
+    subgraph ExternalAgents["隔离执行的 Agent 进程"]
+        CliAgents["无头 CLI / ACP Agent · opencode / dsh / cc / codexcli (运行于 bwrap 沙箱内)"]
+        GuiBridge["独立外置 om-gui-bridge (Phase 2) · Xvfb + 独立用户 Profile + Antigravity GUI + 可选 noVNC"]
     end
 
     subgraph Storage["单机持久化层"]
-        SQLite[("SQLite (WAL) · 元数据 / 会话索引 / 权限 / 统计")]
-        EventLog[("Event & Transcript Store · 追加式会话事件流 / 增量快照 / 审计回放")]
+        SQLite[("SQLite WAL (rusqlite + 单写线程) · spaces / sessions / events(session_id, seq) / approvals / audit")]
+        CastFiles[("Asciicast v2 (.cast) · PTY 原始字节流录制与回放索引")]
         FS[("Server Filesystem · Git Worktrees / Skills / Artifacts")]
     end
 
-    Desktop <-->|"gRPC / WS"| Gateway
-    Mobile <-->|"gRPC / WS"| Gateway
-    Web <-->|"HTTP / WS"| Gateway
-    CLI <-->|"gRPC / Unix Socket"| Gateway
+    Web <-->|"HTTPS / WSS"| API
+    Desktop <-->|"HTTPS / WSS"| API
+    CLI <-->|"HTTP / WS / Unix Socket"| API
 
-    Gateway --> Auth
-    Gateway --> SpaceMgr
-    Gateway --> Orchestrator
-    Gateway --> WorkspaceMgr
+    API --> Auth
+    API --> Orchestrator
+    API --> WorkspaceMgr
 
-    Orchestrator --> HarnessMgr
+    Orchestrator --> HarnessLayer
     Orchestrator --> WorkspaceMgr
-    Orchestrator --> ModelRouter
-    Automation --> Orchestrator
+    HarnessLayer --> Sandbox
+    Sandbox --> CliAgents
+    HarnessLayer -.->|"ACP / Bridge + remote_screen_url"| GuiBridge
+    CliAgents -.->|"BYOK API"| KeyProxy
 
     Auth --> SQLite
-    SpaceMgr --> SQLite
     Orchestrator --> SQLite
-    Orchestrator --> EventLog
-    HarnessMgr --> FS
+    HarnessLayer --> CastFiles
     WorkspaceMgr --> FS
 ```
 
@@ -83,115 +82,129 @@ erDiagram
     SPACE ||--o{ MEMBER : has
     SPACE ||--o{ WORKSPACE : contains
     SPACE ||--o{ SESSION : hosts
-    SPACE ||--o{ AUTOMATION : schedules
     WORKSPACE ||--o{ WORKTREE : isolates
     SESSION }o--|| WORKSPACE : binds
     SESSION }o--o| WORKTREE : runs_in
-    SESSION ||--o{ TURN : executes
+    SESSION ||--o{ SESSION_EVENT : appends
     SESSION ||--o{ QUEUED_PROMPT : buffers
     SESSION ||--o{ APPROVAL_REQUEST : gates
-    SESSION ||--o{ SESSION_EVENT : appends
-    MEMBER ||--o{ TURN : submits
+    SESSION ||--o| PTY_RECORDING : records
     MEMBER ||--o{ APPROVAL_REQUEST : resolves
 ```
 
-- **Space（团队空间）**：租户与协作边界，包含成员列表、共享工作区、全局 Skills/MCP 配置、默认模型策略与团队公告/聊天频道。
-- **Workspace（工作区）**：服务端本地注册的代码仓库或目录，对外暴露受控文件浏览、搜索与 Git 状态/Diff 接口。
-- **Worktree（隔离分支工作树）**：每个并行 Agent 会话可绑定独立 Git Worktree，避免多个 Agent 并发修改同一目录导致冲突，支持分支对比与一键合并/清理。
-- **Session（会话）**：一次持续演进的 Agent 任务线程，包含绑定的 Harness/模型配置、所属工作区、父子分支关系（支持从任意历史 Turn 分叉重跑）以及关联的 PTY 实例。
-- **Queue & Steer（指令队列与实时转向）**：成员在 Agent 运行中可追加待执行指令（Queue），也可执行插队（Jump）、撤回（Recall）或将消息即时注入当前 Turn（Steer）。
-- **Approval Request（审批请求）**：当 Agent 请求执行高危命令、越界写文件或调用受限 MCP 工具时，服务端挂起该步骤并向在线成员（含手机端）广播审批卡片，支持原子化抢占审批与审计留痕。
-- **Event Stream（统一事件流）**：每个会话拥有单调递增序号（`seq`）的事件流（消息分片、工具调用、PTY 帧、状态变更、审批结果），客户端断线重连只需携带 `last_seq` 即可增量追平。
+- **Space（团队空间）**：团队协作与权限边界（面向 <=30 人团队），挂载共享工作区、全局策略与成员列表。
+- **Workspace & Worktree**：注册在 Linux 服务器上的代码仓库；并行会话各自运行在独立 Git Worktree 中避免代码冲突。
+- **Session & Event Stream**：
+  - 每个会话由独立 Tokio Actor 维护状态机（`Idle -> Running -> WaitingApproval -> Settled / Failed / Cancelled`）。
+  - 结构化事件统一写入 SQLite `events(session_id, seq, ts, type, payload)`（复合主键 `(session_id, seq)`），由 Actor 在内存中单调递增 `seq` 并经单写线程落盘后广播。
+  - 客户端重连只需提交 `last_seq`，服务端先顺序补发缺失区间，再无缝切换到实时 broadcast 流。
+- **Approval Request（审批门控）**：当 Agent 请求执行越界写文件、高危命令或受限工具时，服务端挂起该调用并推送审批事件；成员在 Web / PWA 手机端 / CLI 审批后，通过原子状态转换防止重复审批并将结果回传给 Harness。
+- **Queue & Steer**：成员可在运行中追加指令队列、插队或即时转向（Steer）；对不支持原生 Steer 的 Agent，由 Orchestrator 根据 `HarnessCapabilities` 自动降级为排队或取消重发。
 
 ---
 
-## 4. 服务端核心子系统
+## 4. 协议与传输设计（Phase 0–2）
 
-### 4.1 接入与传输层（`openmirasim-server`）
-- 单进程监听统一端口（默认 HTTPS/HTTP + WebSocket，并支持 gRPC 复用或独立监听端口，本地 CLI 亦支持 Unix Domain Socket）。
-- 同时托管编译后的前端 Web 工作台静态资源，部署单二进制即可开箱使用。
-
-### 4.2 会话编排引擎（Session Orchestrator）
-- 每个活跃会话由独立的 Tokio Actor 管理，串行化状态机转换（`Idle -> Running -> WaitingApproval -> Settled / Failed / Cancelled`），避免并发竞态。
-- 支持 **Session Messaging**：允许协调者 Agent（或成员）向子会话派发任务、读取摘要、汇总多路并行结果。
-
-### 4.3 Agent Harness 与 PTY 运行时
-- **PTY Runtime**：基于 Rust 异步 PTY 管理真实终端会话（如 `claude`、`codex`、`bash`），支持窗口大小调整（Resize）、ANSI 环形缓冲区回放以及聊天视图与原生 TUI 视图双模式切换。
-- **MCP Hub & Skills Registry**：在 Space 与 Workspace 两级统一管理 MCP Server 生命周期、健康检查与 Skill 分发。
-- **Model & Account Router**：支持统一配置上游 Provider（Anthropic / OpenAI / Gemini / OpenAI-Compatible / 本地 Ollama 等），按团队或个人绑定配额，并记录不含敏感内容的调用耗时与 Token 统计。
-
-### 4.4 存储与容错
-- **SQLite（WAL 模式）**：单文件零外部数据库依赖，配合连接池与受控写串行队列满足中小团队单机高并发读写。
-- **Event / Transcript Log**：采用按会话分段的追加式日志或 WAL 表结构保存高吞吐流式事件，支持全文检索（SQLite FTS5）与会话导出。
-- **进程恢复**：服务端重启时自动检测孤立会话并标记为可恢复状态，支持按 Harness 原生 Session ID 执行 `resume`。
+- **单一传输栈**：仅使用 Axum 提供：
+  - **REST API**：会话/空间/工作区 CRUD、历史事件分页、文件树与 Git Diff、审批提交、配置读写。
+  - **`/ws/events`（JSON Text Frame）**：带标签的统一事件流（`#[serde(tag = "type")]`），携带 `session_id` 与单调 `seq`，便于抓包、调试和脚本消费。
+  - **`/ws/pty/:session_id`（Binary Frame，Phase 3）**：独立的 PTY 终端字节流与窗口 Resize 控制通道，避免大输出刷屏阻塞聊天与审批事件。
+- **单一类型事实源**：在 `crates/om-core` 中定义所有请求/响应与事件 Rust struct/enum，使用 **`ts-rs`** 自动导出 TypeScript 类型文件并在 CI 校验同步；`om-cli` 直接依赖 `om-core` 零开销复用。
+- **远期扩展**：仅在 Phase 4+ 确有第三方多语言 SDK 需求时，再按需评估引入 Protobuf/gRPC。
 
 ---
 
-## 5. 客户端架构
+## 5. Agent Harness 抽象与多 Agent 接入
 
-### 5.1 共享 Web UI（React + TypeScript）
-- 单一前端代码库同时编译为：
-  1. 中心服务器内嵌的 **Web Workbench**；
-  2. **Tauri v2 Desktop** 渲染层（多窗格分屏、命令面板、Diff 查看器、xterm.js 终端面板）；
-  3. **Tauri v2 Mobile** 移动端适配视图（会话列表、流式对话、推送通知与快捷审批）。
-- 状态层通过统一客户端 SDK 订阅中心服务器的事件流（`last_seq` 断点续传），不依赖本地直接持有业务真相数据。
+### 5.1 统一 `Harness` Trait（位于 `om-core`）
 
-### 5.2 Tauri v2 原生壳
-- **Desktop**：负责系统托盘、本地安全凭证存储（OS Keychain）、原生通知、全局快捷键、离线/多服务器 Profile 切换以及可选的本地目录同步辅助。
-- **Mobile（Android / iOS）**：基于 Tauri v2 Mobile + Rust 原生连接层，支持扫码配对中心服务器、后台断线重连与实时审批交互。
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessCapabilities {
+    pub native_approval: bool,
+    pub steer: bool,
+    pub resume: bool,
+    pub structured_tools: bool,
+    pub pty_attach: bool,
+    pub remote_screen: bool,
+}
 
-### 5.3 CLI / TUI（`openmirasim`）
-- `openmirasim serve`：启动或托管中心服务器。
-- `openmirasim attach / tui`：终端内多会话 TUI 工作台，支持直接切入任意会话 PTY。
-- `openmirasim ctl`（借鉴 `ui-cli`）：面向脚本与 Agent 的纯 JSON 控制面命令（查看状态、发起 Prompt、操作队列、审批、声明式配置 `config get/set/apply`），便于自动化测试与 Agent 编排。
+#[async_trait]
+pub trait Harness: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn capabilities(&self) -> HarnessCapabilities;
+    async fn start(&self, cfg: SessionConfig) -> Result<SessionHandle>;
+    async fn send(&self, h: &SessionHandle, prompt: Prompt) -> Result<()>;
+    async fn steer(&self, h: &SessionHandle, msg: Prompt) -> Result<()>;
+    async fn respond_approval(&self, h: &SessionHandle, req_id: &str, decision: ApprovalDecision) -> Result<()>;
+    async fn cancel(&self, h: &SessionHandle) -> Result<()>;
+    async fn resume(&self, cfg: SessionConfig, native_session_id: &str) -> Result<SessionHandle>;
+    fn events(&self, h: &SessionHandle) -> BoxStream<'static, HarnessEvent>;
+}
+```
+
+### 5.2 分层接入优先级
+
+1. **ACP（Agent Client Protocol，首选）**：
+   - **`opencode`**（原生 `opencode acp`）— **Phase 0 首个接入标杆**。
+   - **`dsh`**（DeepSeek Harness，原生 `dsh --profile acp` / 社区 `dsh-acp`）— Phase 1。
+   - **`cc`**（Claude Code，通过 ACP 适配器接入；`--output-format stream-json` 作为备选）— Phase 1。
+   - **`codexcli`**（OpenAI Codex CLI，通过 ACP 适配器或 `codex app-server` / `codex exec --json` 接入）— Phase 1。
+2. **结构化 JSON 流（次选）**：对尚未完善 ACP 支持的 CLI 版本，通过 `StreamJsonHarness` 解析结构化事件。
+3. **PTY（兜底与原生终端视图，Phase 3）**：基于 `portable-pty` 承载原生 TUI 交互与不支持结构化协议的工具，原始字节流走内存环形缓冲 + asciicast v2（`.cast`）文件。
+4. **Antigravity GUI（独立外置桥接进程 `om-gui-bridge`，Phase 2）**：
+   - 不将 Xvfb/GUI 依赖引入 `om-server` 主干，而是作为独立外部进程通过 ACP/桥接协议接入 `HarnessLayer`，并声明 `structured_tools: false`、`remote_screen: true`。
+   - 运行约束：Linux `Xvfb` 虚拟显示 + **每成员独立 Linux 用户/Profile 隔离**（禁止共享单人登录态，不绕过登录校验/CAPTCHA）+ 按需拉起、空闲自动休眠与单机最大并发实例配额 + 前端提供“消息转发 + 一键切入 noVNC 画面接管”双视图。
 
 ---
 
-## 6. 安全与团队权限模型
+## 6. Linux 裸金属安全与存储架构
 
-- **传输安全**：建议反向代理（Caddy/Nginx/Tailscale）或内置 TLS 终止；移动端与桌面端支持一次性配对码 / Token 签发与设备吊销。
-- **RBAC 角色**：
-  - `Owner`：空间设置、成员与 Provider 密钥管理、全部工作区权限。
-  - `Admin`：注册工作区、配置 MCP/Skills、管理自动化任务。
-  - `Member`：创建与协作会话、提交代码与审批自己/授权范围内的工具调用。
-  - `Viewer`：只读观察会话、日志与 Diff。
-- **凭证隔离**：上游模型 API Key 与账号 Token 仅保存在服务端加密存储中，不下发到客户端配置文件或前端状态树。
-- **操作门控**：命令执行与文件写入支持策略分级（自动放行 / 需人工审批 / 禁止），并与 Git Worktree 边界结合降低误操作半径。
+### 6.1 执行沙箱与凭证安全
+- **Phase 0（单人开发/本机验证）**：允许显式声明的 `Direct` 模式快速验证主干。
+- **Phase 1（团队可用基线）**：基于 Linux 裸金属原生能力实现 **`bubblewrap` (`bwrap`) + `systemd-run`/cgroups v2** 沙箱：
+  - 仅将当前会话对应的 Git Worktree 目录以可写方式 bind-mount 进沙箱，宿主机敏感路径不可见；
+  - 通过 cgroups v2 限制单会话 CPU、内存与进程数（防止 fork bomb 或失控编译拖垮宿主机）；
+  - 可配置网络命名空间与出口策略；
+  - 审批联动：沙箱工作树内普通读写可按策略自动放行，越界操作/危险命令挂起触发 `ApprovalRequest`。
+- **凭证合规与隔离（Phase 2 增强）**：
+  - 团队默认采用 **BYOK**（个人或团队 API Key），开源项目不提供共享订阅反代能力。
+  - 宿主机运行本地 HTTP 鉴权代理，沙箱内进程仅持有短期 `session_token` 与本地代理地址，真实上游 API Key 永不进入沙箱环境变量，也不得写入事件流与日志。
+
+### 6.2 存储设计（`rusqlite` + `.cast`）
+- **SQLite（WAL 模式）**：采用 **`rusqlite`** + 专用单写线程（通过 `mpsc` / `oneshot` 串行化写入，避免多线程写锁争用）+ 读连接池，无需独立数据库或独立 Event Log 服务。
+- **核心表结构**：`spaces`、`members`、`workspaces`、`sessions`、`events(session_id, seq, ts, type, payload)`（复合主键 `(session_id, seq)`）、`approvals`、`pty_recordings`、`audit_logs`。
+- **PTY 原始输出**：不进 SQLite，采用内存环形缓冲供在线客户端快速重连，同时追加写入按会话切分的 **asciicast v2（`.cast`）** 文件，SQLite 仅保存文件路径、大小与时间索引。
 
 ---
 
-## 7. 规划的 Monorepo 目录结构
+## 7. Monorepo 目录结构（先收敛，后按需拆分）
 
 ```text
 openmirasim/
-├── proto/                        # Protobuf 契约定义与 buf.yaml / buf.gen.yaml
-│   └── openmirasim/v1/
-├── crates/                       # Rust Workspace
-│   ├── om-proto/                 # 由 proto/ 生成的 Rust/Tonic 类型与服务定义
-│   ├── om-core/                  # 领域模型、错误定义、权限策略、配置树
-│   ├── om-storage/               # SQLite (WAL) 迁移、仓储与 FTS5 检索
-│   ├── om-runtime/               # PTY 管理、Agent Harness 适配、Git Worktree、MCP Hub
-│   ├── om-server/                # 中心服务端二进制（Axum + Tonic + 静态资源托管）
-│   └── om-cli/                   # CLI / TUI / 脚本化控制面客户端
+├── .agents/environment.json      # 云端开发环境入口（调用 setup-env.sh --cloud）
+├── .cargo/config.toml            # 仓库级 Linux x86_64 lld 链接加速配置
+├── .github/workflows/ci.yml      # 最小 CI（fmt / clippy / test / web typecheck）
+├── rust-toolchain.toml           # 固定 Rust 工具链与组件
+├── Cargo.toml                    # Rust Workspace（先收敛为 3 个核心 crate）
+├── package.json                  # pnpm Workspace 根配置（固定 engines & packageManager）
+├── pnpm-workspace.yaml
+├── crates/
+│   ├── om-core/                  # 领域模型、事件契约（ts-rs）、Harness/Sandbox Trait、错误与配置
+│   ├── om-server/                # Linux 中心服务端（db / acp / orchestrator / sandbox / api / harness）
+│   └── om-cli/                   # CLI（serve / ctl JSON 控制面）与 Phase 3 Ratatui TUI
 ├── apps/
-│   ├── web/                      # 共享 React + TypeScript + Vite 前端工作台
-│   └── tauri/                    # Tauri v2 跨平台客户端壳（Desktop + Android/iOS）
-│       └── src-tauri/
-├── packages/
-│   └── sdk-ts/                   # 由 proto/ 生成的 TypeScript 客户端 SDK 与事件流封装
-├── docs/
-│   ├── architecture.md           # 本文档
-│   └── tech-stack.md             # 技术栈与构建环境说明
-├── Cargo.toml                    # Rust Workspace 根清单
-├── package.json                  # pnpm Workspace 根清单
-└── pnpm-workspace.yaml
+│   ├── web/                      # 共享 React + TypeScript + Vite 前端工作台（含 Phase 2 PWA）
+│   └── tauri/                    # Phase 3 引入：Tauri v2 桌面薄壳
+├── scripts/
+│   └── setup-env.sh              # 幂等环境初始化脚本（支持 --cloud / --desktop / --android）
+├── tests/
+│   └── e2e/                      # Playwright 与端到端集成测试
+└── docs/
+    ├── architecture.md           # 本文档
+    ├── tech-stack.md             # 技术栈与构建环境规范
+    ├── design-review.md          # 架构评审与决议记录
+    └── roadmap.md                # 分阶段 Demo 验收清单与双 Agent 协作分工
 ```
 
----
-
-## 8. 分阶段演进路线
-
-- **Phase 1 — 单机核心闭环（MVP）**：`om-proto` 契约 + `om-server`（SQLite WAL + 单/多会话 PTY + 1~2 个主流 CLI Agent Harness）+ Web 工作台 + 基础 CLI。
-- **Phase 2 — 团队协作与隔离**：RBAC 成员体系、Team Space 在线协作、Queue & Steer、Git Worktree 并发隔离、审批流与 Diff 视图。
-- **Phase 3 — 全平台客户端**：Tauri v2 Desktop 多窗格工作台、Tauri v2 Android 客户端配对与移动审批、Ratatui TUI 与 `ctl` 声明式控制面。
-- **Phase 4 — 编排与生态扩展**：MCP Hub、Skills 仓库、定时任务与目标驱动循环（Schedules & Goals）、Session-to-Session 协同。
+> 当 `om-server` 内模块体量增长并形成稳定边界后，再按需拆分出独立 crate（如 `om-storage`、`om-runtime`）及独立外置桥接进程（如 `om-gui-bridge`）。
