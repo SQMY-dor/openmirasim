@@ -259,11 +259,11 @@ async fn resolve_approval(
 
 #[derive(Serialize)]
 struct ListHarnessesResponse {
-    harnesses: Vec<String>,
+    harnesses: Vec<crate::harness::HarnessDescriptor>,
 }
 
 async fn list_harnesses(State(state): State<AppState>) -> Json<ListHarnessesResponse> {
     Json(ListHarnessesResponse {
-        harnesses: state.orchestrator.harness_ids(),
+        harnesses: state.orchestrator.registry().list(),
     })
 }
