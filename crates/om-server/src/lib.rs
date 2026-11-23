@@ -8,4 +8,5 @@ pub mod acp;
 pub mod db;
 pub mod harness;
 pub mod orchestrator;
+pub mod sandbox;
 pub mod stream;

@@ -65,6 +65,7 @@ pub struct Orchestrator {
     registry: HarnessRegistry,
     config: OrchestratorConfig,
     live: Live,
+    bwrap: Option<Arc<dyn Sandbox>>,
 }
 
 impl Orchestrator {
@@ -75,7 +76,16 @@ impl Orchestrator {
             registry,
             config,
             live: Live::default(),
+            bwrap: None,
         }
+    }
+
+    /// Enables `SandboxMode::Bwrap` sessions with the given (probed) sandbox, e.g.
+    /// `BwrapSandbox::default().probe().await?`.
+    pub fn with_bwrap_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        debug_assert_eq!(sandbox.mode(), SandboxMode::Bwrap);
+        self.bwrap = Some(sandbox);
+        self
     }
 
     pub fn db(&self) -> &Db {
@@ -99,9 +109,9 @@ impl Orchestrator {
             SandboxMode::Direct => Err(CoreError::InvalidInput(
                 "sandbox mode `direct` is disabled on this server".into(),
             )),
-            SandboxMode::Bwrap => Err(CoreError::Unsupported {
+            SandboxMode::Bwrap => self.bwrap.clone().ok_or_else(|| CoreError::Unsupported {
                 harness: "server".into(),
-                capability: "bwrap sandbox (Phase 1, W1-1)",
+                capability: "bwrap sandbox (not configured on this server)",
             }),
         }
     }

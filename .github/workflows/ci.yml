@@ -20,7 +20,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang lld pkg-config libssl-dev libsqlite3-dev
+            clang lld pkg-config libssl-dev libsqlite3-dev bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor, which
+          # bubblewrap needs. Lift it on the throwaway runner so sandbox tests run.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -36,6 +39,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+        env:
+          # Fail (instead of skip) the bwrap escape tests if the sandbox is unusable.
+          OM_REQUIRE_BWRAP: "1"
 
       - name: Check ts-rs bindings are up to date
         run: |
