@@ -21,3 +21,7 @@ serde_json = "1"
 thiserror = "2"
 ts-rs = { version = "12", features = ["serde-json-impl"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util"] }
+tracing = "0.1"
+rusqlite = { version = "0.43", features = ["bundled"] }
+tempfile = "3"
