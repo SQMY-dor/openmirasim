@@ -65,6 +65,9 @@ impl Weekday {
     }
 }
 
+/// Latest timestamp a schedule accepts (9999-12-31T23:59:59.999Z), in Unix ms.
+pub const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
+
 /// When a schedule fires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -88,8 +91,10 @@ pub enum ScheduleSpec {
     Daily {
         minute_of_day: u16,
         #[serde(default)]
+        #[ts(as = "Option<i16>", optional)]
         utc_offset_minutes: i16,
         #[serde(default)]
+        #[ts(as = "Option<Vec<Weekday>>", optional)]
         weekdays: Vec<Weekday>,
     },
 }
@@ -98,9 +103,16 @@ impl ScheduleSpec {
     /// Checks the timetable's fields.
     pub fn validate(&self) -> CoreResult<()> {
         match self {
-            ScheduleSpec::Once { at } if *at <= 0 => Err(CoreError::InvalidInput(
-                "`at` must be a positive timestamp".into(),
-            )),
+            ScheduleSpec::Once { at } if *at <= 0 || *at > MAX_TIMESTAMP_MS => Err(
+                CoreError::InvalidInput("`at` must be a timestamp between 1970 and 9999".into()),
+            ),
+            ScheduleSpec::Every { start_at, .. }
+                if *start_at <= 0 || *start_at > MAX_TIMESTAMP_MS =>
+            {
+                Err(CoreError::InvalidInput(
+                    "`start_at` must be a timestamp between 1970 and 9999".into(),
+                ))
+            }
             ScheduleSpec::Every { interval_secs, .. } if *interval_secs < MIN_INTERVAL_SECS => {
                 Err(CoreError::InvalidInput(format!(
                     "interval must be at least {MIN_INTERVAL_SECS} seconds"
@@ -132,9 +144,18 @@ impl ScheduleSpec {
                 if after < start_at {
                     return Some(start_at);
                 }
-                let step = (interval_secs as i64).checked_mul(1000)?;
-                let n = (after - start_at) / step + 1;
-                start_at.checked_add(n.checked_mul(step)?)
+                let step = i64::try_from(interval_secs).ok()?.checked_mul(1000)?;
+                if step <= 0 {
+                    return None;
+                }
+                // Checked throughout: a hostile `start_at` must end the timetable, never
+                // wrap into the past (which would fire in a tight loop).
+                let n = after
+                    .checked_sub(start_at)?
+                    .checked_div(step)?
+                    .checked_add(1)?;
+                let next = start_at.checked_add(n.checked_mul(step)?)?;
+                (next > after).then_some(next)
             }
             ScheduleSpec::Daily {
                 minute_of_day,
@@ -171,6 +192,7 @@ pub enum ScheduleTarget {
         session_id: SessionId,
         prompt: Prompt,
         #[serde(default)]
+        #[ts(as = "Option<SubmitMode>", optional)]
         mode: SubmitMode,
     },
 }
@@ -246,10 +268,13 @@ pub struct NewSchedule {
     pub spec: ScheduleSpec,
     pub target: ScheduleTarget,
     #[serde(default = "enabled_default")]
+    #[ts(as = "Option<bool>", optional)]
     pub enabled: bool,
     #[serde(default)]
+    #[ts(as = "Option<MissedRunPolicy>", optional)]
     pub missed: MissedRunPolicy,
     #[serde(default)]
+    #[ts(as = "Option<OverlapPolicy>", optional)]
     pub overlap: OverlapPolicy,
 }
 
@@ -499,5 +524,31 @@ mod tests {
             out,
             serde_json::json!({"outcome": "skipped", "reason": "creator_disabled"})
         );
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_every_specs_end_instead_of_wrapping() {
+        let bad = ScheduleSpec::Every {
+            interval_secs: 60,
+            start_at: i64::MIN,
+        };
+        assert!(bad.validate().is_err());
+        assert_eq!(bad.next_after(1_700_000_000_000), None);
+        let huge = ScheduleSpec::Every {
+            interval_secs: u64::MAX,
+            start_at: 1,
+        };
+        assert_eq!(huge.next_after(10), None);
+        let ok = ScheduleSpec::Every {
+            interval_secs: 60,
+            start_at: 1_000,
+        };
+        assert_eq!(ok.next_after(1_000), Some(61_000));
+        assert!(ScheduleSpec::Once { at: i64::MAX }.validate().is_err());
     }
 }

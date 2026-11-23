@@ -278,6 +278,37 @@ async fn admins_manage_strictly_below_themselves() {
 }
 
 #[tokio::test]
+async fn audit_logs_are_scoped_to_the_space() {
+    let fx = setup().await;
+    let other = fx.db.ensure_space("other").await.unwrap();
+    let (_, issued) = fx
+        .auth
+        .bootstrap_owner(&other, "Bo", "second space")
+        .await
+        .unwrap()
+        .expect("first owner of the other space");
+    let other_owner = fx.auth.authenticate(&issued.secret).await.unwrap();
+    fx.auth
+        .add_member(&fx.owner, "carol", Role::Member)
+        .await
+        .unwrap();
+    let mine = fx.auth.audit_log(&fx.owner, None, 100).await.unwrap();
+    assert!(mine.iter().any(|e| e.action == "member.created"));
+    let theirs = fx.auth.audit_log(&other_owner, None, 100).await.unwrap();
+    assert!(
+        theirs.iter().all(|e| e.action != "member.created"),
+        "another space's owner sees none of this space's entries: {theirs:?}"
+    );
+    assert!(
+        fx.auth
+            .audit_log(&other_owner, Some(fx.owner.member_id.to_string()), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn the_last_owner_is_protected() {
     let fx = setup().await;
     forbidden(
@@ -395,4 +426,50 @@ async fn every_change_is_audited_with_its_actor() {
     );
     // Secrets never reach the audit log.
     assert!(log.iter().all(|e| !e.detail.to_string().contains("omt_")));
+}
+
+#[tokio::test]
+async fn permission_checks_use_the_actor_s_current_role() {
+    let fx = setup().await;
+    let (admin, _) = fx.member("adm", Role::Admin).await;
+    let target = fx
+        .auth
+        .add_member(&fx.owner, "victim", Role::Member)
+        .await
+        .unwrap();
+    // The owner demotes the admin after the admin authenticated.
+    fx.auth
+        .change_role(&fx.owner, &admin.member_id, Role::Member)
+        .await
+        .unwrap();
+    // The stale principal still says Admin; the write re-checks and refuses.
+    forbidden(fx.auth.disable_member(&admin, &target.id).await);
+    forbidden(fx.auth.add_member(&admin, "x", Role::Member).await);
+    forbidden(
+        fx.auth
+            .issue_token(&admin, &target.id, "t", None)
+            .await
+            .map(|t| t.token),
+    );
+}
+
+#[tokio::test]
+async fn token_issuance_limits() {
+    let fx = setup().await;
+    let me = fx.owner.member_id.clone();
+    assert!(matches!(
+        fx.auth
+            .issue_token(&fx.owner, &me, "short", Some(Duration::from_micros(500)))
+            .await,
+        Err(CoreError::InvalidInput(_))
+    ));
+    // A short-lived token cannot mint a permanent one.
+    let short = fx
+        .auth
+        .issue_token(&fx.owner, &me, "short", Some(Duration::from_secs(120)))
+        .await
+        .unwrap();
+    let p = fx.auth.authenticate(&short.secret).await.unwrap();
+    let child = fx.auth.issue_token(&p, &me, "child", None).await.unwrap();
+    assert_eq!(child.token.expires_at, short.token.expires_at);
 }

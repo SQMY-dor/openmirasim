@@ -180,6 +180,56 @@ fn token_detail(token: &DeviceTokenRecord) -> serde_json::Value {
     })
 }
 
+/// A permission check run inside the same write transaction as the change it guards,
+/// against the actor's and the target's *current* rows (review P1-3), so a role change
+/// or disablement committed in between cannot be bypassed.
+pub struct Authorize {
+    pub actor: MemberId,
+    /// `(actor now, target now)`; the target is `None` when the change has none yet.
+    #[allow(clippy::type_complexity)]
+    pub check: Box<dyn FnOnce(&MemberRecord, Option<&MemberRecord>) -> CoreResult<()> + Send>,
+}
+
+impl Authorize {
+    pub fn new(
+        actor: MemberId,
+        check: impl FnOnce(&MemberRecord, Option<&MemberRecord>) -> CoreResult<()> + Send + 'static,
+    ) -> Self {
+        Self {
+            actor,
+            check: Box::new(check),
+        }
+    }
+}
+
+/// Runs `auth` against the actor's current row: it must be active and in the target's
+/// space (other spaces look like `NotFound`).
+fn authorize_in(
+    conn: &Connection,
+    auth: Option<Authorize>,
+    space: &SpaceId,
+    target: Option<&MemberRecord>,
+) -> CoreResult<()> {
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    let actor = get_member_in(conn, &auth.actor)
+        .map_err(|_| CoreError::Forbidden(format!("member {} is not active", auth.actor)))?;
+    if !actor.is_active() {
+        return Err(CoreError::Forbidden(format!(
+            "member {} is not active",
+            auth.actor
+        )));
+    }
+    if &actor.space_id != space {
+        return Err(CoreError::NotFound(match target {
+            Some(t) => format!("member {}", t.id),
+            None => "space".into(),
+        }));
+    }
+    (auth.check)(&actor, target)
+}
+
 impl Db {
     /// Creates the space's first member as `Owner` with one token, atomically.
     ///
@@ -195,7 +245,9 @@ impl Db {
         let (space_id, display_name, label) =
             (space_id.clone(), display_name.to_owned(), label.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let any: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM members WHERE space_id = ?1",
@@ -229,9 +281,25 @@ impl Db {
         role: Role,
         actor: Option<MemberId>,
     ) -> CoreResult<MemberRecord> {
+        self.create_member_checked(space_id, display_name, role, actor, None)
+            .await
+    }
+
+    /// [`Db::create_member`] with a permission check in the same transaction.
+    pub async fn create_member_checked(
+        &self,
+        space_id: &SpaceId,
+        display_name: &str,
+        role: Role,
+        actor: Option<MemberId>,
+        auth: Option<Authorize>,
+    ) -> CoreResult<MemberRecord> {
         let (space_id, display_name) = (space_id.clone(), display_name.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            authorize_in(&tx, auth, &space_id, None)?;
             let member = insert_member(&tx, &space_id, &display_name, role)?;
             audit::insert(
                 &tx,
@@ -275,10 +343,24 @@ impl Db {
         role: Role,
         actor: Option<MemberId>,
     ) -> CoreResult<MemberRecord> {
+        self.set_member_role_checked(id, role, actor, None).await
+    }
+
+    /// [`Db::set_member_role`] with a permission check in the same transaction.
+    pub async fn set_member_role_checked(
+        &self,
+        id: &MemberId,
+        role: Role,
+        actor: Option<MemberId>,
+        auth: Option<Authorize>,
+    ) -> CoreResult<MemberRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut member = get_member_in(&tx, &id)?;
+            authorize_in(&tx, auth, &member.space_id.clone(), Some(&member))?;
             if !member.is_active() {
                 return Err(CoreError::Forbidden(format!("member {id} is disabled")));
             }
@@ -314,10 +396,23 @@ impl Db {
         id: &MemberId,
         actor: Option<MemberId>,
     ) -> CoreResult<MemberRecord> {
+        self.disable_member_checked(id, actor, None).await
+    }
+
+    /// [`Db::disable_member`] with a permission check in the same transaction.
+    pub async fn disable_member_checked(
+        &self,
+        id: &MemberId,
+        actor: Option<MemberId>,
+        auth: Option<Authorize>,
+    ) -> CoreResult<MemberRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut member = get_member_in(&tx, &id)?;
+            authorize_in(&tx, auth, &member.space_id.clone(), Some(&member))?;
             if !member.is_active() {
                 return Ok(member);
             }
@@ -358,10 +453,46 @@ impl Db {
         expires_at: Option<i64>,
         actor: Option<MemberId>,
     ) -> CoreResult<DeviceTokenRecord> {
+        self.create_token_checked(member_id, token_hash, label, expires_at, actor, None, None)
+            .await
+    }
+
+    /// [`Db::create_token`] with a permission check in the same transaction and an
+    /// optional cap on the member's live tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_token_checked(
+        &self,
+        member_id: &MemberId,
+        token_hash: String,
+        label: &str,
+        expires_at: Option<i64>,
+        actor: Option<MemberId>,
+        auth: Option<Authorize>,
+        max_live_tokens: Option<u32>,
+    ) -> CoreResult<DeviceTokenRecord> {
         let (member_id, label) = (member_id.clone(), label.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let member = get_member_in(&tx, &member_id)?;
+            authorize_in(&tx, auth, &member.space_id.clone(), Some(&member))?;
+            if let Some(max) = max_live_tokens {
+                let live: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM device_tokens
+                         WHERE member_id = ?1 AND revoked_at IS NULL
+                           AND (expires_at IS NULL OR expires_at > ?2)",
+                        params![member_id.as_str(), now_ms()],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?;
+                if live >= i64::from(max) {
+                    return Err(CoreError::LimitExceeded(format!(
+                        "member already has {live} live tokens (max {max})"
+                    )));
+                }
+            }
             let token = insert_token(&tx, &member, &token_hash, &label, expires_at)?;
             audit::insert(
                 &tx,
@@ -405,10 +536,30 @@ impl Db {
         id: &TokenId,
         actor: Option<MemberId>,
     ) -> CoreResult<DeviceTokenRecord> {
+        self.revoke_token_checked(id, actor, None).await
+    }
+
+    /// [`Db::revoke_token`] with a permission check (against the token's owner) in the
+    /// same transaction.
+    pub async fn revoke_token_checked(
+        &self,
+        id: &TokenId,
+        actor: Option<MemberId>,
+        auth: Option<Authorize>,
+    ) -> CoreResult<DeviceTokenRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut token = get_token_in(&tx, &id)?;
+            let owner = get_member_in(&tx, &token.member_id)?;
+            authorize_in(&tx, auth, &owner.space_id.clone(), Some(&owner)).map_err(
+                |e| match e {
+                    CoreError::NotFound(_) => CoreError::NotFound(format!("token {id}")),
+                    other => other,
+                },
+            )?;
             if token.revoked_at.is_some() {
                 return Ok(token);
             }

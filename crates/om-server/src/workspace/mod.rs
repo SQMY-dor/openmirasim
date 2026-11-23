@@ -3,16 +3,28 @@
 //! Layout under the manager's root (normally `$OM_DATA_DIR`):
 //!
 //! ```text
-//! worktrees/<uuid>/   one checkout per session, on branch `om/<uuid>`
-//! scratch/<uuid>/     empty working dir for sandboxed sessions without a workspace
-//! homes/<member>/     private HOME per member, bound into the sandbox
+//! worktrees/<uuid>/          one checkout per session, on branch `om/<uuid>`
+//! gitdirs/<uuid>/            the session's own repository (its `.git`)
+//! scratch/<uuid>/            empty working dir for sandboxed sessions without a workspace
+//! homes/<space>/<member>/    private HOME per member, bound into the sandbox
+//! homes/_anonymous/<uuid>/   per-session HOME when no member is known
 //! ```
 //!
-//! Worktree creation is serialized per repository (git takes repository-wide locks).
-//! Sessions keep their checkout after closing so their changes can still be reviewed;
-//! [`WorkspaceManager::remove_worktree`] deletes it (the branch is kept).
+//! Isolation (review P0-1): a session never sees the registered repository's `.git`.
+//! Each checkout is a separate clone (`git clone --shared --separate-git-dir`) whose
+//! objects borrow the repository's object store read-only, so sessions cannot touch
+//! the repository's refs, index, config or each other. The session's repository is
+//! writable except for the files git reads configuration or redirections from
+//! (`config`, `hooks/`, `info/`, `commondir`, `objects/info/alternates`), which are
+//! mounted read-only. Work comes back with [`WorkspaceManager::sync_branch`], a
+//! hardened server-side `git fetch` of the session branch into the repository.
+//!
+//! Operations are serialized per repository git dir. Sessions keep their checkout after
+//! closing so their changes can still be reviewed; [`WorkspaceManager::remove_worktree`]
+//! copies the branch back and deletes the checkout.
 
 mod git;
+mod nofollow;
 #[cfg(test)]
 mod tests;
 
@@ -81,7 +93,8 @@ impl PreparedWorktree {
 pub struct WorkspaceManager {
     db: Db,
     config: Arc<WorkspaceConfig>,
-    repo_locks: Arc<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Keyed by canonical git common dir, so every path to one repository shares a lock.
+    repo_locks: Arc<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 fn io(context: &str, e: std::io::Error) -> CoreError {
@@ -112,7 +125,7 @@ fn safe_component(s: &str) -> CoreResult<&str> {
 impl WorkspaceManager {
     /// Creates the root layout. The root is canonicalized.
     pub fn new(db: Db, mut config: WorkspaceConfig) -> CoreResult<Self> {
-        for sub in ["worktrees", "scratch", "homes"] {
+        for sub in ["worktrees", "gitdirs", "scratch", "homes"] {
             std::fs::create_dir_all(config.root.join(sub))
                 .map_err(|e| io("creating workspace root", e))?;
         }
@@ -131,13 +144,38 @@ impl WorkspaceManager {
         &self.config.root
     }
 
-    fn lock_for(&self, id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_for(&self, git_common_dir: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = Path::new(git_common_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(git_common_dir));
         self.repo_locks
             .lock()
-            .expect("repo locks poisoned")
-            .entry(id.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
             .or_default()
             .clone()
+    }
+
+    /// `true` when `p` is a direct child of `<root>/<sub>`.
+    fn owned(&self, sub: &str, p: &Path) -> bool {
+        p.parent() == Some(self.config.root.join(sub).as_path())
+            && p.file_name()
+                .is_some_and(|n| safe_component(&n.to_string_lossy()).is_ok())
+    }
+
+    /// Deletes a directory this manager created, refusing anything outside its layout.
+    fn remove_owned(&self, sub: &str, p: &Path) -> CoreResult<()> {
+        if !self.owned(sub, p) {
+            return Err(CoreError::Workspace(format!(
+                "refusing to delete {} outside {sub}/",
+                p.display()
+            )));
+        }
+        match std::fs::remove_dir_all(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io("removing directory", e)),
+        }
     }
 
     // ------------------------------------------------------------ workspaces
@@ -196,6 +234,18 @@ impl WorkspaceManager {
                 ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )
             .await?;
+        let common = path_str(
+            &Path::new(&common)
+                .canonicalize()
+                .map_err(|e| io("resolving git dir", e))?,
+        );
+        if Path::new(&common).starts_with(&self.config.root)
+            || self.config.root.starts_with(&common)
+        {
+            return Err(CoreError::InvalidInput(
+                "repository git dir must not overlap the server's data directory".into(),
+            ));
+        }
         let default_branch = git
             .line(
                 "symbolic-ref",
@@ -209,11 +259,6 @@ impl WorkspaceManager {
         )
         .await
         .map_err(|_| CoreError::InvalidInput("repository has no commits yet".into()))?;
-        // Make sure the read-only overlays have something to cover.
-        let common_dir = PathBuf::from(&common);
-        for d in ["hooks", "info"] {
-            std::fs::create_dir_all(common_dir.join(d)).map_err(|e| io("preparing git dir", e))?;
-        }
         let stored = StoredWorkspace {
             summary: WorkspaceSummary {
                 id: WorkspaceId::new(),
@@ -244,12 +289,27 @@ impl WorkspaceManager {
 
     // ------------------------------------------------------------ worktrees
 
-    fn member_home(&self, member: Option<&MemberId>) -> CoreResult<PathBuf> {
-        let name = match member {
-            Some(m) => safe_component(m.as_str())?,
-            None => "_anonymous",
+    /// The member's private HOME, per space; an unknown member gets one per session.
+    async fn member_home(
+        &self,
+        space: Option<&SpaceId>,
+        member: Option<&MemberId>,
+        key: &str,
+    ) -> CoreResult<PathBuf> {
+        let home = match member {
+            Some(m) => {
+                let space = match space {
+                    Some(s) => s.clone(),
+                    None => self.db.get_member(m).await?.space_id,
+                };
+                self.config
+                    .root
+                    .join("homes")
+                    .join(safe_component(space.as_str())?)
+                    .join(safe_component(m.as_str())?)
+            }
+            None => self.config.root.join("homes").join("_anonymous").join(key),
         };
-        let home = self.config.root.join("homes").join(name);
         std::fs::create_dir_all(&home).map_err(|e| io("creating member home", e))?;
         Ok(home)
     }
@@ -263,9 +323,9 @@ impl WorkspaceManager {
         base: Option<&str>,
         member: Option<&MemberId>,
     ) -> CoreResult<PreparedWorktree> {
-        let home = path_str(&self.member_home(member)?);
         let key = uuid::Uuid::now_v7().simple().to_string();
         let Some(ws_id) = workspace_id else {
+            let home = path_str(&self.member_home(None, member, &key).await?);
             let dir = self.config.root.join("scratch").join(&key);
             std::fs::create_dir_all(&dir).map_err(|e| io("creating scratch dir", e))?;
             return Ok(PreparedWorktree {
@@ -286,6 +346,11 @@ impl WorkspaceManager {
             });
         };
         let ws = self.db.get_workspace(ws_id).await?;
+        let home = path_str(
+            &self
+                .member_home(Some(&ws.summary.space_id), member, &key)
+                .await?,
+        );
         let repo = PathBuf::from(&ws.summary.repo_path);
         let git = Git::at(&self.config.git_bin, &repo);
         let base = base.unwrap_or(&ws.summary.default_branch);
@@ -308,60 +373,18 @@ impl WorkspaceManager {
             .await
             .map_err(|_| CoreError::InvalidInput(format!("unknown base revision {base:?}")))?;
         let path = self.config.root.join("worktrees").join(&key);
+        let git_dir = self.config.root.join("gitdirs").join(&key);
         let branch = format!("om/{key}");
 
-        let lock = self.lock_for(ws_id);
+        let lock = self.lock_for(&ws.git_common_dir);
         let _guard = lock.lock().await;
-        git.run(
-            "worktree add",
-            [
-                "worktree",
-                "add",
-                "--quiet",
-                "--no-track",
-                "-b",
-                &branch,
-                &path_str(&path),
-                &base_commit,
-            ],
-        )
-        .await?;
-        // Record the admin dir now, while the checkout's `.git` file is still ours.
-        let git_dir = match Git::at(&self.config.git_bin, &path)
-            .line(
-                "rev-parse",
-                ["rev-parse", "--path-format=absolute", "--git-dir"],
-            )
-            .await
-        {
-            Ok(d) => PathBuf::from(d),
-            Err(e) => {
-                let _ = git
-                    .run(
-                        "worktree remove",
-                        ["worktree", "remove", "--force", &path_str(&path)],
-                    )
-                    .await;
-                return Err(e);
-            }
-        };
-        let expected_parent = Path::new(&ws.git_common_dir).join("worktrees");
-        if git_dir.parent() != Some(expected_parent.as_path()) {
-            let _ = git
-                .run(
-                    "worktree remove",
-                    ["worktree", "remove", "--force", &path_str(&path)],
-                )
-                .await;
-            return Err(CoreError::Workspace(format!(
-                "unexpected worktree git dir {}",
-                git_dir.display()
-            )));
-        }
-        // Overlay target for repositories using extensions.worktreeConfig.
-        let cfg = git_dir.join("config.worktree");
-        if !cfg.exists() {
-            std::fs::write(&cfg, b"").map_err(|e| io("preparing worktree config", e))?;
+        let made = self
+            .clone_checkout(&repo, &git_dir, &path, &branch, &base_commit)
+            .await;
+        if let Err(e) = made {
+            let _ = self.remove_owned("worktrees", &path);
+            let _ = self.remove_owned("gitdirs", &git_dir);
+            return Err(e);
         }
         Ok(PreparedWorktree {
             stored: StoredWorktree {
@@ -381,6 +404,70 @@ impl WorkspaceManager {
         })
     }
 
+    /// Clones `repo` into a session repository at `git_dir` with its checkout at `path`,
+    /// on `branch` at `base_commit`, then pins the files git reads configuration from.
+    async fn clone_checkout(
+        &self,
+        repo: &Path,
+        git_dir: &Path,
+        path: &Path,
+        branch: &str,
+        base_commit: &str,
+    ) -> CoreResult<()> {
+        Git::at(&self.config.git_bin, &self.config.root)
+            .with_config("protocol.file.allow", "always")
+            .run(
+                "clone",
+                [
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    "--no-checkout",
+                    "--no-tags",
+                    "--separate-git-dir",
+                    &path_str(git_dir),
+                    "--",
+                    &path_str(repo),
+                    &path_str(path),
+                ],
+            )
+            .await?;
+        // Pin the common dir to the repository itself (an agent-created `commondir`
+        // would otherwise redirect every git call to a directory it controls) and make
+        // sure each read-only overlay exists before the sandbox binds it.
+        std::fs::write(git_dir.join("commondir"), b".\n")
+            .map_err(|e| io("preparing git dir", e))?;
+        for d in ["hooks", "info"] {
+            std::fs::create_dir_all(git_dir.join(d)).map_err(|e| io("preparing git dir", e))?;
+        }
+        for f in ["objects/info/alternates", "info/exclude"] {
+            let f = git_dir.join(f);
+            if !f.exists() {
+                std::fs::write(&f, b"").map_err(|e| io("preparing git dir", e))?;
+            }
+        }
+        let session_git = Git::worktree(&self.config.git_bin, git_dir, path);
+        // The clone's remote points at the host repository, which the sandbox cannot
+        // reach anyway; drop it so nothing tries.
+        let _ = session_git
+            .run("remote remove", ["remote", "remove", "origin"])
+            .await;
+        session_git
+            .run(
+                "checkout",
+                [
+                    "checkout",
+                    "--quiet",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    base_commit,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Records a prepared checkout for its session.
     pub async fn attach(
         &self,
@@ -396,22 +483,22 @@ impl WorkspaceManager {
     /// Deletes a prepared checkout that never got a session (e.g. the insert failed).
     pub async fn discard(&self, prepared: PreparedWorktree) {
         let path = PathBuf::from(&prepared.stored.info.path);
-        match &prepared.repo {
-            Some((repo, _)) => {
-                let git = Git::at(&self.config.git_bin, repo);
-                let _ = git
-                    .run(
-                        "worktree remove",
-                        ["worktree", "remove", "--force", &path_str(&path)],
-                    )
-                    .await;
-                if let Some(b) = &prepared.stored.info.branch {
-                    let _ = git.run("branch", ["branch", "-D", "--", b]).await;
-                }
-            }
-            None => {
-                let _ = std::fs::remove_dir_all(&path);
-            }
+        let _guard = match &prepared.repo {
+            Some((_, common)) => Some(self.lock_for(&path_str(common)).lock_owned().await),
+            None => None,
+        };
+        let sub = if prepared.repo.is_some() {
+            "worktrees"
+        } else {
+            "scratch"
+        };
+        if let Err(e) = self.remove_owned(sub, &path) {
+            tracing::warn!(error = %e, "failed to discard checkout");
+        }
+        if let Some(gd) = &prepared.stored.git_dir
+            && let Err(e) = self.remove_owned("gitdirs", Path::new(gd))
+        {
+            tracing::warn!(error = %e, "failed to discard session git dir");
         }
     }
 
@@ -423,35 +510,99 @@ impl WorkspaceManager {
             .ok_or_else(|| CoreError::NotFound(format!("worktree of session {session_id}")))
     }
 
-    /// What the sandbox must expose for this checkout: the checkout and the repository's
-    /// git dir read-write (so the agent can commit), with every file git reads config
-    /// or redirections from overlaid read-only, plus the member's private HOME.
+    /// What the sandbox must expose for this checkout: the checkout and the session's own
+    /// git dir read-write (so the agent can commit), the files git reads configuration or
+    /// redirections from read-only, the repository's object store read-only (the clone
+    /// borrows its objects), plus the member's private HOME. The registered repository's
+    /// `.git` is never exposed.
     pub async fn sandbox_paths(&self, wt: &StoredWorktree) -> CoreResult<SandboxPaths> {
         let mut paths = SandboxPaths {
             writable: vec![PathBuf::from(&wt.info.path)],
             readonly: Vec::new(),
             home: wt.home_path.as_ref().map(PathBuf::from),
         };
-        if let (Some(ws_id), Some(git_dir)) = (&wt.info.workspace_id, &wt.git_dir) {
-            let ws = self.db.get_workspace(ws_id).await?;
-            let common = PathBuf::from(&ws.git_common_dir);
-            let admin = PathBuf::from(git_dir);
-            paths.writable.push(common.clone());
+        if let Some(git_dir) = &wt.git_dir {
+            let gd = PathBuf::from(git_dir);
+            if !self.owned("gitdirs", &gd) {
+                return Err(CoreError::Workspace(
+                    "this checkout predates per-session repositories and cannot be sandboxed \
+                     safely; start a new session"
+                        .into(),
+                ));
+            }
+            paths.writable.push(gd.clone());
             for p in [
-                common.join("config"),
-                common.join("hooks"),
-                common.join("info"),
-                common.join("commondir"),
-                admin.join("commondir"),
-                admin.join("gitdir"),
-                admin.join("config.worktree"),
+                "config",
+                "hooks",
+                "info",
+                "commondir",
+                "objects/info/alternates",
             ] {
-                if p.exists() {
-                    paths.readonly.push(p);
+                let p = gd.join(p);
+                if !p.exists() {
+                    return Err(CoreError::Workspace(format!(
+                        "session git dir is missing {}",
+                        p.display()
+                    )));
+                }
+                paths.readonly.push(p);
+            }
+            if let Some(ws_id) = &wt.info.workspace_id {
+                let ws = self.db.get_workspace(ws_id).await?;
+                let objects = Path::new(&ws.git_common_dir).join("objects");
+                if objects.is_dir() {
+                    paths.readonly.push(objects);
                 }
             }
         }
         Ok(paths)
+    }
+
+    /// Copies the session branch from the session's repository into the registered
+    /// repository (`refs/heads/om/<uuid>`), so its commits can be reviewed and merged
+    /// there. The session repository is treated as hostile: only that one ref is
+    /// fetched, objects are checked, and nothing from it is executed.
+    pub async fn sync_branch(&self, session_id: &SessionId) -> CoreResult<()> {
+        let wt = self.worktree(session_id).await?;
+        self.sync_stored(&wt).await
+    }
+
+    async fn sync_stored(&self, wt: &StoredWorktree) -> CoreResult<()> {
+        let (Some(ws_id), Some(git_dir), Some(branch)) =
+            (&wt.info.workspace_id, &wt.git_dir, &wt.info.branch)
+        else {
+            return Err(CoreError::Unsupported {
+                harness: "workspace".into(),
+                capability: "syncing a checkout without a repository",
+            });
+        };
+        if !self.owned("gitdirs", Path::new(git_dir)) {
+            // Legacy worktree: the branch already lives in the repository.
+            return Ok(());
+        }
+        let ws = self.db.get_workspace(ws_id).await?;
+        let lock = self.lock_for(&ws.git_common_dir);
+        let _guard = lock.lock().await;
+        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        Git::at(&self.config.git_bin, &ws.summary.repo_path)
+            .with_config("protocol.file.allow", "always")
+            .with_config("transfer.fsckObjects", "true")
+            .with_config("fetch.fsckObjects", "true")
+            .run(
+                "fetch",
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    "--",
+                    git_dir,
+                    &refspec,
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     fn checkout_git(&self, wt: &StoredWorktree) -> CoreResult<Git> {
@@ -472,7 +623,12 @@ impl WorkspaceManager {
         let mut args = vec!["diff", "--name-status", "-z"];
         args.extend(diff_opts);
         args.extend([base.as_str(), "--"]);
-        let names = split_z(&git.run("diff --name-status", &args).await?);
+        // Names are bounded by the entry cap (generously sized per entry).
+        let name_cap = self.config.max_entries.saturating_mul(4096).max(1 << 20);
+        let (names, _) = git
+            .run_capped("diff --name-status", &args, name_cap, &[])
+            .await?;
+        let names = split_z(&names);
         let mut files = Vec::new();
         let mut it = names.into_iter();
         while let Some(status) = it.next() {
@@ -500,20 +656,31 @@ impl WorkspaceManager {
             }
         }
 
+        let max = self.config.max_patch_bytes;
         let mut args = vec!["diff"];
         args.extend(diff_opts);
         args.extend([base.as_str(), "--"]);
-        let mut patch = git.run("diff", &args).await?;
+        let (mut patch, mut truncated) = git.run_capped("diff", &args, max, &[]).await?;
 
-        let untracked = split_z(
-            &git.run(
+        let (untracked, _) = git
+            .run_capped(
                 "ls-files",
                 ["ls-files", "-z", "--others", "--exclude-standard"],
+                name_cap,
+                &[],
             )
-            .await?,
-        );
-        for path in untracked {
-            if patch.len() >= self.config.max_patch_bytes {
+            .await?;
+        let untracked = split_z(&untracked);
+        let root = PathBuf::from(&wt.info.path);
+        for path in untracked.into_iter().take(self.config.max_entries) {
+            // Only regular files: a FIFO or device would block or never end.
+            let regular = std::fs::symlink_metadata(root.join(&path))
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if truncated || patch.len() >= max || !regular {
+                if patch.len() >= max {
+                    truncated = true;
+                }
                 files.push(FileChange {
                     path,
                     kind: FileChangeKind::Untracked,
@@ -522,30 +689,33 @@ impl WorkspaceManager {
                 continue;
             }
             // `--no-index` exits 1 when files differ; that is the normal case here.
-            let out = git
-                .output([
-                    "diff",
-                    "--no-index",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                    "--",
-                    "/dev/null",
-                    &path,
-                ])
-                .await?;
-            if out.status.code().is_some_and(|c| c <= 1) {
-                patch.extend_from_slice(&out.stdout);
+            let room = max - patch.len();
+            if let Ok((out, more)) = git
+                .run_capped(
+                    "diff --no-index",
+                    [
+                        "diff",
+                        "--no-index",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-color",
+                        "--",
+                        "/dev/null",
+                        &path,
+                    ],
+                    room,
+                    &[1],
+                )
+                .await
+            {
+                patch.extend_from_slice(&out);
+                truncated |= more;
             }
             files.push(FileChange {
                 path,
                 kind: FileChangeKind::Untracked,
                 old_path: None,
             });
-        }
-        let truncated = patch.len() > self.config.max_patch_bytes;
-        if truncated {
-            patch.truncate(self.config.max_patch_bytes);
         }
         Ok(WorktreeDiff {
             base_commit: base,
@@ -592,73 +762,83 @@ impl WorkspaceManager {
         Ok(entries)
     }
 
-    /// Reads a file inside the checkout. Rejects `..`, absolute paths, and symlinks that
-    /// resolve outside the checkout.
+    /// Reads a file inside the checkout. Rejects `..`, absolute paths, `.git`, symlinks
+    /// anywhere on the path and anything but a regular file, opening each component
+    /// without following links so a concurrent swap cannot escape the checkout.
     pub async fn read_file(&self, session_id: &SessionId, rel: &str) -> CoreResult<Vec<u8>> {
         let wt = self.worktree(session_id).await?;
-        let root = Path::new(&wt.info.path)
-            .canonicalize()
-            .map_err(|e| io("resolving worktree", e))?;
         let rel_path = Path::new(rel);
         if rel.is_empty()
             || rel_path
                 .components()
                 .any(|c| !matches!(c, Component::Normal(_)))
+            || rel_path.components().any(|c| c.as_os_str() == ".git")
         {
             return Err(CoreError::InvalidInput(format!(
                 "invalid relative path {rel:?}"
             )));
         }
-        let full = root
-            .join(rel_path)
-            .canonicalize()
-            .map_err(|_| CoreError::NotFound(format!("file {rel}")))?;
-        if !full.starts_with(&root) || full.starts_with(root.join(".git")) {
-            return Err(CoreError::InvalidInput(format!(
-                "path escapes the worktree: {rel}"
-            )));
-        }
-        let meta = std::fs::metadata(&full).map_err(|e| io("reading file", e))?;
-        if !meta.is_file() {
-            return Err(CoreError::InvalidInput(format!(
-                "not a regular file: {rel}"
-            )));
-        }
-        if meta.len() > self.config.max_file_bytes {
-            return Err(CoreError::InvalidInput(format!(
-                "file is larger than {} bytes",
-                self.config.max_file_bytes
-            )));
-        }
-        tokio::fs::read(&full)
+        let root = PathBuf::from(&wt.info.path);
+        let rel_path = rel_path.to_path_buf();
+        let max = self.config.max_file_bytes;
+        let rel = rel.to_owned();
+        tokio::task::spawn_blocking(move || nofollow::read(&root, &rel_path, max, &rel))
             .await
-            .map_err(|e| io("reading file", e))
+            .map_err(|e| CoreError::Workspace(format!("read task failed: {e}")))?
     }
 
-    /// Removes the checkout from disk (the branch and its commits are kept).
+    /// Copies the session branch back into the repository (see
+    /// [`WorkspaceManager::sync_branch`]), then deletes the checkout and the session's
+    /// repository. Fails, deleting nothing, when the branch cannot be copied; use
+    /// [`WorkspaceManager::remove_worktree_discarding`] to delete anyway.
     pub async fn remove_worktree(&self, session_id: &SessionId) -> CoreResult<()> {
         let wt = self.worktree(session_id).await?;
-        match (&wt.info.workspace_id, &wt.git_dir) {
-            (Some(ws_id), Some(_)) => {
-                let ws = self.db.get_workspace(ws_id).await?;
-                let lock = self.lock_for(ws_id);
-                let _guard = lock.lock().await;
-                let git = Git::at(&self.config.git_bin, &ws.summary.repo_path);
-                git.run(
+        if wt.info.workspace_id.is_some() && wt.git_dir.is_some() {
+            self.sync_stored(&wt).await?;
+        }
+        self.delete_checkout(&wt).await?;
+        self.db.mark_worktree_removed(session_id).await
+    }
+
+    /// Deletes the checkout and the session's repository without copying the branch
+    /// back (e.g. an agent broke its repository). Unsynced commits are lost.
+    pub async fn remove_worktree_discarding(&self, session_id: &SessionId) -> CoreResult<()> {
+        let wt = self.worktree(session_id).await?;
+        self.delete_checkout(&wt).await?;
+        self.db.mark_worktree_removed(session_id).await
+    }
+
+    async fn delete_checkout(&self, wt: &StoredWorktree) -> CoreResult<()> {
+        let path = PathBuf::from(&wt.info.path);
+        let Some(git_dir) = &wt.git_dir else {
+            if path.starts_with(self.config.root.join("scratch")) {
+                self.remove_owned("scratch", &path)?;
+            }
+            return Ok(());
+        };
+        let gd = PathBuf::from(git_dir);
+        if self.owned("gitdirs", &gd) {
+            // Our own directories: deleting them needs no git and works even when the
+            // workspace row is gone or the agent wrecked its repository.
+            self.remove_owned("worktrees", &path)?;
+            return self.remove_owned("gitdirs", &gd);
+        }
+        // Legacy linked worktree inside the repository's git dir.
+        if let Some(ws_id) = &wt.info.workspace_id
+            && let Ok(ws) = self.db.get_workspace(ws_id).await
+        {
+            let lock = self.lock_for(&ws.git_common_dir);
+            let _guard = lock.lock().await;
+            let git = Git::at(&self.config.git_bin, &ws.summary.repo_path);
+            let _ = git
+                .run(
                     "worktree remove",
                     ["worktree", "remove", "--force", &wt.info.path],
                 )
-                .await?;
-                let _ = git.run("worktree prune", ["worktree", "prune"]).await;
-            }
-            _ => {
-                let p = PathBuf::from(&wt.info.path);
-                if p.starts_with(self.config.root.join("scratch")) {
-                    std::fs::remove_dir_all(&p).map_err(|e| io("removing scratch dir", e))?;
-                }
-            }
+                .await;
+            let _ = git.run("worktree prune", ["worktree", "prune"]).await;
         }
-        self.db.mark_worktree_removed(session_id).await
+        self.remove_owned("worktrees", &path)
     }
 }
 

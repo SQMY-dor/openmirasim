@@ -269,21 +269,36 @@ async fn sandbox_paths_overlay_git_config_read_only() {
     let wt = f.mgr.worktree(&a).await.unwrap();
     let p = f.mgr.sandbox_paths(&wt).await.unwrap();
     let common = f.repo.join(".git");
-    assert_eq!(p.writable, vec![PathBuf::from(&wa.path), common.clone()]);
-    for must in ["config", "hooks", "info"] {
+    let gd = PathBuf::from(wt.git_dir.clone().unwrap());
+    assert!(gd.starts_with(f.mgr.root().join("gitdirs")));
+    assert_eq!(p.writable, vec![PathBuf::from(&wa.path), gd.clone()]);
+    assert!(
+        !p.writable.iter().any(|w| w.starts_with(&common)),
+        "the repository's .git is never writable"
+    );
+    for must in [
+        "config",
+        "hooks",
+        "info",
+        "commondir",
+        "objects/info/alternates",
+    ] {
         assert!(
-            p.readonly.contains(&common.join(must)),
+            p.readonly.contains(&gd.join(must)),
             "missing ro overlay {must}"
         );
     }
-    let admin = PathBuf::from(wt.git_dir.unwrap());
-    for must in ["commondir", "gitdir", "config.worktree"] {
-        assert!(
-            p.readonly.contains(&admin.join(must)),
-            "missing ro overlay {must}"
-        );
-    }
-    assert!(p.home.unwrap().ends_with("homes/alice"));
+    assert!(p.readonly.contains(&common.join("objects")));
+    assert!(
+        !p.readonly
+            .iter()
+            .any(|r| r.starts_with(&common) && *r != common.join("objects")),
+        "nothing else of the repository's .git is exposed: {:?}",
+        p.readonly
+    );
+    let home = p.home.unwrap();
+    assert!(home.ends_with(format!("homes/{}/alice", f.space)));
+    let _ = a;
 }
 
 #[tokio::test]
@@ -373,4 +388,213 @@ async fn scratch_dirs_and_bad_inputs() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn session_commits_stay_out_of_the_repository_until_synced() {
+    let f = fx().await;
+    let ws = f
+        .mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let (a, wa) = checkout(&f, &ws).await;
+    let pa = PathBuf::from(&wa.path);
+    let branch = wa.branch.clone().unwrap();
+    std::fs::write(pa.join("feature.txt"), "x\n").unwrap();
+    sh_git(&pa, &["add", "feature.txt"]);
+    sh_git(&pa, &["commit", "-q", "-m", "feature"]);
+    // The session's commit and branch are not in the repository yet.
+    let host_has = |r: &str| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&f.repo)
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(!host_has(&branch));
+    // Tampering with the session's HEAD or refs does not touch the repository.
+    sh_git(&pa, &["update-ref", "refs/heads/main", "HEAD"]);
+    let host_main = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&f.repo)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(host_main.trim(), wa.base_commit.as_deref().unwrap());
+
+    f.mgr.sync_branch(&a).await.unwrap();
+    assert!(host_has(&branch));
+    assert!(host_has(&format!("{branch}:feature.txt")));
+}
+
+#[tokio::test]
+async fn a_repository_registers_once_across_spaces() {
+    let f = fx().await;
+    f.mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let other = f.db.ensure_space("other").await.unwrap();
+    assert!(matches!(
+        f.mgr
+            .register(other, "app", &f.repo.to_string_lossy())
+            .await,
+        Err(CoreError::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn removal_works_after_the_agent_wrecks_its_repository() {
+    let f = fx().await;
+    let ws = f
+        .mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let (a, wa) = checkout(&f, &ws).await;
+    let wt = f.mgr.worktree(&a).await.unwrap();
+    let gd = PathBuf::from(wt.git_dir.unwrap());
+    std::fs::remove_dir_all(gd.join("refs")).unwrap();
+    std::fs::remove_file(PathBuf::from(&wa.path).join(".git")).unwrap();
+    // Copying the branch back fails, so the safe removal refuses...
+    assert!(f.mgr.remove_worktree(&a).await.is_err());
+    assert!(Path::new(&wa.path).exists());
+    // ...and the discarding removal still cleans up.
+    f.mgr.remove_worktree_discarding(&a).await.unwrap();
+    assert!(!Path::new(&wa.path).exists());
+    assert!(!gd.exists());
+}
+
+#[tokio::test]
+async fn reads_and_diffs_never_follow_links_or_block_on_fifos() {
+    let f = fx().await;
+    let ws = f
+        .mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let (a, wa) = checkout(&f, &ws).await;
+    let pa = PathBuf::from(&wa.path);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "s").unwrap();
+    std::os::unix::fs::symlink(outside.path(), pa.join("dirlink")).unwrap();
+    assert!(f.mgr.read_file(&a, "dirlink/secret").await.is_err());
+    let fifo = pa.join("pipe");
+    let ok = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.mgr.read_file(&a, "pipe"),
+    )
+    .await
+    .expect("reading a FIFO must not block");
+    assert!(matches!(r, Err(CoreError::InvalidInput(_))));
+    let d = tokio::time::timeout(std::time::Duration::from_secs(20), f.mgr.diff(&a))
+        .await
+        .expect("diff must not block on a FIFO")
+        .unwrap();
+    assert!(!d.patch.contains("pipe"));
+}
+
+#[tokio::test]
+async fn diff_truncation_is_reported_at_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = fx().await;
+    let mut cfg = WorkspaceConfig::new(tmp.path().join("data2"));
+    cfg.max_patch_bytes = 200;
+    let mgr = WorkspaceManager::new(f.db.clone(), cfg).unwrap();
+    let ws = mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let sid = session(&f).await;
+    let p = mgr.prepare(Some(&ws.id), None, None).await.unwrap();
+    let info = mgr.attach(&sid, p).await.unwrap();
+    std::fs::write(Path::new(&info.path).join("README.md"), "x\n".repeat(500)).unwrap();
+    let d = mgr.diff(&sid).await.unwrap();
+    assert!(d.truncated);
+    assert!(d.patch.len() <= 200);
+}
+
+#[tokio::test]
+async fn sandboxed_agent_cannot_reach_the_repository_git_dir() {
+    let Ok(sb) = crate::sandbox::BwrapSandbox::default().probe().await else {
+        if std::env::var_os("OM_REQUIRE_BWRAP").is_some() {
+            panic!("bwrap required");
+        }
+        return;
+    };
+    let f = fx().await;
+    let ws = f
+        .mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let (a, wa) = checkout(&f, &ws).await;
+    let wt = f.mgr.worktree(&a).await.unwrap();
+    let paths = f.mgr.sandbox_paths(&wt).await.unwrap();
+    let gd = wt.git_dir.clone().unwrap();
+    let common = f.repo.join(".git");
+    let script = format!(
+        "cd {wt}; \
+         git -c user.name=a -c user.email=a@b commit -q --allow-empty -m agent && echo COMMIT-OK; \
+         echo x > {gd}/commondir 2>/dev/null && echo WROTE-COMMONDIR; \
+         echo x >> {gd}/config 2>/dev/null && echo WROTE-CONFIG; \
+         touch {gd}/hooks/pre-commit 2>/dev/null && echo WROTE-HOOK; \
+         echo x > {gd}/objects/info/alternates 2>/dev/null && echo WROTE-ALTERNATES; \
+         ls {common}/HEAD >/dev/null 2>&1 && echo SEES-REPO-HEAD; \
+         touch {common}/objects/x 2>/dev/null && echo WROTE-REPO-OBJECTS; true",
+        wt = wa.path,
+        common = common.display(),
+    );
+    let spec = om_core::sandbox::SandboxSpec {
+        writable_paths: paths.writable.clone(),
+        readonly_paths: paths.readonly.clone(),
+        home: paths.home.clone(),
+        network: false,
+        ..Default::default()
+    };
+    let cmd = om_core::sandbox::Sandbox::wrap(
+        &sb,
+        &spec,
+        om_core::sandbox::CommandSpec::new("/bin/sh")
+            .arg("-c")
+            .arg(script),
+    )
+    .unwrap();
+    let out = tokio::process::Command::new(&cmd.program)
+        .args(&cmd.args)
+        .env_clear()
+        .envs(&cmd.env)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("COMMIT-OK"),
+        "agent can commit: {stdout} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for bad in [
+        "WROTE-COMMONDIR",
+        "WROTE-CONFIG",
+        "WROTE-HOOK",
+        "WROTE-ALTERNATES",
+        "SEES-REPO-HEAD",
+        "WROTE-REPO-OBJECTS",
+    ] {
+        assert!(!stdout.contains(bad), "{bad}: {stdout}");
+    }
 }

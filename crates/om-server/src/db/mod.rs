@@ -12,8 +12,9 @@
 mod audit;
 mod members;
 pub use audit::{ApprovalRule, AuditEntry};
-pub use members::TOKEN_TOUCH_INTERVAL_MS;
+pub use members::{Authorize, TOKEN_TOUCH_INTERVAL_MS};
 mod goals;
+pub use goals::TurnContext;
 mod migrations;
 mod schedules;
 #[cfg(test)]
@@ -122,12 +123,21 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let known = migrations::MIGRATIONS.len() as i64;
+    if current > known {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(format!(
+                "database schema v{current} is newer than this server (v{known}); upgrade the server"
+            )),
+        ));
+    }
     for (idx, sql) in migrations::MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
         if version <= current {
             continue;
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
@@ -299,7 +309,7 @@ impl Db {
         created_by: Option<MemberId>,
     ) -> CoreResult<(SessionSummary, SessionEvent)> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage)?;
             let id = SessionId::new();
             let now = now_ms();
             tx.execute(
@@ -361,7 +371,9 @@ impl Db {
     ) -> CoreResult<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let events = append_in_tx(&tx, &session_id, payloads)?;
             tx.commit().map_err(storage)?;
             Ok(events)
@@ -378,9 +390,14 @@ impl Db {
     ) -> CoreResult<EventPage> {
         let session_id = session_id.clone();
         let limit = limit.max(1);
+        // SQLite integers are signed; a larger cursor is past every event.
+        let after_seq = i64::try_from(after_seq).unwrap_or(i64::MAX);
         self.read(move |conn| {
-            let head_seq = head_seq(conn, &session_id)?;
-            let mut stmt = conn
+            // One read transaction, so `head_seq` and the page come from the same
+            // snapshot (review P2-6).
+            let tx = conn.unchecked_transaction().map_err(storage)?;
+            let head_seq = head_seq(&tx, &session_id)?;
+            let mut stmt = tx
                 .prepare(
                     "SELECT seq, ts, payload FROM events
                      WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
@@ -388,7 +405,7 @@ impl Db {
                 .map_err(storage)?;
             let rows = stmt
                 .query_map(
-                    params![session_id.as_str(), after_seq as i64, limit as i64 + 1],
+                    params![session_id.as_str(), after_seq, limit as i64 + 1],
                     |r| {
                         let seq: i64 = r.get(0)?;
                         let ts: i64 = r.get(1)?;
@@ -403,6 +420,8 @@ impl Db {
                 )
                 .map_err(storage)?;
             let mut events = rows.collect::<Result<Vec<_>, _>>().map_err(storage)?;
+            drop(stmt);
+            tx.finish().map_err(storage)?;
             let has_more = events.len() > limit as usize;
             events.truncate(limit as usize);
             Ok(EventPage {
@@ -423,7 +442,9 @@ impl Db {
         turn_id: Option<om_core::ids::TurnId>,
     ) -> CoreResult<SessionEvent> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let r = &approval.record;
             tx.execute(
                 "INSERT INTO approvals (id, session_id, harness_request_id, tool_call_id, title,
@@ -480,7 +501,9 @@ impl Db {
     ) -> CoreResult<ApprovalOutcome> {
         let approval_id = approval_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let outcome = resolve_in_tx(&tx, &approval_id, decision, resolved_by, None)?;
             tx.commit().map_err(storage)?;
             Ok(outcome)
@@ -498,7 +521,9 @@ impl Db {
     ) -> CoreResult<ApprovalOutcome> {
         let approval_id = approval_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let outcome = resolve_in_tx(&tx, &approval_id, decision, None, Some(rule))?;
             tx.commit().map_err(storage)?;
             Ok(outcome)
@@ -513,7 +538,9 @@ impl Db {
     ) -> CoreResult<Vec<ApprovalOutcome>> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let ids: Vec<String> = {
                 let mut stmt = tx
                     .prepare(
@@ -555,6 +582,8 @@ impl Db {
     ) -> CoreResult<Vec<StoredApproval>> {
         let session_id = session_id.clone();
         self.read(move |conn| {
+            // An unknown session is NotFound, not an empty list (review P2-6).
+            head_seq(conn, &session_id)?;
             let sql = if pending_only {
                 format!(
                     "{APPROVAL_COLUMNS} WHERE session_id = ?1 AND status = 'pending' ORDER BY created_at, id"
@@ -571,6 +600,21 @@ impl Db {
         .await
     }
 
+    /// Records a native session id the harness learned after start (e.g. after the
+    /// first turn), so the session can be resumed later (review P2-5).
+    pub async fn set_native_session_id(&self, id: &SessionId, native: String) -> CoreResult<()> {
+        let id = id.clone();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET native_session_id = ?2 WHERE id = ?1",
+                params![id.as_str(), native],
+            )
+            .map_err(storage)?;
+            Ok(())
+        })
+        .await
+    }
+
     // -------------------------------------------------------------- recovery
 
     /// Called once at startup. Agent processes do not survive a server restart, so
@@ -579,7 +623,9 @@ impl Db {
     /// recovered sessions.
     pub async fn recover_after_restart(&self) -> CoreResult<Vec<SessionId>> {
         self.write(|conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let live: Vec<(String, String)> = {
                 let mut stmt = tx
                     .prepare(
@@ -617,19 +663,33 @@ impl Db {
                         Some("server_restart".into()),
                     )?;
                 }
-                append_in_tx(
-                    &tx,
-                    &session_id,
-                    vec![
-                        EventPayload::Error {
-                            message: "server restarted; agent process was lost".into(),
-                        },
-                        EventPayload::StatusChanged {
-                            from,
-                            to: SessionStatus::Failed,
-                        },
-                    ],
-                )?;
+                // Close what the lost actor left open in the stream (review P1-9): the
+                // running turn, the in-memory queue and a paused flag.
+                let open = open_stream_state(&tx, &session_id)?;
+                let mut payloads = vec![EventPayload::Error {
+                    message: "server restarted; agent process was lost".into(),
+                }];
+                if let Some(turn_id) = open.turn {
+                    payloads.push(EventPayload::TurnEnded {
+                        turn_id,
+                        stop_reason: om_core::session::StopReason::Failed,
+                        error: Some("server restarted".into()),
+                    });
+                }
+                payloads.extend(open.queued.into_iter().map(|queued_id| {
+                    EventPayload::QueueItemRemoved {
+                        queued_id,
+                        reason: om_core::queue::QueueRemoval::Dropped,
+                    }
+                }));
+                if open.paused {
+                    payloads.push(EventPayload::QueuePaused { paused: false });
+                }
+                payloads.push(EventPayload::StatusChanged {
+                    from,
+                    to: SessionStatus::Failed,
+                });
+                append_in_tx(&tx, &session_id, payloads)?;
                 recovered.push(session_id);
             }
             tx.commit().map_err(storage)?;
@@ -640,6 +700,50 @@ impl Db {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// What a session's event stream leaves open: a turn without `TurnEnded`, queued
+/// prompts never removed, and whether the queue is paused.
+#[derive(Default)]
+struct OpenStreamState {
+    turn: Option<om_core::ids::TurnId>,
+    queued: Vec<om_core::ids::QueuedPromptId>,
+    paused: bool,
+}
+
+fn open_stream_state(tx: &Transaction<'_>, id: &SessionId) -> CoreResult<OpenStreamState> {
+    let mut st = OpenStreamState::default();
+    let mut stmt = tx
+        .prepare(
+            "SELECT payload FROM events WHERE session_id = ?1
+               AND type IN ('prompt_submitted', 'turn_ended', 'prompt_queued',
+                            'queue_item_removed', 'queue_paused')
+             ORDER BY seq",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([id.as_str()], |r| r.get::<_, String>(0))
+        .map_err(storage)?;
+    for row in rows {
+        let Ok(payload) = serde_json::from_str::<EventPayload>(&row.map_err(storage)?) else {
+            continue;
+        };
+        match payload {
+            EventPayload::PromptSubmitted { turn_id, .. } => st.turn = Some(turn_id),
+            EventPayload::TurnEnded { turn_id, .. } => {
+                if st.turn.as_ref() == Some(&turn_id) {
+                    st.turn = None;
+                }
+            }
+            EventPayload::PromptQueued { queued, .. } => st.queued.push(queued.id),
+            EventPayload::QueueItemRemoved { queued_id, .. } => {
+                st.queued.retain(|q| q != &queued_id)
+            }
+            EventPayload::QueuePaused { paused } => st.paused = paused,
+            _ => {}
+        }
+    }
+    Ok(st)
+}
 
 const SESSION_COLUMNS: &str = "SELECT id, space_id, config, status, head_seq, native_session_id,
                                       created_at, updated_at FROM sessions";

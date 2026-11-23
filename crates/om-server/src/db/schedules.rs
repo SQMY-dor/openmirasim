@@ -59,7 +59,9 @@ impl Db {
     /// [`MAX_SCHEDULES_PER_SPACE`] schedules.
     pub async fn create_schedule(&self, s: Schedule) -> CoreResult<Schedule> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let count: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM schedules WHERE space_id = ?1",
@@ -107,7 +109,8 @@ impl Db {
             let n = conn
                 .execute(
                     "UPDATE schedules SET name = ?2, spec = ?3, target = ?4, enabled = ?5,
-                            missed = ?6, overlap = ?7, next_run_at = ?8, updated_at = ?9
+                            missed = ?6, overlap = ?7, next_run_at = ?8, updated_at = ?9,
+                            created_by = ?10
                      WHERE id = ?1",
                     params![
                         s.id.as_str(),
@@ -118,7 +121,8 @@ impl Db {
                         enum_str(&s.missed),
                         enum_str(&s.overlap),
                         s.next_run_at,
-                        s.updated_at
+                        s.updated_at,
+                        s.created_by.as_str()
                     ],
                 )
                 .map_err(|e| name_taken(e, &s.name))?;
@@ -158,6 +162,37 @@ impl Db {
                 .map_err(storage)?
                 .collect::<Result<_, _>>()
                 .map_err(storage)
+        })
+        .await
+    }
+
+    /// Pauses or resumes a schedule, touching only those columns so a concurrent
+    /// edit of its definition is not overwritten (review P2-7).
+    pub async fn set_schedule_enabled(
+        &self,
+        id: &ScheduleId,
+        enabled: bool,
+        next_run_at: Option<i64>,
+        updated_at: i64,
+    ) -> CoreResult<Schedule> {
+        let id = id.clone();
+        self.write(move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE schedules SET enabled = ?2, next_run_at = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    params![id.as_str(), enabled, next_run_at, updated_at],
+                )
+                .map_err(storage)?;
+            if n == 0 {
+                return Err(CoreError::NotFound(format!("schedule {id}")));
+            }
+            conn.query_row(
+                &format!("{SCHEDULE_COLUMNS} WHERE id = ?1"),
+                [id.as_str()],
+                row_to_schedule,
+            )
+            .map_err(storage)
         })
         .await
     }

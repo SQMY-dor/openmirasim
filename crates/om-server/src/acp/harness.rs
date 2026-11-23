@@ -148,7 +148,7 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                         let titles = state.tool_titles.lock().ok()?;
                         titles.get(tool_call_id.as_deref()?).cloned()
                     })
-                    .unwrap_or_else(|| "Permission requested".to_owned());
+                    .unwrap_or_else(|| crate::approval::PLACEHOLDER_TITLE.to_owned());
                 let kind = tool_call
                     .get("kind")
                     .and_then(|k| serde_json::from_value::<ToolKind>(k.clone()).ok());
@@ -193,6 +193,7 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                     )),
                 );
             }
+            Incoming::Settle(settlement) => settlement.complete(),
             Incoming::Closed => break,
         }
     }
@@ -303,7 +304,12 @@ impl Harness for AcpHarness {
         });
         tokio::spawn(handle_incoming(state.clone(), incoming));
 
-        match self.handshake(&state, &ctx, &cwd).await {
+        // If this future is dropped mid-handshake (the session was closed while starting),
+        // the agent must not outlive it.
+        let guard = KillOnDrop(Some(state.clone()));
+        let result = self.handshake(&state, &ctx, &cwd).await;
+        guard.disarm();
+        match result {
             Ok(native_id) => {
                 if let Ok(mut n) = state.native_id.lock() {
                     *n = Some(native_id.clone());
@@ -391,6 +397,24 @@ impl AcpHarness {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| CoreError::Harness("session/new returned no sessionId".into()))
+        }
+    }
+}
+
+struct KillOnDrop(Option<Arc<State>>);
+
+impl KillOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take()
+            && let Ok(mut child) = state.child.try_lock()
+        {
+            let _ = child.start_kill();
         }
     }
 }

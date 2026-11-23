@@ -57,7 +57,12 @@ pub struct HttpApiError(pub ApiError);
 
 impl From<CoreError> for HttpApiError {
     fn from(err: CoreError) -> Self {
-        Self(ApiError::from(&err))
+        let api = ApiError::from(&err);
+        if api.code == om_core::api::ApiErrorCode::Internal {
+            // Clients get a generic message; keep the detail in the server log.
+            tracing::error!(error = %err, "internal error answering a request");
+        }
+        Self(api)
     }
 }
 
@@ -644,7 +649,7 @@ async fn list_audit(
     let entries = state
         .orchestrator
         .db()
-        .list_audit(query.target, limit)
+        .list_audit(&state.config.default_space_id, query.target, limit)
         .await?
         .into_iter()
         .map(|e| AuditEntryView {

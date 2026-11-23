@@ -10,8 +10,8 @@ use om_core::auth::Action;
 use om_core::content::{ContentBlock, Prompt};
 use om_core::event::EventPayload;
 use om_core::goal::{DEFAULT_DONE_MARKER, Goal, GoalStatus, NewGoal};
-use om_core::ids::{GoalId, MemberId, SessionId, TurnId};
-use om_core::queue::SubmitMode;
+use om_core::ids::{GoalId, MemberId, QueuedPromptId, SessionId, TurnId};
+use om_core::queue::{QueueRemoval, SubmitMode, SubmitOutcome};
 use om_core::session::{SessionStatus, StopReason};
 use om_core::{CoreError, CoreResult, now_ms};
 use std::collections::HashMap;
@@ -33,8 +33,32 @@ struct Inner {
 
 /// What a driver does after a turn.
 enum Next {
-    Continue,
+    /// A continuation was sent; follow it.
+    Continue(SubmitOutcome),
     End(GoalStatus, &'static str),
+}
+
+/// The goal's own prompt the driver follows (review P1-13): only turns started by the
+/// goal's prompts count, never prompts other members sent meanwhile.
+#[derive(Debug, Clone, PartialEq)]
+enum Expect {
+    /// Waiting in the queue under this id.
+    Queued(QueuedPromptId),
+    /// Running (or ran) as this turn.
+    Turn(TurnId),
+}
+
+impl Expect {
+    fn from_outcome(o: &SubmitOutcome) -> Option<Self> {
+        match o {
+            SubmitOutcome::Started { turn_id } | SubmitOutcome::Steered { turn_id } => {
+                Some(Self::Turn(turn_id.clone()))
+            }
+            SubmitOutcome::Queued { queued_id, .. } | SubmitOutcome::Interrupting { queued_id } => {
+                Some(Self::Queued(queued_id.clone()))
+            }
+        }
+    }
 }
 
 impl GoalRunner {
@@ -149,26 +173,26 @@ impl GoalRunner {
             .lock()
             .expect("goal stops lock")
             .insert(goal.id.clone(), stop.clone());
+        // A stop that landed before the driver was registered must not be lost.
+        if !self.db().get_goal(&goal.id).await?.status.is_active() {
+            self.inner
+                .stops
+                .lock()
+                .expect("goal stops lock")
+                .remove(&goal.id);
+            return self.db().get_goal(&goal.id).await;
+        }
+        // The driver sends the opening prompt itself, so it knows which queued prompt /
+        // turn is the goal's before it reads any event of it.
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
         let this = self.clone();
         let driven = goal.clone();
-        tokio::spawn(async move { this.drive(driven, sub, stop).await });
-
-        if let Err(e) = self
-            .inner
-            .orch
-            .send_prompt(
-                session_id,
-                Some(by.clone()),
-                Prompt::text(goal.opening_prompt()),
-                SubmitMode::Queue,
-            )
-            .await
-        {
-            self.finish(&goal.id, GoalStatus::Failed, "prompt_rejected")
-                .await;
-            return Err(e);
+        tokio::spawn(async move { this.drive(driven, sub, stop, opened_tx).await });
+        match opened_rx.await {
+            Ok(Ok(())) => Ok(goal),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(CoreError::Harness("goal driver stopped".into())),
         }
-        Ok(goal)
     }
 
     /// Stops an active goal on behalf of `by`, who must be an active member of the
@@ -282,12 +306,53 @@ impl GoalRunner {
         }
     }
 
-    async fn drive(&self, goal: Goal, mut sub: Subscription, stop: Arc<Notify>) {
-        let mut turn: Option<TurnId> = None;
+    async fn drive(
+        &self,
+        goal: Goal,
+        mut sub: Subscription,
+        stop: Arc<Notify>,
+        opened: tokio::sync::oneshot::Sender<CoreResult<()>>,
+    ) {
+        let opening = self
+            .inner
+            .orch
+            .send_prompt(
+                &goal.session_id,
+                Some(goal.created_by.clone()),
+                Prompt::text(goal.opening_prompt()),
+                SubmitMode::Queue,
+            )
+            .await;
+        let mut expect = match opening {
+            Ok(outcome) => {
+                let _ = opened.send(Ok(()));
+                Expect::from_outcome(&outcome)
+            }
+            Err(e) => {
+                self.finish(&goal.id, GoalStatus::Failed, "prompt_rejected")
+                    .await;
+                let _ = opened.send(Err(e));
+                return;
+            }
+        };
+        // The deadline ends the goal even while a turn runs (review P1-13).
+        let deadline = goal.deadline_at.map(|d| {
+            let left = (d - now_ms()).max(0) as u64;
+            tokio::time::Instant::now() + std::time::Duration::from_millis(left)
+        });
         let mut reply = String::new();
         loop {
             let ev = tokio::select! {
                 _ = stop.notified() => return,
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.finish(&goal.id, GoalStatus::Expired, "deadline").await;
+                    return;
+                }
                 ev = sub.next() => ev,
             };
             let ev = match ev {
@@ -299,14 +364,35 @@ impl GoalRunner {
                 }
             };
             match ev.payload {
-                EventPayload::PromptSubmitted { turn_id, .. } => {
-                    turn = Some(turn_id);
+                EventPayload::QueueItemRemoved { queued_id, reason }
+                    if expect == Some(Expect::Queued(queued_id.clone())) =>
+                {
+                    match reason {
+                        QueueRemoval::Started { turn_id } => {
+                            expect = Some(Expect::Turn(turn_id));
+                            reply.clear();
+                        }
+                        QueueRemoval::Failed { .. } => {
+                            self.finish(&goal.id, GoalStatus::Failed, "prompt_rejected")
+                                .await;
+                            return;
+                        }
+                        _ => {
+                            self.finish(&goal.id, GoalStatus::Stopped, "prompt_withdrawn")
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                EventPayload::PromptSubmitted { turn_id, .. }
+                    if expect == Some(Expect::Turn(turn_id.clone())) =>
+                {
                     reply.clear();
                 }
                 EventPayload::AgentMessageChunk {
                     turn_id,
                     content: ContentBlock::Text { text },
-                } if turn.as_ref() == Some(&turn_id) => reply.push_str(&text),
+                } if expect == Some(Expect::Turn(turn_id.clone())) => reply.push_str(&text),
                 EventPayload::StatusChanged {
                     to: SessionStatus::Failed | SessionStatus::Closed,
                     ..
@@ -319,10 +405,12 @@ impl GoalRunner {
                     turn_id,
                     stop_reason,
                     ..
-                } if turn.as_ref() == Some(&turn_id) => {
-                    turn = None;
+                } if expect == Some(Expect::Turn(turn_id.clone())) => {
                     match self.after_turn(&goal.id, stop_reason, &reply).await {
-                        Ok(Next::Continue) => {}
+                        Ok(Next::Continue(outcome)) => {
+                            expect = Expect::from_outcome(&outcome);
+                            reply.clear();
+                        }
                         Ok(Next::End(status, reason)) => {
                             self.finish(&goal.id, status, reason).await;
                             return;
@@ -401,7 +489,7 @@ impl GoalRunner {
             )
             .await
         {
-            Ok(_) => Ok(Next::Continue),
+            Ok(outcome) => Ok(Next::Continue(outcome)),
             Err(e) => {
                 tracing::warn!(goal = %id, error = %e, "continuation rejected");
                 Ok(Next::End(GoalStatus::Failed, "prompt_rejected"))

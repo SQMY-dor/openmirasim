@@ -7,4 +7,4 @@ import type { ScheduleTarget } from "./ScheduleTarget";
 /**
  * Request body to create a schedule.
  */
-export type NewSchedule = { name: string, spec: ScheduleSpec, target: ScheduleTarget, enabled: boolean, missed: MissedRunPolicy, overlap: OverlapPolicy, };
+export type NewSchedule = { name: string, spec: ScheduleSpec, target: ScheduleTarget, enabled?: boolean, missed?: MissedRunPolicy, overlap?: OverlapPolicy, };

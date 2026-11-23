@@ -7,7 +7,7 @@ export type ListEventsQuery = {
 /**
  * Return events with `seq > after_seq`.
  */
-after_seq: number, 
+after_seq?: number, 
 /**
  * Page size; the server clamps it to [`MAX_EVENTS_PAGE`].
  */

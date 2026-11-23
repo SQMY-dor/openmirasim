@@ -93,10 +93,11 @@ pub struct MemberRecord {
     pub space_id: SpaceId,
     pub display_name: String,
     pub role: Role,
+    #[ts(type = "number")]
     pub created_at: i64,
     /// Set once the member is disabled; their tokens stop working at the same moment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub disabled_at: Option<i64>,
 }
 
@@ -114,15 +115,16 @@ pub struct DeviceTokenRecord {
     pub member_id: MemberId,
     /// Where the token is used ("MacBook", "om-cli on build box").
     pub label: String,
+    #[ts(type = "number")]
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub expires_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub last_used_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
+    #[ts(optional, type = "number")]
     pub revoked_at: Option<i64>,
 }
 

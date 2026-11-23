@@ -20,7 +20,7 @@ pub use hub::Subscription;
 use crate::approval::ApprovalPolicy;
 use crate::db::Db;
 pub use crate::harness::HarnessRegistry;
-use crate::proxy::{KeyProxy, ProxyEnvSandbox};
+use crate::proxy::{KeyProxy, ProxyEnvSandbox, SessionGrant};
 use crate::sandbox::ScopedSandbox;
 use crate::workspace::WorkspaceManager;
 use actor::{ActorSpec, Command};
@@ -60,7 +60,39 @@ impl Default for OrchestratorConfig {
     }
 }
 
-type Live = Arc<Mutex<HashMap<SessionId, mpsc::Sender<Command>>>>;
+/// A session's slot in the live map. `tx` is `None` while the slot is reserved (an
+/// agent is being started, or a stopped session is being closed), so two starts, or a
+/// start and a close, can never interleave (review P1-8). `generation` tells a stale
+/// actor's exit apart from the slot of a newer one.
+struct LiveEntry {
+    generation: u64,
+    tx: Option<mpsc::Sender<Command>>,
+}
+
+type Live = Arc<Mutex<HashMap<SessionId, LiveEntry>>>;
+
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A reserved live slot; released on drop unless an actor took it over.
+struct Reservation {
+    live: Live,
+    id: SessionId,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut map) = self.live.lock()
+            && map
+                .get(&self.id)
+                .is_some_and(|e| e.generation == self.generation)
+        {
+            map.remove(&self.id);
+        }
+    }
+}
 
 /// Entry point for session lifecycle, prompts, approvals and subscriptions.
 #[derive(Clone)]
@@ -135,20 +167,48 @@ impl Orchestrator {
     }
 
     /// The session's sandbox: scoped to its worktree / git dir / HOME when it has one,
-    /// and given key-proxy credentials instead of real keys when the proxy is enabled.
+    /// and given key-proxy credentials instead of real keys when the proxy is enabled
+    /// (the grant is returned so exactly this token is revoked when the agent stops).
     async fn session_sandbox(
         &self,
         id: &SessionId,
         config: &SessionConfig,
-    ) -> CoreResult<Arc<dyn Sandbox>> {
+    ) -> CoreResult<(Arc<dyn Sandbox>, Option<SessionGrant>)> {
         let sandbox = self.scoped_sandbox(id, config).await?;
         match &self.key_proxy {
             Some(proxy) if config.sandbox == SandboxMode::Bwrap => {
                 let grant = proxy.grant(id)?;
-                Ok(Arc::new(ProxyEnvSandbox::new(sandbox, &grant)))
+                Ok((Arc::new(ProxyEnvSandbox::new(sandbox, &grant)), Some(grant)))
             }
-            _ => Ok(sandbox),
+            _ => Ok((sandbox, None)),
         }
+    }
+
+    /// Reserves the session's live slot, failing when an agent runs or is starting.
+    fn reserve(&self, id: &SessionId) -> CoreResult<Reservation> {
+        let mut map = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.contains_key(id) {
+            return Err(CoreError::InvalidInput(format!(
+                "session {id} is already running or starting"
+            )));
+        }
+        let generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        map.insert(
+            id.clone(),
+            LiveEntry {
+                generation,
+                tx: None,
+            },
+        );
+        Ok(Reservation {
+            live: self.live.clone(),
+            id: id.clone(),
+            generation,
+            armed: true,
+        })
     }
 
     async fn scoped_sandbox(
@@ -228,23 +288,33 @@ impl Orchestrator {
         self.registry.require(id)
     }
 
-    fn spawn_actor(&self, spec: ActorSpec) {
+    fn spawn_actor(
+        &self,
+        spec: ActorSpec,
+        mut reservation: Reservation,
+        grant: Option<SessionGrant>,
+    ) {
         let (tx, rx) = mpsc::channel(self.config.command_capacity);
         let id = spec.session_id.clone();
-        self.live
-            .lock()
-            .expect("live poisoned")
-            .insert(id.clone(), tx);
+        let generation = reservation.generation;
+        if let Ok(mut map) = self.live.lock()
+            && let Some(entry) = map.get_mut(&id)
+            && entry.generation == generation
+        {
+            entry.tx = Some(tx);
+        }
+        reservation.armed = false;
         // Weak: once every Orchestrator clone is dropped, the command senders go away and
         // actors shut their agents down instead of being kept alive by this callback.
         let live = Arc::downgrade(&self.live);
         let proxy = self.key_proxy.clone();
         let on_exit = move || {
-            if let Some(proxy) = &proxy {
-                proxy.revoke_session(&id);
+            if let (Some(proxy), Some(grant)) = (&proxy, &grant) {
+                proxy.revoke_grant(&id, grant);
             }
             if let Some(live) = live.upgrade()
                 && let Ok(mut map) = live.lock()
+                && map.get(&id).is_some_and(|e| e.generation == generation)
             {
                 map.remove(&id);
             }
@@ -259,7 +329,7 @@ impl Orchestrator {
     }
 
     fn live_sender(&self, id: &SessionId) -> Option<mpsc::Sender<Command>> {
-        self.live.lock().ok()?.get(id).cloned()
+        self.live.lock().ok()?.get(id).and_then(|e| e.tx.clone())
     }
 
     async fn send<T>(
@@ -331,45 +401,59 @@ impl Orchestrator {
             mgr.attach(&summary.id, p).await?;
         }
         self.hub.publish(std::slice::from_ref(&event));
-        let sandbox = self.session_sandbox(&summary.id, &config).await?;
-        self.spawn_actor(ActorSpec {
-            session_id: summary.id.clone(),
-            config,
-            status: SessionStatus::Starting,
-            resume_native_session_id: None,
-            harness,
-            sandbox,
-            policy: self.approval_policy.clone(),
-        });
+        let reservation = self.reserve(&summary.id)?;
+        let (sandbox, grant) = self.session_sandbox(&summary.id, &config).await?;
+        self.spawn_actor(
+            ActorSpec {
+                session_id: summary.id.clone(),
+                config,
+                status: SessionStatus::Starting,
+                resume_native_session_id: None,
+                harness,
+                sandbox,
+                policy: self.approval_policy.clone(),
+            },
+            reservation,
+            grant,
+        );
         Ok(summary)
     }
 
     /// Restarts a `Failed` session, resuming the agent's native session when possible.
     pub async fn resume_session(&self, id: &SessionId) -> CoreResult<SessionSummary> {
-        if self.live_sender(id).is_some() {
-            let s = self.db.get_session(id).await?;
-            return Err(CoreError::InvalidTransition {
-                from: s.status,
-                to: SessionStatus::Starting,
-            });
-        }
+        // Reserve first: a concurrent resume or close of this session now fails instead
+        // of racing this one.
+        let reservation = match self.reserve(id) {
+            Ok(r) => r,
+            Err(_) => {
+                let s = self.db.get_session(id).await?;
+                return Err(CoreError::InvalidTransition {
+                    from: s.status,
+                    to: SessionStatus::Starting,
+                });
+            }
+        };
         let summary = self.db.get_session(id).await?;
         summary.status.transition(SessionStatus::Starting)?;
         let harness = self.harness_for(&summary.config.harness_id)?;
-        let sandbox = self.session_sandbox(&summary.id, &summary.config).await?;
+        let (sandbox, grant) = self.session_sandbox(&summary.id, &summary.config).await?;
         let resume = summary
             .native_session_id
             .clone()
             .filter(|_| harness.capabilities().resume);
-        self.spawn_actor(ActorSpec {
-            session_id: summary.id.clone(),
-            config: summary.config.clone(),
-            status: summary.status,
-            resume_native_session_id: resume,
-            harness,
-            sandbox,
-            policy: self.approval_policy.clone(),
-        });
+        self.spawn_actor(
+            ActorSpec {
+                session_id: summary.id.clone(),
+                config: summary.config.clone(),
+                status: summary.status,
+                resume_native_session_id: resume,
+                harness,
+                sandbox,
+                policy: self.approval_policy.clone(),
+            },
+            reservation,
+            grant,
+        );
         Ok(summary)
     }
 
@@ -435,7 +519,10 @@ impl Orchestrator {
             // The actor exited between the lookup and the send: fall through.
         }
         self.db.get_session(id).await?;
-        self.db.append_events(id, vec![payload]).await.map(|_| ())
+        let events = self.db.append_events(id, vec![payload]).await?;
+        // Subscribers of an ended session still get it live.
+        self.hub.publish(&events);
+        Ok(())
     }
 
     /// The session's queue, front first.
@@ -513,6 +600,20 @@ impl Orchestrator {
         if self.live_sender(id).is_some() {
             return self.send(id, |reply| Command::Close { reply }).await;
         }
+        // Hold the slot so the session cannot be resumed while it is being closed.
+        let _reservation = match self.reserve(id) {
+            Ok(r) => r,
+            Err(_) => {
+                if self.live_sender(id).is_some() {
+                    return self.send(id, |reply| Command::Close { reply }).await;
+                }
+                let s = self.db.get_session(id).await?;
+                return Err(CoreError::InvalidTransition {
+                    from: s.status,
+                    to: SessionStatus::Closed,
+                });
+            }
+        };
         let s = self.db.get_session(id).await?;
         let events = self
             .db

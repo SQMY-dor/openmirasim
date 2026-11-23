@@ -58,6 +58,8 @@ fn within_checks_are_lexical_and_strict() {
     assert!(!ok(&["sub/.git/hooks/pre-commit"]));
     assert!(!ok(&["/../../etc"]));
     assert!(!all_within("relative/cwd", &["a".into()]));
+    assert!(!ok(&[""]), "an empty path is not a scope");
+    assert!(!ok(&["src/a.rs", "  "]));
 }
 
 #[test]
@@ -181,6 +183,56 @@ fn rule_keys_scope_commands_by_title() {
         Some("execute:cargo test")
     );
     assert_eq!(rule_key(None, "x"), None);
+    assert_eq!(rule_key(Some(ToolKind::Execute), "  "), None);
+    assert_eq!(rule_key(Some(ToolKind::Fetch), PLACEHOLDER_TITLE), None);
+}
+
+#[test]
+fn remembered_file_allows_stay_in_the_sandboxed_worktree() {
+    let p = ApprovalPolicy::ask_always();
+    let p = ApprovalPolicy {
+        remember_always: true,
+        ..p
+    };
+    let o = opts();
+    let mut mem = HashMap::new();
+    mem.insert("edit".to_string(), Remembered { allow: true });
+    mem.insert("delete:rm a".to_string(), Remembered { allow: true });
+    let inside = vec!["src/a.rs".to_string()];
+    let git = vec![".git/config".to_string()];
+    let outside = vec!["/home/x/.bashrc".to_string()];
+    assert_eq!(
+        p.evaluate(
+            &req(SandboxMode::Bwrap, Some(ToolKind::Edit), &inside, "t", &o),
+            &mem
+        ),
+        auto("remembered:edit", "a1")
+    );
+    for locs in [&git, &outside, &vec![]] {
+        assert_eq!(
+            p.evaluate(
+                &req(SandboxMode::Bwrap, Some(ToolKind::Edit), locs, "t", &o),
+                &mem
+            ),
+            Verdict::Ask,
+            "{locs:?}"
+        );
+    }
+    assert_eq!(
+        p.evaluate(
+            &req(SandboxMode::Direct, Some(ToolKind::Edit), &inside, "t", &o),
+            &mem
+        ),
+        Verdict::Ask,
+        "no remembered file allow outside the sandbox"
+    );
+    assert_eq!(
+        p.evaluate(
+            &req(SandboxMode::Bwrap, Some(ToolKind::Delete), &git, "rm a", &o),
+            &mem
+        ),
+        Verdict::Ask
+    );
 }
 
 #[test]

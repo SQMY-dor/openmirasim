@@ -7,4 +7,4 @@ import type { SubmitMode } from "./SubmitMode";
 /**
  * What a schedule does when it fires.
  */
-export type ScheduleTarget = { "kind": "new_session", config: SessionConfig, prompt: Prompt, } | { "kind": "session", session_id: SessionId, prompt: Prompt, mode: SubmitMode, };
+export type ScheduleTarget = { "kind": "new_session", config: SessionConfig, prompt: Prompt, } | { "kind": "session", session_id: SessionId, prompt: Prompt, mode?: SubmitMode, };

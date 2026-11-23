@@ -9,4 +9,4 @@ export type DeviceTokenRecord = { id: TokenId, member_id: MemberId,
 /**
  * Where the token is used ("MacBook", "om-cli on build box").
  */
-label: string, created_at: bigint, expires_at?: bigint, last_used_at?: bigint, revoked_at?: bigint, };
+label: string, created_at: number, expires_at?: number, last_used_at?: number, revoked_at?: number, };

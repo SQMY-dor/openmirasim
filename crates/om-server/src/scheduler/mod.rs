@@ -64,6 +64,28 @@ struct Inner {
     wake: Notify,
     stopped: AtomicBool,
     ready_timeout: Duration,
+    /// Schedules with a `NewSession` fire in progress (review P1-12): the overlap check
+    /// cannot rely on the recorded run, which only exists once the fire finishes.
+    starting: std::sync::Mutex<std::collections::HashSet<ScheduleId>>,
+    /// Bounds fires running at once.
+    fire_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Fires running at once across all schedules; more wait for a slot.
+pub const MAX_CONCURRENT_FIRES: usize = 8;
+
+/// Marks a schedule as starting a session until dropped.
+struct StartingGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<ScheduleId>>,
+    id: ScheduleId,
+}
+
+impl Drop for StartingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.set.lock() {
+            s.remove(&self.id);
+        }
+    }
 }
 
 impl Scheduler {
@@ -80,6 +102,8 @@ impl Scheduler {
                 wake: Notify::new(),
                 stopped: AtomicBool::new(false),
                 ready_timeout,
+                starting: std::sync::Mutex::default(),
+                fire_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FIRES)),
             }),
         }
     }
@@ -127,7 +151,7 @@ impl Scheduler {
         new: NewSchedule,
     ) -> CoreResult<Schedule> {
         new.validate()?;
-        let old = self.db().get_schedule(id).await?;
+        let old = self.schedule_for(id, by).await?;
         self.check_owner(&old.space_id, by, &new.target).await?;
         let now = now_ms();
         let next_run_at = Self::first_fire(&new, now)?;
@@ -150,29 +174,91 @@ impl Scheduler {
 
     /// Pauses or resumes a schedule. Resuming picks the next slot after now; slots that
     /// passed while it was paused are not run.
-    pub async fn set_enabled(&self, id: &ScheduleId, enabled: bool) -> CoreResult<Schedule> {
-        let old = self.db().get_schedule(id).await?;
+    /// `by` must be the schedule's owner or an admin of its space; resuming also
+    /// needs the right to do what the schedule does.
+    pub async fn set_enabled(
+        &self,
+        id: &ScheduleId,
+        by: &MemberId,
+        enabled: bool,
+    ) -> CoreResult<Schedule> {
+        let old = self.schedule_for(id, by).await?;
+        self.check_manages(&old, by).await?;
+        if enabled {
+            self.check_owner(&old.space_id, by, &old.target).await?;
+        }
         if old.enabled == enabled {
             return Ok(old);
         }
         let now = now_ms();
-        let s = Schedule {
-            enabled,
-            next_run_at: if enabled {
-                old.spec.next_after(now)
-            } else {
-                None
-            },
-            updated_at: now,
-            ..old
+        let next = if enabled {
+            old.spec.next_after(now)
+        } else {
+            None
         };
-        let s = self.db().update_schedule(s).await?;
+        let s = self
+            .db()
+            .set_schedule_enabled(id, enabled, next, now)
+            .await?;
+        self.audit(
+            by,
+            if enabled {
+                "schedule.resumed"
+            } else {
+                "schedule.paused"
+            },
+            &s,
+        )
+        .await;
         self.inner.wake.notify_one();
         Ok(s)
     }
 
-    pub async fn delete(&self, id: &ScheduleId) -> CoreResult<()> {
-        self.db().delete_schedule(id).await
+    /// Deletes a schedule; `by` must be its owner or an admin of its space.
+    pub async fn delete(&self, id: &ScheduleId, by: &MemberId) -> CoreResult<()> {
+        let s = self.schedule_for(id, by).await?;
+        self.check_manages(&s, by).await?;
+        self.db().delete_schedule(id).await?;
+        self.audit(by, "schedule.deleted", &s).await;
+        Ok(())
+    }
+
+    /// Loads a schedule for `by`; a schedule of another space looks like `NotFound`.
+    async fn schedule_for(&self, id: &ScheduleId, by: &MemberId) -> CoreResult<Schedule> {
+        let s = self.db().get_schedule(id).await?;
+        match self.db().get_member(by).await {
+            Ok(m) if m.space_id == s.space_id => Ok(s),
+            Ok(_) | Err(CoreError::NotFound(_)) => {
+                Err(CoreError::NotFound(format!("schedule {id}")))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The owner, or an active admin of the schedule's space.
+    async fn check_manages(&self, s: &Schedule, by: &MemberId) -> CoreResult<()> {
+        let m = self.db().get_member(by).await?;
+        if !m.is_active() {
+            return Err(CoreError::Forbidden("member is not active".into()));
+        }
+        if &s.created_by == by || m.role.can(Action::ManageMembers) {
+            Ok(())
+        } else {
+            Err(CoreError::Forbidden(
+                "only the schedule's owner or an admin may change it".into(),
+            ))
+        }
+    }
+
+    async fn audit(&self, by: &MemberId, action: &str, s: &Schedule) {
+        let detail = serde_json::json!({"name": s.name, "enabled": s.enabled});
+        if let Err(e) = self
+            .db()
+            .audit(Some(by.clone()), action, s.id.as_str(), detail)
+            .await
+        {
+            tracing::warn!(schedule = %s.id, error = %e, "schedule audit entry not written");
+        }
     }
 
     pub async fn get(&self, id: &ScheduleId) -> CoreResult<Schedule> {
@@ -193,7 +279,7 @@ impl Scheduler {
     /// Fires a schedule now, outside its timetable, without moving its next slot. `by`
     /// must be allowed to do what the schedule does; the run still acts as the owner.
     pub async fn trigger(&self, id: &ScheduleId, by: &MemberId) -> CoreResult<ScheduleRun> {
-        let s = self.db().get_schedule(id).await?;
+        let s = self.schedule_for(id, by).await?;
         self.check_owner(&s.space_id, by, &s.target).await?;
         let now = now_ms();
         Ok(self.fire(s, now, true).await)
@@ -214,7 +300,9 @@ impl Scheduler {
                 continue;
             }
             let this = self.clone();
+            let slots = self.inner.fire_slots.clone();
             fired.push(tokio::spawn(async move {
+                let _slot = slots.acquire_owned().await;
                 if now - slot > MISSED_GRACE_MS && s.missed == MissedRunPolicy::Skip {
                     let run = ScheduleRun {
                         id: ScheduleRunId::new(),
@@ -381,6 +469,22 @@ impl Scheduler {
                 }
             }
             ScheduleTarget::NewSession { config, prompt } => {
+                // Claim the "starting" mark first, atomically, so two fires of one
+                // schedule cannot both pass the overlap check.
+                let _starting = {
+                    let mut set = self
+                        .inner
+                        .starting
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if !set.insert(s.id.clone()) && s.overlap == OverlapPolicy::Skip {
+                        return skipped(SkipReason::PreviousRunActive);
+                    }
+                    StartingGuard {
+                        set: &self.inner.starting,
+                        id: s.id.clone(),
+                    }
+                };
                 if s.overlap == OverlapPolicy::Skip && self.previous_run_active(&s.id).await {
                     return skipped(SkipReason::PreviousRunActive);
                 }
@@ -397,19 +501,27 @@ impl Scheduler {
                     Ok(summary) => summary.id,
                     Err(e) => return failed(e, None),
                 };
-                if let Err(e) =
-                    wait_ready(&self.inner.orch, &session_id, self.inner.ready_timeout).await
-                {
-                    return failed(e, Some(session_id));
-                }
-                match self
-                    .inner
-                    .orch
-                    .send_prompt(&session_id, owner, prompt.clone(), SubmitMode::Queue)
-                    .await
-                {
+                let started =
+                    match wait_ready(&self.inner.orch, &session_id, self.inner.ready_timeout).await
+                    {
+                        Ok(()) => {
+                            self.inner
+                                .orch
+                                .send_prompt(&session_id, owner, prompt.clone(), SubmitMode::Queue)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                match started {
                     Ok(submit) => RunOutcome::SessionStarted { session_id, submit },
-                    Err(e) => failed(e, Some(session_id)),
+                    Err(e) => {
+                        // Close the session this run created so it neither holds sandbox
+                        // resources nor blocks later fires as an "active" previous run.
+                        if let Err(ce) = self.inner.orch.close_session(&session_id).await {
+                            tracing::warn!(session = %session_id, error = %ce, "closing failed scheduled session");
+                        }
+                        failed(e, Some(session_id))
+                    }
                 }
             }
         }

@@ -4,10 +4,12 @@ use super::wait_ready;
 use crate::db::Db;
 use crate::orchestrator::Orchestrator;
 use om_core::auth::Action;
-use om_core::dispatch::{Dispatch, DispatchTarget, MAX_DISPATCH_DEPTH, NewDispatch};
+use om_core::dispatch::{
+    Dispatch, DispatchTarget, MAX_DISPATCH_DEPTH, MAX_DISPATCH_FANOUT, NewDispatch,
+};
 use om_core::event::EventPayload;
 use om_core::ids::{DispatchId, MemberId, SessionId};
-use om_core::queue::SubmitMode;
+use om_core::queue::{SubmitMode, SubmitOutcome};
 use om_core::session::SessionStatus;
 use om_core::{CoreError, CoreResult, now_ms};
 use std::time::Duration;
@@ -59,44 +61,55 @@ impl Dispatcher {
         req.validate()?;
         let from = self.db.get_session(&req.from_session).await?;
         let by_member = by.is_some();
-        let member_id = match by {
-            Some(m) => m,
-            None => self.db.last_turn_member(&from.id).await?.ok_or_else(|| {
-                CoreError::Forbidden(
-                    "no member started the source session's turn, so it cannot dispatch".into(),
+        let (member_id, depth, fanout) = match by {
+            // A member dispatching by hand starts a new chain.
+            Some(m) => {
+                self.check_member(&m, &from.space_id).await?;
+                (m, 1, None)
+            }
+            // An agent extends the chain of the turn it runs in, and only while it runs.
+            None => {
+                if !matches!(
+                    from.status,
+                    SessionStatus::Running | SessionStatus::WaitingApproval
+                ) {
+                    return Err(CoreError::InvalidInput(
+                        "an agent can only dispatch while its turn runs".into(),
+                    ));
+                }
+                let turn = self.db.turn_context(&from.id).await?.ok_or_else(|| {
+                    CoreError::Forbidden("the source session has no turn to act for".into())
+                })?;
+                // Everyone who instructed this turn must be allowed; act as its starter.
+                let mut acting = None;
+                for m in &turn.members {
+                    let m = m.clone().ok_or_else(|| {
+                        CoreError::Forbidden(
+                            "an instruction in this turn came from no member, so it cannot dispatch"
+                                .into(),
+                        )
+                    })?;
+                    self.check_member(&m, &from.space_id).await?;
+                    acting.get_or_insert(m);
+                }
+                let acting = acting.expect("a turn has a starter");
+                (
+                    acting,
+                    turn.depth + 1,
+                    Some((turn.started_at, MAX_DISPATCH_FANOUT)),
                 )
-            })?,
-        };
-        let m = self
-            .db
-            .get_member(&member_id)
-            .await
-            .map_err(|_| CoreError::Forbidden("unknown member".into()))?;
-        if !m.is_active() || m.space_id != from.space_id {
-            return Err(CoreError::Forbidden(
-                "member is not active in this space".into(),
-            ));
-        }
-        if !m.role.can(Action::PromptSession) {
-            return Err(CoreError::Forbidden(
-                "role does not allow prompting sessions".into(),
-            ));
-        }
-        // A member dispatching by hand starts a new chain; an agent extends its own.
-        let depth = if by_member {
-            1
-        } else {
-            self.db.dispatch_depth(&from.id).await? + 1
+            }
         };
         if depth > MAX_DISPATCH_DEPTH {
             return Err(CoreError::LimitExceeded(format!(
                 "dispatch chains are limited to {MAX_DISPATCH_DEPTH} hops"
             )));
         }
+        let m = self.db.get_member(&member_id).await?;
 
-        let (to_session, created_session, mode) = match req.target {
+        let (to_session, created_session, mode) = match &req.target {
             DispatchTarget::Session { session_id, mode } => {
-                let to = self.db.get_session(&session_id).await?;
+                let to = self.db.get_session(session_id).await?;
                 if to.space_id != from.space_id {
                     return Err(CoreError::NotFound(format!("session {session_id}")));
                 }
@@ -105,7 +118,7 @@ impl Dispatcher {
                         "the target session has ended".into(),
                     ));
                 }
-                (session_id, false, mode)
+                (session_id.clone(), false, *mode)
             }
             DispatchTarget::NewSession { config } => {
                 if !m.role.can(Action::CreateSession) {
@@ -115,32 +128,96 @@ impl Dispatcher {
                 }
                 let created = self
                     .orch
-                    .create_session(from.space_id.clone(), config, Some(member_id.clone()))
+                    .create_session(
+                        from.space_id.clone(),
+                        config.clone(),
+                        Some(member_id.clone()),
+                    )
                     .await?;
-                wait_ready(&self.orch, &created.id, self.ready_timeout).await?;
                 (created.id, true, SubmitMode::Queue)
             }
         };
-        let submit = self
-            .orch
-            .send_prompt(&to_session, Some(member_id.clone()), req.prompt, mode)
-            .await?;
+        // Reserve the row before anything reaches the target, so the depth and fan-out
+        // limits see this dispatch at once (review P1-14).
+        let reserved = self
+            .db
+            .reserve_dispatch(
+                Dispatch {
+                    id: DispatchId::new(),
+                    space_id: from.space_id.clone(),
+                    from_session: from.id.clone(),
+                    to_session: to_session.clone(),
+                    member_id: member_id.clone(),
+                    depth,
+                    created_session,
+                    submit: SubmitOutcome::Queued {
+                        queued_id: om_core::ids::QueuedPromptId::new(),
+                        position: 0,
+                    },
+                    created_at: now_ms(),
+                },
+                fanout,
+            )
+            .await;
+        let reserved = match reserved {
+            Ok(d) => d,
+            Err(e) => {
+                self.abandon(created_session.then_some(&to_session)).await;
+                return Err(e);
+            }
+        };
+        let delivered = async {
+            if created_session {
+                wait_ready(&self.orch, &to_session, self.ready_timeout).await?;
+            }
+            self.orch
+                .send_prompt(&to_session, Some(member_id.clone()), req.prompt, mode)
+                .await
+        }
+        .await;
+        let submit = match delivered {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = self.db.delete_dispatch(&reserved.id).await;
+                self.abandon(created_session.then_some(&to_session)).await;
+                return Err(e);
+            }
+        };
         let d = self
             .db
-            .insert_dispatch(Dispatch {
-                id: DispatchId::new(),
-                space_id: from.space_id,
-                from_session: from.id,
-                to_session,
-                member_id,
-                depth,
-                created_session,
-                submit,
-                created_at: now_ms(),
-            })
+            .complete_dispatch(Dispatch { submit, ..reserved })
             .await?;
         self.record(&d, !by_member).await;
         Ok(d)
+    }
+
+    /// The member must be active in `space` and allowed to prompt sessions.
+    async fn check_member(&self, id: &MemberId, space: &om_core::ids::SpaceId) -> CoreResult<()> {
+        let m = self
+            .db
+            .get_member(id)
+            .await
+            .map_err(|_| CoreError::Forbidden("unknown member".into()))?;
+        if !m.is_active() || &m.space_id != space {
+            return Err(CoreError::Forbidden(
+                "member is not active in this space".into(),
+            ));
+        }
+        if !m.role.can(Action::PromptSession) {
+            return Err(CoreError::Forbidden(
+                "role does not allow prompting sessions".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Closes a session this dispatch created but could not deliver to.
+    async fn abandon(&self, created: Option<&SessionId>) {
+        if let Some(id) = created
+            && let Err(e) = self.orch.close_session(id).await
+        {
+            tracing::warn!(session = %id, error = %e, "closing undelivered dispatch session");
+        }
     }
 
     /// Announces the dispatch on both sessions' streams and writes the audit entry.

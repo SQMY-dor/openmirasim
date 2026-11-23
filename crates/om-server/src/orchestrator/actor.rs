@@ -167,7 +167,10 @@ impl Actor {
                 "prompts are queued; send with a submit mode instead".into(),
             ));
         }
-        self.start_turn(member, prompt, None).await
+        let turn = self.start_turn(member, prompt, None).await?;
+        // An empty queue has nothing left to hold back.
+        self.set_paused(false).await;
+        Ok(turn)
     }
 
     /// Starts a turn. `from_queue` records which queued prompt it came from.
@@ -249,26 +252,33 @@ impl Actor {
 
     /// Starts queued prompts while the session is idle and the queue is not paused. A
     /// prompt the harness refuses is dropped with `Failed` and the next one is tried.
-    async fn drain(&mut self) {
+    /// Returns what happened to each prompt it took off the queue.
+    async fn drain(&mut self) -> Vec<(QueuedPromptId, Result<TurnId, String>)> {
+        let mut out = Vec::new();
         while !self.paused
             && self.turn.is_none()
             && self.status == SessionStatus::Idle
             && let Some(next) = self.queue.pop_front()
         {
             let id = next.id.clone();
-            if let Err(e) = self
+            match self
                 .start_turn(next.member_id, next.prompt, Some(id.clone()))
                 .await
             {
-                self.record(vec![EventPayload::QueueItemRemoved {
-                    queued_id: id,
-                    reason: QueueRemoval::Failed {
-                        error: e.to_string(),
-                    },
-                }])
-                .await;
+                Ok(turn) => out.push((id, Ok(turn))),
+                Err(e) => {
+                    self.record(vec![EventPayload::QueueItemRemoved {
+                        queued_id: id.clone(),
+                        reason: QueueRemoval::Failed {
+                            error: e.to_string(),
+                        },
+                    }])
+                    .await;
+                    out.push((id, Err(e.to_string())));
+                }
             }
         }
+        out
     }
 
     /// Drops every queued prompt (session closing or agent gone).
@@ -294,18 +304,27 @@ impl Actor {
         match self.status {
             SessionStatus::Idle if self.turn.is_none() => {
                 // Sending again resumes a paused queue. A plain `Queue` send still waits
-                // behind what is already queued; `Next` / `Steer` go first.
-                self.set_paused(false).await;
+                // behind what is already queued; `Next` / `Steer` go first. Nothing is
+                // unpaused until the prompt is accepted (review P1-9).
                 if mode == SubmitMode::Queue && !self.queue.is_empty() {
                     let (queued_id, _) = self.enqueue(member, prompt, mode, false).await?;
-                    self.drain().await;
-                    let position = self.position_of(&queued_id).unwrap_or(0) as u32;
-                    return Ok(SubmitOutcome::Queued {
-                        queued_id,
-                        position,
-                    });
+                    self.set_paused(false).await;
+                    let drained = self.drain().await;
+                    if let Some(position) = self.position_of(&queued_id) {
+                        return Ok(SubmitOutcome::Queued {
+                            queued_id,
+                            position: position as u32,
+                        });
+                    }
+                    // The queue ahead failed to start and ours was taken off too.
+                    return match drained.into_iter().find(|(id, _)| id == &queued_id) {
+                        Some((_, Ok(turn_id))) => Ok(SubmitOutcome::Started { turn_id }),
+                        Some((_, Err(e))) => Err(CoreError::Harness(e)),
+                        None => Err(CoreError::Harness("queued prompt was dropped".into())),
+                    };
                 }
                 let turn_id = self.start_turn(member, prompt, None).await?;
+                self.set_paused(false).await;
                 Ok(SubmitOutcome::Started { turn_id })
             }
             SessionStatus::Running | SessionStatus::WaitingApproval if self.turn.is_some() => {
@@ -381,6 +400,9 @@ impl Actor {
         }])
         .await?;
         self.queue.remove(i);
+        if self.queue.is_empty() {
+            self.set_paused(false).await;
+        }
         Ok(())
     }
 
@@ -450,12 +472,13 @@ impl Actor {
         decision: ApprovalDecision,
     ) -> ApprovalRecord {
         let approval_id = outcome.approval.record.id.clone();
+        let for_agent = agent_decision(&outcome.approval.record.options, &decision);
         self.hub.publish(std::slice::from_ref(&outcome.event));
         self.pending.remove(&approval_id);
         self.deadlines.remove(&approval_id);
         if let Some(s) = &self.session
             && let Err(e) = s
-                .respond_approval(&outcome.approval.harness_request_id, decision)
+                .respond_approval(&outcome.approval.harness_request_id, for_agent)
                 .await
         {
             tracing::warn!(session = %self.id, error = %e, "harness rejected approval answer");
@@ -517,6 +540,8 @@ impl Actor {
             .filter(|(_, d)| **d <= now)
             .map(|(id, _)| id.clone())
             .collect();
+        // A storage hiccup must not leave the approval waiting forever: retry shortly.
+        let retry_at = now + std::time::Duration::from_secs(1);
         for id in due {
             self.deadlines.remove(&id);
             let decision = match self.db.get_approval(&id).await {
@@ -524,8 +549,13 @@ impl Actor {
                     Some(option_id) => ApprovalDecision::Selected { option_id },
                     None => ApprovalDecision::Cancelled,
                 },
+                Err(CoreError::NotFound(_)) => {
+                    self.pending.remove(&id);
+                    continue;
+                }
                 Err(e) => {
                     tracing::error!(session = %self.id, error = %e, "failed to load approval");
+                    self.deadlines.insert(id, retry_at);
                     continue;
                 }
             };
@@ -541,7 +571,8 @@ impl Actor {
                     self.pending.remove(&id);
                 }
                 Err(e) => {
-                    tracing::error!(session = %self.id, error = %e, "failed to expire approval")
+                    tracing::error!(session = %self.id, error = %e, "failed to expire approval");
+                    self.deadlines.insert(id, retry_at);
                 }
             }
         }
@@ -556,6 +587,9 @@ impl Actor {
                     .collect();
             }
             Err(e) => {
+                // Fail closed: without a fresh read, keep only remembered rejections so
+                // a revoked "allow always" can never keep answering.
+                self.remembered.retain(|_, r| !r.allow);
                 tracing::error!(session = %self.id, error = %e, "failed to load approval rules")
             }
         }
@@ -687,7 +721,11 @@ impl Actor {
         let turn = self.turn.clone();
         let turn_payload = |f: &dyn Fn(TurnId) -> EventPayload| turn.clone().map(f);
         match ev {
-            HarnessEvent::NativeSessionId(_) => {}
+            HarnessEvent::NativeSessionId(native) => {
+                if let Err(e) = self.db.set_native_session_id(&self.id, native).await {
+                    tracing::warn!(session = %self.id, error = %e, "native session id not saved");
+                }
+            }
             HarnessEvent::MessageChunk(content) => {
                 if let Some(p) = turn_payload(&|turn_id| EventPayload::AgentMessageChunk {
                     turn_id,
@@ -818,16 +856,62 @@ pub(crate) async fn run(
         paused: false,
     };
 
-    let events = start_harness(&mut actor, &spec).await;
-    let Some(mut events) = events else {
-        // Fail queued commands so callers do not hang.
-        commands.close();
-        while let Some(cmd) = commands.recv().await {
-            reject(cmd, CoreError::Harness("harness failed to start".into()));
+    // Starting can take a while (handshake timeouts): keep answering `Close` meanwhile
+    // (review P2-5). Other commands wait until the agent is up.
+    let mut buffered = Vec::new();
+    let mut close_reply = None;
+    let started = {
+        let start = start_harness(&mut actor, &spec);
+        tokio::pin!(start);
+        loop {
+            tokio::select! {
+                r = &mut start => break Some(r),
+                cmd = commands.recv() => match cmd {
+                    Some(Command::Close { reply }) => {
+                        close_reply = Some(reply);
+                        break None;
+                    }
+                    Some(other) => buffered.push(other),
+                    None => break None,
+                },
+            }
         }
-        on_exit();
-        return;
     };
+    let mut events = match started {
+        Some(Some(events)) => events,
+        Some(None) | None => {
+            if let Some(reply) = close_reply {
+                // The start was abandoned (dropping it stops the agent).
+                let _ = reply.send(actor.on_close().await);
+            }
+            // Fail queued commands so callers do not hang.
+            commands.close();
+            for cmd in buffered {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            while let Some(cmd) = commands.recv().await {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            on_exit();
+            return;
+        }
+    };
+    for cmd in buffered {
+        if handle_command(&mut actor, cmd).await {
+            if let Some(s) = actor.session.take() {
+                let _ = s.shutdown().await;
+            }
+            commands.close();
+            while let Ok(cmd) = commands.try_recv() {
+                reject(
+                    cmd,
+                    CoreError::InvalidInput("session is no longer running".into()),
+                );
+            }
+            on_exit();
+            return;
+        }
+    }
 
     loop {
         let deadline = actor.next_deadline();
@@ -1011,5 +1095,66 @@ fn reject(cmd: Command, err: CoreError) {
         Command::ResolveApproval { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
         }
+    }
+}
+
+/// The answer sent to the agent for a member's decision. "Always" choices are kept by
+/// the server (so members can revoke them); the agent gets the matching one-off option
+/// when it offered one, so it never caches a rule of its own.
+fn agent_decision(
+    options: &[om_core::approval::ApprovalOption],
+    decision: &ApprovalDecision,
+) -> ApprovalDecision {
+    use om_core::approval::ApprovalOptionKind as K;
+    let ApprovalDecision::Selected { option_id } = decision else {
+        return decision.clone();
+    };
+    let Some(chosen) = options.iter().find(|o| &o.option_id == option_id) else {
+        return decision.clone();
+    };
+    let once = match chosen.kind {
+        K::AllowAlways => K::AllowOnce,
+        K::RejectAlways => K::RejectOnce,
+        _ => return decision.clone(),
+    };
+    options
+        .iter()
+        .find(|o| o.kind == once)
+        .map(|o| ApprovalDecision::Selected {
+            option_id: o.option_id.clone(),
+        })
+        .unwrap_or_else(|| decision.clone())
+}
+
+#[cfg(test)]
+mod agent_decision_tests {
+    use super::*;
+    use om_core::approval::{ApprovalOption, ApprovalOptionKind as K};
+
+    #[test]
+    fn always_answers_reach_the_agent_as_one_offs() {
+        let opts: Vec<_> = [
+            ("a1", K::AllowOnce),
+            ("aa", K::AllowAlways),
+            ("ra", K::RejectAlways),
+        ]
+        .into_iter()
+        .map(|(id, kind)| ApprovalOption {
+            option_id: id.into(),
+            name: id.into(),
+            kind,
+        })
+        .collect();
+        let sel = |id: &str| ApprovalDecision::Selected {
+            option_id: id.into(),
+        };
+        assert_eq!(agent_decision(&opts, &sel("aa")), sel("a1"));
+        assert_eq!(agent_decision(&opts, &sel("a1")), sel("a1"));
+        // No one-off reject offered: the member's choice goes through unchanged.
+        assert_eq!(agent_decision(&opts, &sel("ra")), sel("ra"));
+        assert_eq!(
+            agent_decision(&opts, &ApprovalDecision::Cancelled),
+            ApprovalDecision::Cancelled
+        );
     }
 }

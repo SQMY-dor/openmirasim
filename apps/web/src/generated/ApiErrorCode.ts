@@ -3,4 +3,4 @@
 /**
  * Machine-readable error code.
  */
-export type ApiErrorCode = "unauthorized" | "forbidden" | "not_found" | "conflict" | "invalid_input" | "unsupported" | "internal";
+export type ApiErrorCode = "unauthorized" | "forbidden" | "not_found" | "conflict" | "invalid_input" | "unsupported" | "limit_exceeded" | "internal";

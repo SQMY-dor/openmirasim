@@ -6,4 +6,4 @@ import type { SubmitMode } from "./SubmitMode";
 /**
  * Where a dispatch goes.
  */
-export type DispatchTarget = { "kind": "session", session_id: SessionId, mode: SubmitMode, } | { "kind": "new_session", config: SessionConfig, };
+export type DispatchTarget = { "kind": "session", session_id: SessionId, mode?: SubmitMode, } | { "kind": "new_session", config: SessionConfig, };

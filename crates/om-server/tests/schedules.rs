@@ -517,10 +517,10 @@ async fn once_pause_trigger_delete_and_failures() {
     ));
 
     // Paused: nothing fires.
-    let paused = f.sched.set_enabled(&s.id, false).await.unwrap();
+    let paused = f.sched.set_enabled(&s.id, &f.member, false).await.unwrap();
     assert_eq!(paused.next_run_at, None);
     assert!(fire_all(&f, at).await.is_empty());
-    let s = f.sched.set_enabled(&s.id, true).await.unwrap();
+    let s = f.sched.set_enabled(&s.id, &f.member, true).await.unwrap();
     assert_eq!(s.next_run_at, Some(at));
 
     // A harness that cannot start fails the run, naming the session it created.
@@ -547,7 +547,7 @@ async fn once_pause_trigger_delete_and_failures() {
     assert_eq!(f.sched.get(&s.id).await.unwrap().next_run_at, s.next_run_at);
     assert_eq!(f.sched.runs(&s.id, 10).await.unwrap()[0], run);
 
-    f.sched.delete(&s.id).await.unwrap();
+    f.sched.delete(&s.id, &f.member).await.unwrap();
     assert!(matches!(
         f.sched.get(&s.id).await,
         Err(CoreError::NotFound(_))
@@ -594,4 +594,102 @@ async fn background_loop_fires_on_time() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn editing_a_schedule_makes_the_editor_its_stored_owner() {
+    let f = fixture().await;
+    let bob =
+        f.db.create_member(&f.space, "bob", Role::Member, None)
+            .await
+            .unwrap()
+            .id;
+    let s = f
+        .sched
+        .create(
+            f.space.clone(),
+            &f.member,
+            new_schedule(
+                "edit-owner",
+                every_minute(1_000),
+                new_session_target("hold", "a"),
+            ),
+        )
+        .await
+        .unwrap();
+    f.sched
+        .update(
+            &s.id,
+            &bob,
+            new_schedule(
+                "edit-owner",
+                every_minute(1_000),
+                new_session_target("hold", "b"),
+            ),
+        )
+        .await
+        .unwrap();
+    // Read back from the database, not the returned value.
+    let stored = f.db.get_schedule(&s.id).await.unwrap();
+    assert_eq!(
+        stored.created_by, bob,
+        "fires run as the editor, not the old owner"
+    );
+}
+
+#[tokio::test]
+async fn failed_new_session_runs_close_their_session_and_changes_need_rights() {
+    let f = fixture().await;
+    let s = f
+        .sched
+        .create(
+            f.space.clone(),
+            &f.member,
+            new_schedule(
+                "broken",
+                every_minute(1_000),
+                new_session_target("broken", "x"),
+            ),
+        )
+        .await
+        .unwrap();
+    let run = f.sched.trigger(&s.id, &f.member).await.unwrap();
+    let RunOutcome::Failed {
+        session_id: Some(sid),
+        ..
+    } = run.outcome
+    else {
+        panic!("{:?}", run.outcome)
+    };
+    assert_eq!(
+        f.db.get_session(&sid).await.unwrap().status,
+        SessionStatus::Closed,
+        "the failed run's session is closed"
+    );
+
+    // Another member may not pause or delete it; another space cannot even see it.
+    let bob =
+        f.db.create_member(&f.space, "bob", Role::Member, None)
+            .await
+            .unwrap()
+            .id;
+    assert!(matches!(
+        f.sched.set_enabled(&s.id, &bob, false).await,
+        Err(om_core::CoreError::Forbidden(_))
+    ));
+    assert!(matches!(
+        f.sched.delete(&s.id, &bob).await,
+        Err(om_core::CoreError::Forbidden(_))
+    ));
+    let other = f.db.ensure_space("other").await.unwrap();
+    let eve =
+        f.db.create_member(&other, "eve", Role::Owner, None)
+            .await
+            .unwrap()
+            .id;
+    assert!(matches!(
+        f.sched.delete(&s.id, &eve).await,
+        Err(om_core::CoreError::NotFound(_))
+    ));
+    f.sched.delete(&s.id, &f.member).await.unwrap();
 }

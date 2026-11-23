@@ -3,7 +3,7 @@
 use super::{Db, enum_str, from_json, parse_enum, storage, to_json};
 use om_core::dispatch::Dispatch;
 use om_core::goal::{Goal, GoalStatus};
-use om_core::ids::{DispatchId, GoalId, MemberId, SessionId, SpaceId};
+use om_core::ids::{DispatchId, GoalId, MemberId, SessionId, SpaceId, TurnId};
 use om_core::{CoreError, CoreResult, now_ms};
 use rusqlite::{OptionalExtension, params};
 
@@ -29,6 +29,19 @@ fn row_to_goal(r: &rusqlite::Row<'_>) -> rusqlite::Result<Goal> {
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
     })
+}
+
+/// See [`Db::turn_context`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnContext {
+    pub turn_id: TurnId,
+    /// When the turn's prompt was submitted (Unix ms).
+    pub started_at: i64,
+    /// The turn's starter, then every member who steered into it; `None` for a prompt
+    /// no member sent.
+    pub members: Vec<Option<MemberId>>,
+    /// Depth of the dispatch chain that delivered this turn; 0 for a member's own turn.
+    pub depth: u32,
 }
 
 fn row_to_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<Dispatch> {
@@ -186,37 +199,149 @@ impl Db {
 
     /// The member whose prompt started the session's latest turn, if a member did.
     pub async fn last_turn_member(&self, session_id: &SessionId) -> CoreResult<Option<MemberId>> {
+        Ok(self
+            .turn_context(session_id)
+            .await?
+            .and_then(|t| t.members.into_iter().next().flatten()))
+    }
+
+    /// Who instructed the session's latest turn and how deep in a dispatch chain it is
+    /// (review P1-14). `None` when the session never had a turn.
+    pub async fn turn_context(&self, session_id: &SessionId) -> CoreResult<Option<TurnContext>> {
         let session_id = session_id.clone();
         self.read(move |conn| {
-            let member: Option<Option<String>> = conn
+            let tx = conn.unchecked_transaction().map_err(storage)?;
+            let latest: Option<(i64, i64, String, Option<String>)> = tx
                 .query_row(
-                    "SELECT json_extract(payload, '$.member_id') FROM events
-                     WHERE session_id = ?1 AND type = 'prompt_submitted'
+                    "SELECT seq, ts, json_extract(payload, '$.turn_id'),
+                            json_extract(payload, '$.member_id')
+                     FROM events WHERE session_id = ?1 AND type = 'prompt_submitted'
                      ORDER BY seq DESC LIMIT 1",
                     [session_id.as_str()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()
                 .map_err(storage)?;
-            Ok(member.flatten().map(MemberId))
+            let Some((seq, ts, turn_id, starter)) = latest else {
+                return Ok(None);
+            };
+            // Everyone who instructed this turn: its starter, then each steer.
+            let mut members = vec![starter.map(MemberId)];
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT json_extract(payload, '$.member_id') FROM events
+                         WHERE session_id = ?1 AND type = 'prompt_steered' AND seq > ?2
+                         ORDER BY seq",
+                    )
+                    .map_err(storage)?;
+                let steers = stmt
+                    .query_map(params![session_id.as_str(), seq], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })
+                    .map_err(storage)?;
+                for m in steers {
+                    members.push(m.map_err(storage)?.map(MemberId));
+                }
+            }
+            // The deepest dispatch that delivered this turn (directly, via the queue, or
+            // as a steer); a dispatch still being delivered counts too.
+            let depth: Option<u32> = tx
+                .query_row(
+                    "SELECT MAX(depth) FROM dispatches
+                     WHERE to_session = ?1 AND (
+                         submit = 'null'
+                         OR json_extract(submit, '$.turn_id') = ?2
+                         OR json_extract(submit, '$.queued_id') IN (
+                             SELECT json_extract(payload, '$.queued_id') FROM events
+                             WHERE session_id = ?1 AND type = 'queue_item_removed'
+                               AND json_extract(payload, '$.reason.turn_id') = ?2))",
+                    params![session_id.as_str(), turn_id],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?;
+            Ok(Some(TurnContext {
+                turn_id: TurnId(turn_id),
+                started_at: ts,
+                members,
+                depth: depth.unwrap_or(0),
+            }))
         })
         .await
     }
 
-    /// The session's depth in a dispatch chain: the depth of the latest dispatch that
-    /// reached it, or 0 when none did.
-    pub async fn dispatch_depth(&self, session_id: &SessionId) -> CoreResult<u32> {
-        let session_id = session_id.clone();
-        self.read(move |conn| {
-            conn.query_row(
-                "SELECT depth FROM dispatches WHERE to_session = ?1
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                [session_id.as_str()],
-                |r| r.get(0),
+    /// Reserves a dispatch row before its prompt is sent, so its depth counts at once,
+    /// and enforces the fan-out cap: at most `max_fanout` dispatches from the source
+    /// session since `since` (its current turn's start). Complete it with
+    /// [`Db::complete_dispatch`] or drop it with [`Db::delete_dispatch`].
+    pub async fn reserve_dispatch(
+        &self,
+        d: Dispatch,
+        fanout: Option<(i64, u32)>,
+    ) -> CoreResult<Dispatch> {
+        self.write(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            if let Some((since, max)) = fanout {
+                let n: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM dispatches WHERE from_session = ?1 AND created_at >= ?2",
+                        params![d.from_session.as_str(), since],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?;
+                if n >= i64::from(max) {
+                    return Err(CoreError::LimitExceeded(format!(
+                        "a turn may dispatch at most {max} times"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO dispatches (id, space_id, from_session, to_session, member_id, depth,
+                                         created_session, submit, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'null', ?8)",
+                params![
+                    d.id.as_str(),
+                    d.space_id.as_str(),
+                    d.from_session.as_str(),
+                    d.to_session.as_str(),
+                    d.member_id.as_str(),
+                    d.depth,
+                    d.created_session,
+                    d.created_at
+                ],
             )
-            .optional()
-            .map(|d| d.unwrap_or(0))
-            .map_err(storage)
+            .map_err(storage)?;
+            tx.commit().map_err(storage)?;
+            Ok(d)
+        })
+        .await
+    }
+
+    /// Records how a reserved dispatch's prompt was taken.
+    pub async fn complete_dispatch(&self, d: Dispatch) -> CoreResult<Dispatch> {
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE dispatches SET submit = ?2 WHERE id = ?1",
+                params![d.id.as_str(), to_json(&d.submit).map_err(storage)?],
+            )
+            .map_err(storage)?;
+            Ok(d)
+        })
+        .await
+    }
+
+    /// Drops a reserved dispatch whose prompt was never delivered.
+    pub async fn delete_dispatch(&self, id: &DispatchId) -> CoreResult<()> {
+        let id = id.clone();
+        self.write(move |conn| {
+            conn.execute(
+                "DELETE FROM dispatches WHERE id = ?1 AND submit = 'null'",
+                [id.as_str()],
+            )
+            .map_err(storage)?;
+            Ok(())
         })
         .await
     }
@@ -255,7 +380,8 @@ impl Db {
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(&format!(
-                    "{DISPATCH_COLUMNS} WHERE from_session = ?1 OR to_session = ?1
+                    "{DISPATCH_COLUMNS} WHERE (from_session = ?1 OR to_session = ?1)
+                       AND submit != 'null'
                      ORDER BY created_at DESC, id DESC LIMIT ?2"
                 ))
                 .map_err(storage)?;

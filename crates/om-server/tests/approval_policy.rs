@@ -312,8 +312,9 @@ async fn every_step_is_audited() {
 
     let audit = |target: String| {
         let db = f.orch.db().clone();
+        let space = f.space.clone();
         async move {
-            let mut rows = db.list_audit(Some(target), 50).await.unwrap();
+            let mut rows = db.list_audit(&space, Some(target), 50).await.unwrap();
             rows.reverse();
             rows
         }

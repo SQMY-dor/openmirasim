@@ -192,4 +192,23 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX dispatches_from ON dispatches(from_session, created_at DESC);
     CREATE INDEX dispatches_to ON dispatches(to_session, created_at DESC);
     "#,
+    // v7 (review P0-5): audit entries belong to a space. Existing rows are backfilled
+    // from their target or actor (same rule as `audit::space_of`).
+    r#"
+    ALTER TABLE audit_logs ADD COLUMN space_id TEXT;
+    UPDATE audit_logs SET space_id = COALESCE(
+        (SELECT space_id FROM sessions WHERE id = audit_logs.target),
+        (SELECT s.space_id FROM approvals a JOIN sessions s ON s.id = a.session_id
+          WHERE a.id = audit_logs.target),
+        (SELECT space_id FROM members WHERE id = audit_logs.target),
+        (SELECT m.space_id FROM device_tokens t JOIN members m ON m.id = t.member_id
+          WHERE t.id = audit_logs.target),
+        (SELECT space_id FROM goals WHERE id = audit_logs.target),
+        (SELECT space_id FROM schedules WHERE id = audit_logs.target),
+        (SELECT space_id FROM dispatches WHERE id = audit_logs.target),
+        (SELECT space_id FROM workspaces WHERE id = audit_logs.target),
+        (SELECT space_id FROM members WHERE id = audit_logs.actor));
+    CREATE INDEX audit_logs_space ON audit_logs(space_id, id DESC);
+    CREATE INDEX audit_logs_space_target ON audit_logs(space_id, target, id DESC);
+    "#,
 ];

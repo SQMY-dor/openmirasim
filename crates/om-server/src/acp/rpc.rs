@@ -2,6 +2,14 @@
 //!
 //! Both sides may send requests, so the connection tracks outgoing requests by id and
 //! surfaces incoming requests / notifications on a channel for the harness to handle.
+//!
+//! Ordering: responses to our requests travel through the same channel as the peer's
+//! notifications (as [`Incoming::Settle`]), so a caller waiting on a response only
+//! wakes after every notification the peer sent before that response has been
+//! handled. The consumer of the channel must call [`Settlement::complete`] for each.
+//!
+//! Closing: once the peer's output ends or our writes fail, every waiting request and
+//! every later one fails with [`RpcError::CONNECTION_CLOSED`]; nothing waits forever.
 
 use om_core::{CoreError, CoreResult};
 use serde_json::{Value, json};
@@ -10,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+/// Longest line accepted from the peer; longer lines are skipped.
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 use tokio::sync::{mpsc, oneshot};
 
 /// JSON-RPC error object.
@@ -73,7 +84,7 @@ impl From<RpcError> for CoreError {
 }
 
 /// A message initiated by the peer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Incoming {
     Notification {
         method: String,
@@ -84,11 +95,89 @@ pub enum Incoming {
         method: String,
         params: Value,
     },
+    /// A response to one of our requests, in order with the notifications around it.
+    Settle(Settlement),
     /// The peer's output ended; no more messages follow.
     Closed,
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
+type Reply = oneshot::Sender<Result<Value, RpcError>>;
+
+/// Wakes the caller of [`RpcConnection::request`] with its response.
+#[derive(Debug)]
+pub struct Settlement {
+    tx: Reply,
+    result: Result<Value, RpcError>,
+}
+
+impl Settlement {
+    pub fn complete(self) {
+        let _ = self.tx.send(self.result);
+    }
+}
+
+impl PartialEq for Settlement {
+    fn eq(&self, other: &Self) -> bool {
+        self.result == other.result
+    }
+}
+
+/// Waiting requests; `None` once the connection is closed.
+type Pending = Arc<Mutex<Option<HashMap<u64, Reply>>>>;
+
+fn closed() -> RpcError {
+    RpcError::new(RpcError::CONNECTION_CLOSED, "agent connection closed")
+}
+
+/// Marks the connection closed and fails every waiting request.
+fn close_pending(pending: &Pending) {
+    let drained = pending
+        .lock()
+        .map(|mut p| p.take())
+        .unwrap_or_else(|e| e.into_inner().take())
+        .unwrap_or_default();
+    for (_, tx) in drained {
+        let _ = tx.send(Err(closed()));
+    }
+}
+
+/// Reads one `\n`-terminated line of at most `max` bytes. `Ok(None)` at EOF;
+/// `Ok(Some(None))` for a line that was too long (skipped).
+async fn read_line_capped<R: AsyncRead + Unpin>(
+    r: &mut BufReader<R>,
+    max: usize,
+) -> std::io::Result<Option<Option<Vec<u8>>>> {
+    let mut line = Vec::new();
+    let mut too_long = false;
+    loop {
+        let buf = r.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(if line.is_empty() && !too_long {
+                None
+            } else if too_long {
+                Some(None)
+            } else {
+                Some(Some(line))
+            });
+        }
+        let (chunk, consumed, ended) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], i + 1, true),
+            None => (buf, buf.len(), false),
+        };
+        if !too_long {
+            if line.len() + chunk.len() > max {
+                too_long = true;
+                line = Vec::new();
+            } else {
+                line.extend_from_slice(chunk);
+            }
+        }
+        r.consume(consumed);
+        if ended {
+            return Ok(Some(if too_long { None } else { Some(line) }));
+        }
+    }
+}
 
 /// Handle for sending requests, notifications and responses. Cheap to clone.
 #[derive(Clone)]
@@ -107,8 +196,9 @@ impl RpcConnection {
     {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        let pending: Pending = Arc::default();
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
 
+        let writer_pending = pending.clone();
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(line) = out_rx.recv().await {
@@ -116,6 +206,8 @@ impl RpcConnection {
                     || writer.write_all(b"\n").await.is_err()
                     || writer.flush().await.is_err()
                 {
+                    // The peer can no longer receive requests: nothing will answer.
+                    close_pending(&writer_pending);
                     break;
                 }
             }
@@ -123,27 +215,27 @@ impl RpcConnection {
 
         let reader_pending = pending.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Value>(line) {
-                    Ok(msg) => dispatch(msg, &reader_pending, &in_tx),
-                    Err(_) => tracing::debug!(%line, "ignoring non-JSON line from agent"),
+            let mut reader = BufReader::new(reader);
+            loop {
+                match read_line_capped(&mut reader, MAX_LINE_BYTES).await {
+                    Ok(Some(Some(bytes))) => {
+                        let line = String::from_utf8_lossy(&bytes);
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Value>(line) {
+                            Ok(msg) => dispatch(msg, &reader_pending, &in_tx),
+                            Err(_) => tracing::debug!("ignoring non-JSON line from agent"),
+                        }
+                    }
+                    Ok(Some(None)) => {
+                        tracing::warn!(max = MAX_LINE_BYTES, "skipping oversized line from agent")
+                    }
+                    Ok(None) | Err(_) => break,
                 }
             }
-            let drained: Vec<_> = reader_pending
-                .lock()
-                .map(|mut p| p.drain().collect())
-                .unwrap_or_default();
-            for (_, tx) in drained {
-                let _ = tx.send(Err(RpcError::new(
-                    RpcError::CONNECTION_CLOSED,
-                    "agent connection closed",
-                )));
-            }
+            close_pending(&reader_pending);
             let _ = in_tx.send(Incoming::Closed);
         });
 
@@ -172,10 +264,18 @@ impl RpcConnection {
     ) -> Result<Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .map_err(|_| RpcError::new(RpcError::INTERNAL, "poisoned"))?
-            .insert(id, tx);
+        {
+            let mut guard = self
+                .pending
+                .lock()
+                .map_err(|_| RpcError::new(RpcError::INTERNAL, "poisoned"))?;
+            match guard.as_mut() {
+                Some(p) => {
+                    p.insert(id, tx);
+                }
+                None => return Err(closed()),
+            }
+        }
         if self
             .send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .is_err()
@@ -208,7 +308,9 @@ impl RpcConnection {
     }
 
     fn forget(&self, id: u64) {
-        if let Ok(mut p) = self.pending.lock() {
+        if let Ok(mut p) = self.pending.lock()
+            && let Some(p) = p.as_mut()
+        {
             p.remove(&id);
         }
     }
@@ -244,13 +346,21 @@ fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::UnboundedSender<Incomin
                 tracing::debug!(?id, "response with non-numeric id ignored");
                 return;
             };
-            let tx = pending.lock().ok().and_then(|mut p| p.remove(&num));
+            let tx = pending
+                .lock()
+                .ok()
+                .and_then(|mut p| p.as_mut().and_then(|p| p.remove(&num)));
             if let Some(tx) = tx {
                 let result = match msg.get("error") {
                     Some(err) if !err.is_null() => Err(RpcError::from_value(err)),
                     _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
-                let _ = tx.send(result);
+                // Through the channel, behind every earlier notification.
+                if let Err(mpsc::error::SendError(Incoming::Settle(s))) =
+                    in_tx.send(Incoming::Settle(Settlement { tx, result }))
+                {
+                    s.complete();
+                }
             }
         }
         (None, None) => tracing::debug!("malformed JSON-RPC message ignored"),
@@ -266,7 +376,8 @@ mod tests {
         let (client_io, agent_io) = tokio::io::duplex(4096);
         let (client_r, client_w) = tokio::io::split(client_io);
         let (agent_r, mut agent_w) = tokio::io::split(agent_io);
-        let (conn, mut incoming) = RpcConnection::spawn(client_r, client_w);
+        let (conn, raw) = RpcConnection::spawn(client_r, client_w);
+        let mut incoming = pump(raw);
 
         // Fake agent: answer request id 0 with an echo, then send a notification.
         tokio::spawn(async move {
@@ -309,6 +420,96 @@ mod tests {
         );
         // Agent task ended and dropped its writer: the connection reports closure.
         assert_eq!(incoming.recv().await.unwrap(), Incoming::Closed);
+    }
+
+    /// Completes settlements and forwards everything else, like a harness does.
+    fn pump(mut raw: mpsc::UnboundedReceiver<Incoming>) -> mpsc::UnboundedReceiver<Incoming> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(m) = raw.recv().await {
+                match m {
+                    Incoming::Settle(s) => s.complete(),
+                    other => {
+                        let _ = tx.send(other);
+                    }
+                }
+            }
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn responses_wait_for_earlier_notifications() {
+        let (client_io, agent_io) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_io);
+        let (agent_r, mut agent_w) = tokio::io::split(agent_io);
+        let (conn, mut raw) = RpcConnection::spawn(client_r, client_w);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(agent_r).lines();
+            let req: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let note = json!({"jsonrpc": "2.0", "method": "chunk", "params": {"n": 1}});
+            let resp = json!({"jsonrpc": "2.0", "id": req["id"], "result": "done"});
+            agent_w
+                .write_all(format!("{note}\n{resp}\n").as_bytes())
+                .await
+                .unwrap();
+            let _keep = lines;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let call = tokio::spawn({
+            let conn = conn.clone();
+            async move { conn.request("prompt", Value::Null, None).await }
+        });
+        // The notification arrives first; the caller is still waiting.
+        assert!(matches!(
+            raw.recv().await.unwrap(),
+            Incoming::Notification { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !call.is_finished(),
+            "response must not overtake the notification"
+        );
+        match raw.recv().await.unwrap() {
+            Incoming::Settle(s) => s.complete(),
+            other => panic!("expected a settlement, got {other:?}"),
+        }
+        assert_eq!(call.await.unwrap().unwrap(), json!("done"));
+    }
+
+    #[tokio::test]
+    async fn requests_after_close_fail_at_once() {
+        let (client_io, agent_io) = tokio::io::duplex(4096);
+        let (client_r, client_w) = tokio::io::split(client_io);
+        let (conn, mut incoming) = RpcConnection::spawn(client_r, client_w);
+        drop(agent_io);
+        assert_eq!(incoming.recv().await.unwrap(), Incoming::Closed);
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.request("late", Value::Null, None),
+        )
+        .await
+        .expect("must not hang")
+        .unwrap_err();
+        assert_eq!(err.code, RpcError::CONNECTION_CLOSED);
+    }
+
+    #[tokio::test]
+    async fn oversized_lines_are_skipped() {
+        let data = format!("{}\nshort\n", "x".repeat(100));
+        let mut r = BufReader::with_capacity(8, data.as_bytes());
+        assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), Some(None));
+        assert_eq!(
+            read_line_capped(&mut r, 10).await.unwrap(),
+            Some(Some(b"short".to_vec()))
+        );
+        assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), None);
+        let mut r = BufReader::new(&b"tail"[..]);
+        assert_eq!(
+            read_line_capped(&mut r, 10).await.unwrap(),
+            Some(Some(b"tail".to_vec()))
+        );
     }
 
     #[tokio::test]

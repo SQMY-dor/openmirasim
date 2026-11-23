@@ -6,8 +6,8 @@ import type { SpaceId } from "./SpaceId";
 /**
  * A member of a space.
  */
-export type MemberRecord = { id: MemberId, space_id: SpaceId, display_name: string, role: Role, created_at: bigint, 
+export type MemberRecord = { id: MemberId, space_id: SpaceId, display_name: string, role: Role, created_at: number, 
 /**
  * Set once the member is disabled; their tokens stop working at the same moment.
  */
-disabled_at?: bigint, };
+disabled_at?: number, };
