@@ -50,6 +50,11 @@ pub(crate) enum Command {
     ListQueue {
         reply: oneshot::Sender<CoreResult<Vec<QueuedPrompt>>>,
     },
+    /// Appends an announcement (goal / dispatch event) in stream order.
+    Announce {
+        payload: EventPayload,
+        reply: oneshot::Sender<CoreResult<()>>,
+    },
     Withdraw {
         queued_id: QueuedPromptId,
         member: Option<MemberId>,
@@ -977,6 +982,10 @@ async fn handle_command(actor: &mut Actor, cmd: Command) -> bool {
             let _ = reply.send(actor.on_resume().await);
             false
         }
+        Command::Announce { payload, reply } => {
+            let _ = reply.send(actor.append(vec![payload]).await.map(|_| ()));
+            false
+        }
     }
 }
 
@@ -989,6 +998,7 @@ fn reject(cmd: Command, err: CoreError) {
         Command::Cancel { reply }
         | Command::Close { reply }
         | Command::ResumeQueue { reply }
+        | Command::Announce { reply, .. }
         | Command::Withdraw { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
         }

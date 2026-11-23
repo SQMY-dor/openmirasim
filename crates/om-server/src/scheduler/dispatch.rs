@@ -5,6 +5,7 @@ use crate::db::Db;
 use crate::orchestrator::Orchestrator;
 use om_core::auth::Action;
 use om_core::dispatch::{Dispatch, DispatchTarget, MAX_DISPATCH_DEPTH, NewDispatch};
+use om_core::event::EventPayload;
 use om_core::ids::{DispatchId, MemberId, SessionId};
 use om_core::queue::SubmitMode;
 use om_core::session::SessionStatus;
@@ -124,7 +125,8 @@ impl Dispatcher {
             .orch
             .send_prompt(&to_session, Some(member_id.clone()), req.prompt, mode)
             .await?;
-        self.db
+        let d = self
+            .db
             .insert_dispatch(Dispatch {
                 id: DispatchId::new(),
                 space_id: from.space_id,
@@ -136,6 +138,50 @@ impl Dispatcher {
                 submit,
                 created_at: now_ms(),
             })
+            .await?;
+        self.record(&d, !by_member).await;
+        Ok(d)
+    }
+
+    /// Announces the dispatch on both sessions' streams and writes the audit entry.
+    /// Best effort: the prompt has already been delivered.
+    async fn record(&self, d: &Dispatch, from_agent: bool) {
+        for (session, payload) in [
+            (
+                &d.from_session,
+                EventPayload::DispatchSent {
+                    dispatch: d.clone(),
+                },
+            ),
+            (
+                &d.to_session,
+                EventPayload::DispatchReceived {
+                    dispatch: d.clone(),
+                },
+            ),
+        ] {
+            if let Err(e) = self.orch.announce(session, payload).await {
+                tracing::warn!(dispatch = %d.id, %session, error = %e, "dispatch event not recorded");
+            }
+        }
+        let detail = serde_json::json!({
+            "from_session": d.from_session,
+            "to_session": d.to_session,
+            "depth": d.depth,
+            "created_session": d.created_session,
+            "from_agent": from_agent,
+        });
+        if let Err(e) = self
+            .db
+            .audit(
+                Some(d.member_id.clone()),
+                "session.dispatch",
+                d.id.as_str(),
+                detail,
+            )
             .await
+        {
+            tracing::warn!(dispatch = %d.id, error = %e, "dispatch audit entry not written");
+        }
     }
 }

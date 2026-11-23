@@ -3,6 +3,8 @@ import type { ApprovalDecision } from "./ApprovalDecision";
 import type { ApprovalId } from "./ApprovalId";
 import type { ApprovalRecord } from "./ApprovalRecord";
 import type { ContentBlock } from "./ContentBlock";
+import type { Dispatch } from "./Dispatch";
+import type { Goal } from "./Goal";
 import type { HarnessCapabilities } from "./HarnessCapabilities";
 import type { MemberId } from "./MemberId";
 import type { PlanEntry } from "./PlanEntry";
@@ -24,4 +26,4 @@ export type EventPayload = { "type": "session_created", config: SessionConfig, c
 /**
  * Policy rule that resolved the request automatically, if any.
  */
-auto_rule?: string, } | { "type": "turn_ended", turn_id: TurnId, stop_reason: StopReason, error?: string, } | { "type": "error", message: string, } | { "type": "prompt_queued", queued: QueuedPrompt, position: number, } | { "type": "queue_item_removed", queued_id: QueuedPromptId, reason: QueueRemoval, } | { "type": "queue_reordered", order: Array<QueuedPromptId>, } | { "type": "queue_paused", paused: boolean, } | { "type": "prompt_steered", turn_id: TurnId, member_id?: MemberId, prompt: Prompt, };
+auto_rule?: string, } | { "type": "turn_ended", turn_id: TurnId, stop_reason: StopReason, error?: string, } | { "type": "error", message: string, } | { "type": "prompt_queued", queued: QueuedPrompt, position: number, } | { "type": "queue_item_removed", queued_id: QueuedPromptId, reason: QueueRemoval, } | { "type": "queue_reordered", order: Array<QueuedPromptId>, } | { "type": "queue_paused", paused: boolean, } | { "type": "prompt_steered", turn_id: TurnId, member_id?: MemberId, prompt: Prompt, } | { "type": "goal_updated", goal: Goal, } | { "type": "dispatch_sent", dispatch: Dispatch, } | { "type": "dispatch_received", dispatch: Dispatch, };

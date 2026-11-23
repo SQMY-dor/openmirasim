@@ -7,6 +7,8 @@
 
 use crate::approval::{ApprovalDecision, ApprovalRecord};
 use crate::content::{ContentBlock, Prompt};
+use crate::dispatch::Dispatch;
+use crate::goal::Goal;
 use crate::harness::HarnessCapabilities;
 use crate::ids::{ApprovalId, MemberId, QueuedPromptId, SessionId, TurnId};
 use crate::queue::{QueueRemoval, QueuedPrompt};
@@ -127,6 +129,13 @@ pub enum EventPayload {
         member_id: Option<MemberId>,
         prompt: Prompt,
     },
+    /// A goal on this session was set, made progress, or ended (W4-1). Carries the
+    /// goal as it now stands.
+    GoalUpdated { goal: Goal },
+    /// A prompt from this session was dispatched to another session (W4-1).
+    DispatchSent { dispatch: Dispatch },
+    /// A prompt dispatched from another session arrived here (W4-1).
+    DispatchReceived { dispatch: Dispatch },
 }
 
 impl EventPayload {
@@ -151,7 +160,20 @@ impl EventPayload {
             Self::QueueReordered { .. } => "queue_reordered",
             Self::QueuePaused { .. } => "queue_paused",
             Self::PromptSteered { .. } => "prompt_steered",
+            Self::GoalUpdated { .. } => "goal_updated",
+            Self::DispatchSent { .. } => "dispatch_sent",
+            Self::DispatchReceived { .. } => "dispatch_received",
         }
+    }
+
+    /// Whether code outside the session actor (the goal runner, the dispatcher) may
+    /// append this payload to a session's stream. Everything else is emitted only by
+    /// the actor that owns the session.
+    pub fn is_announcement(&self) -> bool {
+        matches!(
+            self,
+            Self::GoalUpdated { .. } | Self::DispatchSent { .. } | Self::DispatchReceived { .. }
+        )
     }
 }
 

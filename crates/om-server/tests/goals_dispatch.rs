@@ -309,7 +309,7 @@ async fn goal_stops_on_budget_refusal_owner_and_member_stop() {
         .await
         .unwrap();
     wait_status(&f, &sid, SessionStatus::Running).await;
-    let g = f.goals.stop_goal(&g.id).await.unwrap();
+    let g = f.goals.stop_goal(&g.id, &f.member).await.unwrap();
     assert_eq!(
         (g.status, g.ended_reason.as_deref()),
         (GoalStatus::Stopped, Some("stopped_by_member"))
@@ -526,4 +526,170 @@ async fn agent_dispatch_acts_as_the_turns_member_and_is_depth_limited() {
         f.dispatcher.dispatch_from_agent(hop(&s[1], &s[0])).await,
         Err(CoreError::Forbidden(_))
     ));
+}
+
+/// Every `goal_updated` goal on a session, in stream order.
+async fn goal_events(f: &Fx, id: &SessionId) -> Vec<om_core::goal::Goal> {
+    f.db.list_events(id, 0, 10_000)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            om_core::event::EventPayload::GoalUpdated { goal } => Some(goal),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn audit_actions(f: &Fx, target: &str) -> Vec<(Option<MemberId>, String)> {
+    let mut v: Vec<_> =
+        f.db.list_audit(Some(target.to_owned()), 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.actor, a.action))
+            .collect();
+    v.reverse();
+    v
+}
+
+#[tokio::test]
+async fn goals_and_dispatches_are_announced_and_audited() {
+    let f = fixture().await;
+    let sid = idle_session(&f).await;
+
+    // set → progress after turn 1 → achieved after turn 2, all on the session stream.
+    let g = f
+        .goals
+        .set_goal(&sid, &f.member, goal("ship it done-on-2", 5))
+        .await
+        .unwrap();
+    let g = wait_goal_end(&f, &g.id).await;
+    assert_eq!(g.status, GoalStatus::Achieved);
+    let seen: Vec<_> = goal_events(&f, &sid)
+        .await
+        .into_iter()
+        .map(|g| (g.status, g.turns_used))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (GoalStatus::Active, 0),
+            (GoalStatus::Active, 1),
+            (GoalStatus::Achieved, 2)
+        ]
+    );
+    assert_eq!(
+        audit_actions(&f, g.id.as_str()).await,
+        vec![
+            (Some(f.member.clone()), "goal.set".to_owned()),
+            (None, "goal.ended".to_owned())
+        ]
+    );
+
+    // Stopping needs the right to prompt in the goal's space.
+    wait_status(&f, &sid, SessionStatus::Idle).await;
+    let held = f
+        .goals
+        .set_goal(&sid, &f.member, goal("hold", 5))
+        .await
+        .unwrap();
+    wait_status(&f, &sid, SessionStatus::Running).await;
+    let viewer =
+        f.db.create_member(&f.space, "vic", Role::Viewer, None)
+            .await
+            .unwrap()
+            .id;
+    let err = f.goals.stop_goal(&held.id, &viewer).await.unwrap_err();
+    assert!(matches!(err, CoreError::Forbidden(_)), "{err:?}");
+    let other_space = f.db.ensure_space("other").await.unwrap();
+    let outsider =
+        f.db.create_member(&other_space, "olga", Role::Owner, None)
+            .await
+            .unwrap()
+            .id;
+    let err = f.goals.stop_goal(&held.id, &outsider).await.unwrap_err();
+    assert!(matches!(err, CoreError::NotFound(_)), "{err:?}");
+    let stopped = f.goals.stop_goal(&held.id, &f.member).await.unwrap();
+    assert_eq!(stopped.status, GoalStatus::Stopped);
+    assert_eq!(
+        audit_actions(&f, held.id.as_str()).await.last().unwrap(),
+        &(Some(f.member.clone()), "goal.ended".to_owned())
+    );
+    assert_eq!(
+        goal_events(&f, &sid).await.last().unwrap().status,
+        GoalStatus::Stopped
+    );
+    f.orch.cancel_turn(&sid).await.unwrap();
+    wait_status(&f, &sid, SessionStatus::Idle).await;
+
+    // A dispatch shows up on both streams and in the audit log.
+    let other = idle_session(&f).await;
+    let d = f
+        .dispatcher
+        .dispatch_as(
+            &f.member,
+            NewDispatch {
+                from_session: sid.clone(),
+                target: DispatchTarget::Session {
+                    session_id: other.clone(),
+                    mode: SubmitMode::Queue,
+                },
+                prompt: Prompt::text("review this"),
+            },
+        )
+        .await
+        .unwrap();
+    let kinds = |id: SessionId| {
+        let db = f.db.clone();
+        async move {
+            db.list_events(&id, 0, 10_000)
+                .await
+                .unwrap()
+                .events
+                .into_iter()
+                .filter_map(|e| match e.payload {
+                    om_core::event::EventPayload::DispatchSent { dispatch } => {
+                        Some(("sent", dispatch.id))
+                    }
+                    om_core::event::EventPayload::DispatchReceived { dispatch } => {
+                        Some(("received", dispatch.id))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(kinds(sid.clone()).await, vec![("sent", d.id.clone())]);
+    assert_eq!(kinds(other.clone()).await, vec![("received", d.id.clone())]);
+    assert_eq!(
+        audit_actions(&f, d.id.as_str()).await,
+        vec![(Some(f.member.clone()), "session.dispatch".to_owned())]
+    );
+
+    // Only announcements may be appended from outside the session.
+    let err = f
+        .orch
+        .announce(
+            &sid,
+            om_core::event::EventPayload::Error {
+                message: "spoof".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CoreError::InvalidInput(_)), "{err:?}");
+
+    // An ended session still records announcements (written straight to the log).
+    f.orch.close_session(&other).await.unwrap();
+    wait_status(&f, &other, SessionStatus::Closed).await;
+    f.orch
+        .announce(
+            &other,
+            om_core::event::EventPayload::GoalUpdated { goal: g.clone() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(goal_events(&f, &other).await, vec![g]);
 }
