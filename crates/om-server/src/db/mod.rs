@@ -13,6 +13,7 @@ mod audit;
 mod members;
 pub use audit::{ApprovalRule, AuditEntry};
 pub use members::TOKEN_TOUCH_INTERVAL_MS;
+mod goals;
 mod migrations;
 mod schedules;
 #[cfg(test)]

@@ -16,14 +16,18 @@
 //! - [`sandbox`]: the `Sandbox` trait that wraps agent processes.
 //! - [`queue`]: Queue & Steer submit modes (W2-3).
 //! - [`schedule`]: schedules that send prompts on a timetable (W4-1).
+//! - [`goal`]: goals that keep a session working until they are met (W4-1).
+//! - [`dispatch`]: one session handing a prompt to another (W4-1).
 //! - [`error`]: shared error type.
 
 pub mod api;
 pub mod approval;
 pub mod auth;
 pub mod content;
+pub mod dispatch;
 pub mod error;
 pub mod event;
+pub mod goal;
 pub mod harness;
 pub mod ids;
 pub mod proxy;
