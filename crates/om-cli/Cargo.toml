@@ -1,0 +1,10 @@
+[package]
+name = "om-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI, scriptable ctl control plane, and TUI client for OpenMirasim"
+
+[dependencies]
+om-core.workspace = true

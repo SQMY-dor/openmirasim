@@ -1,145 +1,86 @@
 # OpenMirasim 技术栈与构建环境规范
 
-本文档明确 OpenMirasim 各层技术选型、选型理由以及开发与 CI 构建环境依赖规范。
+本文档明确 OpenMirasim 采纳 [`design-review.md`](design-review.md)（R1–R7）决议后的技术选型、选型依据与构建环境要求。
 
 ---
 
 ## 1. 技术栈矩阵
 
-### 1.1 中心服务端与核心运行时（Rust）
+### 1.1 Linux 中心服务端（`om-server` + `om-core`）
 
-| 类别 | 选型 | 用途与说明 |
+| 类别 | 选型 | 说明 |
 | --- | --- | --- |
-| 语言与工具链 | **Rust（Stable，Edition 2021/2024）** | 内存安全、单二进制部署、极低常驻内存，适合长期承载多路 Agent 与 PTY 会话 |
-| 异步运行时 | **Tokio** | 高并发网络 I/O、Actor 会话调度、子进程与定时器管理 |
-| HTTP / WebSocket | **Axum + Tower** | 现代类型安全路由、中间件鉴权、WebSocket 流式推送与静态前端资源托管 |
-| gRPC 服务端 | **Tonic + Prost** | 面向原生客户端（Tauri Core / CLI）的强类型 RPC 与双向流 |
-| 数据库 | **SQLite（WAL 模式）**（`sqlx` 或 `rusqlite`） | 面向单机中心服务的零运维持久化，支持 FTS5 全文检索与事务并发读 |
-| 终端 PTY | **portable-pty**（或 `pty-process`） | 跨平台伪终端控制，承载 Claude Code / Codex / Shell 等交互式 CLI Agent |
-| Git 与文件系统 | **`git` CLI + `git2` / `gix`** + `notify` | Worktree 生命周期管理、实时文件监听、状态与 Diff 计算 |
-| 日志与可观测性 | **tracing + tracing-subscriber** | 结构化日志、按 `session_id` / `space_id` 追踪请求与 Agent 执行链路 |
+| 语言与工具链 | **Rust（Stable，MSRV 1.85）** | 低内存占用、单二进制部署、可靠承载 30 人团队多路 Agent 会话 |
+| 异步运行时 | **Tokio** | 高并发网络 I/O、单会话 Actor 调度、子进程管理与超时回收 |
+| HTTP / WebSocket | **Axum + Tower** | REST 控制面、`/ws/events`（JSON 文本帧）、`/ws/pty/:id`（Binary 帧）及静态前端托管 |
+| 跨端类型契约 | **`serde` + `ts-rs`** | 以 `om-core` 的 Rust 类型为单一事实源，自动生成 TypeScript 类型并在 CI 校验 |
+| 数据存储 | **`rusqlite`（SQLite WAL + 单写线程）** | 零外部数据库运维、编译快、原生支持 FTS5 与精细 PRAGMA 控制；事件直接存 `events(session_id, seq, ...)` |
+| PTY 与录制 | **`portable-pty` + asciicast v2（`.cast`）** | Phase 3 原生终端视图与兜底；原始字节写环形缓冲与 `.cast` 文件，不进 SQLite |
+| Linux 裸金属沙箱 | **`bubblewrap`（`bwrap`）+ `systemd-run`/cgroups v2** | 毫秒级无守护进程隔离（Worktree bind-mount、CPU/内存/PIDs/网络隔离） |
+| Agent 接入协议 | **ACP（JSON-RPC 2.0 stdio）** > `stream-json` > PTY | 优先统一对接 `opencode`、`dsh`、`cc`、`codexcli`；Antigravity GUI 通过独立外置 `om-gui-bridge` 接入 |
+| Git 管理 | **`git` CLI（Worktree 隔离）** | 稳定可控的 Worktree 创建/清理/状态/Diff |
+| 可观测性 | **`tracing` + `tracing-subscriber`** | 按 `space_id` / `session_id` 结构化日志追踪 |
 
-### 1.2 CLI 与 TUI（Rust）
+### 1.2 CLI 与 TUI（`om-cli`）
 
-| 类别 | 选型 | 用途与说明 |
+| 类别 | 选型 | 说明 |
 | --- | --- | --- |
-| 命令行解析 | **Clap（derive）** | 统一 `openmirasim serve / tui / ctl / login` 子命令体系 |
-| 终端界面 | **Ratatui + Crossterm** | 无头 Linux 服务器与终端重度用户的多会话 TUI 工作台 |
-| 脚本化输出 | **Serde JSON** | 面向脚本与 Agent 的结构化 JSON 输出与声明式配置应用 |
+| 命令行与控制面 | **Clap（derive）+ Serde JSON** | `openmirasim serve`、脚本化 `openmirasim ctl`（纯 JSON 输出），直接复用 `om-core` 类型 |
+| 终端工作台（Phase 3） | **Ratatui + Crossterm** | 无头 Linux 服务器与终端用户的多会话 TUI |
 
-### 1.3 跨平台客户端（Tauri v2 + React / TypeScript）
+### 1.3 Web 工作台、PWA 与桌面端（`apps/web` + Phase 3 `apps/tauri`）
 
-| 类别 | 选型 | 用途与说明 |
+| 类别 | 选型 | 说明 |
 | --- | --- | --- |
-| 桌面与移动端壳 | **Tauri v2**（Desktop + Mobile） | 复用系统原生 WebView，二进制体积小、内存开销低；Rust Core 可直接复用 `om-proto` 与 `om-core` |
-| 前端框架 | **React 19 + TypeScript 5** | 组件生态成熟，适配复杂多窗格工作台、代码审阅与响应式移动布局 |
-| 构建与包管理 | **Vite + pnpm Workspace** | 极速热更新、统一的 Monorepo 依赖管理与前后端共享类型包 |
-| 样式与组件 | **Tailwind CSS + Radix UI / shadcn** | 一致的设计系统、高键盘可访问性与暗/亮色主题切换 |
-| 终端与代码视图 | **xterm.js** + 轻量代码/Diff 查看器 | 在 Web 与 Tauri 窗格中原生渲染远程 PTY 输出与 Git Diff |
-| 客户端状态与同步 | **Zustand / TanStack Query** + Event Stream Store | 维护 `last_seq` 增量事件同步、离线重连与乐观更新 |
+| 前端框架 | **React 19 + TypeScript 5 + Vite** | 一套代码服务桌面浏览器、移动端 PWA 与 Tauri 桌面壳 |
+| 包管理 | **pnpm Workspace**（固定 `engines` & `packageManager`） | 统一前端依赖与类型生成脚本 |
+| 移动端方案（Phase 2） | **PWA + Service Worker + Web Push** | 手机端查看进度与实时审批，省去早期 Android NDK / Xcode 维护成本（iOS 需“添加到主屏幕”开启推送） |
+| 桌面端薄壳（Phase 3） | **Tauri v2** | 托盘、原生通知、OS Keychain、多服务器切换；不承载核心业务状态 |
+| 终端与代码视图 | **xterm.js**（Phase 3）+ Diff 查看器（Phase 1） | 渲染远程 PTY 流与 Worktree Git Diff |
 
-### 1.4 协议与代码生成（Protobuf / gRPC）
+### 1.4 质量与测试
 
-| 类别 | 选型 | 用途与说明 |
+| 类别 | 选型 | 说明 |
 | --- | --- | --- |
-| IDL 与规范校验 | **Protobuf v3 + Buf** | 统一 API 契约、Lint 规范检查与 Breaking Change 防护 |
-| 编译器与插件 | **protoc** + `tonic-build` / `@bufbuild/protobuf` | 从 `proto/` 自动生成 Rust 与 TypeScript 双端强类型代码 |
-
-### 1.5 测试与质量保障
-
-| 类别 | 选型 | 用途与说明 |
-| --- | --- | --- |
-| Rust 质量 | `cargo fmt`、`cargo clippy`、`cargo test` | 编译期类型约束、静态检查与服务端单元/集成测试 |
-| 前端质量 | TypeScript `tsc --noEmit`、ESLint / Biome、Vitest | 类型安全、代码风格检查与前端逻辑单元测试 |
-| 端到端测试 | **Playwright** + **Xvfb**（Linux 无头环境） | 验证 Web 工作台、服务端 API 与多客户端实时协作场景 |
+| Rust 检查 | `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` | 每次 PR 必跑 CI 门禁 |
+| 前端检查 | `pnpm typecheck`（`tsc --noEmit`）+ 单元测试 | 类型安全与生成契约一致性检查 |
+| 端到端测试 | **Playwright**（Mock Harness 驱动） | 验证流式对话、`last_seq` 断线续传、重启恢复、审批流与沙箱越界拦截 |
 
 ---
 
-## 2. 关键选型理由
+## 2. 延后引入的技术（明确不在 Phase 0–2）
 
-1. **为什么中心服务端和 CLI 选 Rust？**
-   - 单台服务器需要同时托管数十个 Agent 子进程、PTY 字节流、WebSocket 扇出与文件监听；Rust 的低内存占用与零 GC 停顿能把机器资源留给 AI Agent 与项目编译本身。
-   - 服务端与 Tauri 客户端壳同属 Rust Workspace，领域类型、协议编解码与鉴权逻辑可直接跨端复用。
-2. **为什么跨平台客户端选 Tauri v2 + 共享 React UI？**
-   - 一套 React/TypeScript 前端即可覆盖 **Web 工作台（零安装）+ 桌面端（Windows/macOS/Linux）+ 移动端（Android/iOS）**，避免多端重复维护业务逻辑。
-   - 相比 Electron，Tauri v2 省去自带 Chromium 的 150MB+ 内存与包体开销，与开发者本机运行多个编码 Agent 的场景更契合。
-3. **为什么数据库默认选 SQLite（WAL）？**
-   - 项目以单台自托管服务器为核心，SQLite（WAL 模式）零外部进程依赖、备份即复制单文件，读并发高且足以支撑团队级并发会话；后续如有超大团队需求，可通过 `om-storage` 抽象层平滑扩展至 PostgreSQL。
-4. **为什么引入 Protobuf + Buf？**
-   - 系统同时存在 Rust（服务端/CLI/Tauri Core）与 TypeScript（Web/桌面/移动 UI）两套语言，使用 Protobuf 作为单一事实源可避免手写 DTO 漂移，同时原生支持 gRPC 双向流。
+- **Protobuf / gRPC / Buf**：Phase 0–2 全链路使用 Axum REST + WebSocket + `ts-rs`，直到需要对外发布多语言 SDK 时再按需引入。
+- **Tauri Mobile（Android / iOS 原生构建）**：Phase 0–3 由 PWA + Web Push 承担移动端体验，Phase 4 再按需评估原生壳。
+- **Windows 服务端支持**：服务端先专注 Linux 裸金属（客户端 Web / Tauri 桌面仍跨平台支持 Windows / macOS / Linux）。
 
 ---
 
 ## 3. 构建环境与工具链要求
 
-### 3.1 基础工具链
+### 3.1 基础工具链版本
 
-| 工具 | 最低 / 推荐版本 | 用途 |
-| --- | --- | --- |
-| Rust (`rustup`, `cargo`, `clippy`, `rustfmt`) | Stable（>= 1.85） | 服务端、CLI/TUI 与 Tauri 原生层编译 |
-| Node.js + pnpm | Node >= 22，pnpm >= 10 | 前端工作台、TS SDK 构建与 Monorepo 管理 |
-| Tauri CLI (`cargo-tauri`) | `^2.0` | Desktop 与 Mobile（Android/iOS）构建打包 |
-| Protobuf & Buf | `protoc` >= 3.21、`buf` >= 1.50 | Protobuf Lint、Breaking 检查与代码生成 |
-| SQLite | `libsqlite3-dev` + `sqlite3` | 本地数据库编译与调试 |
-| 快速链接器 | `lld`（LLVM Linker）+ `clang` | 显著加速 Rust / Tauri 增量链接速度 |
+- **Rust**：通过根目录 [`rust-toolchain.toml`](../rust-toolchain.toml) 固定 `stable` 通道与 `rustfmt`/`clippy` 组件（MSRV `1.85`）。
+- **Node.js / pnpm**：通过根目录 [`package.json`](../package.json) 的 `engines`（`node >= 22`、`pnpm >= 10`）与 `packageManager` 字段约束。
+- **Linux x86_64 链接加速**：通过仓库级 [`.cargo/config.toml`](../.cargo/config.toml) 配置 `clang` + `lld`（不再修改开发者本机全局 `$CARGO_HOME/config.toml`）。
 
-### 3.2 Linux（Ubuntu 24.04）系统构建依赖
+### 3.2 Linux（Ubuntu 24.04）一键初始化脚本
 
-构建 Tauri v2 桌面端、Rust 原生依赖与 Protobuf 需安装以下系统包：
+仓库提供幂等、非交互的 [`scripts/setup-env.sh`](../scripts/setup-env.sh)，按阶段按需安装依赖：
 
 ```bash
-sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-  libwebkit2gtk-4.1-dev \
-  libgtk-3-dev \
-  libayatana-appindicator3-dev \
-  librsvg2-dev \
-  libxdo-dev \
-  patchelf \
-  build-essential \
-  pkg-config \
-  libssl-dev \
-  libsqlite3-dev \
-  sqlite3 \
-  lld \
-  protobuf-compiler \
-  libprotobuf-dev \
-  xvfb \
-  curl \
-  wget \
-  file
-```
-
-### 3.3 Android 移动端交叉编译环境（Linux / macOS / Windows）
-
-- **JDK**：OpenJDK 17 或 21（配置 `JAVA_HOME`）。
-- **Android SDK**：Platform（API 34+）、Build-Tools（34/35）、Platform-Tools、Command-line Tools（配置 `ANDROID_HOME`）。
-- **Android NDK**：推荐使用 **NDK r28（`28.2.13676358`）**（默认支持 Android 16KB 内存页对齐，配置 `NDK_HOME` 与 `ANDROID_NDK_HOME`）。
-- **Rust Android Targets**：
-  ```bash
-  rustup target add \
-    aarch64-linux-android \
-    armv7-linux-androideabi \
-    i686-linux-android \
-    x86_64-linux-android
-  ```
-
-> **说明**：iOS 客户端编译需在 macOS 环境下安装完整 Xcode、CocoaPods 及 Rust Apple iOS targets（`aarch64-apple-ios`、`aarch64-apple-ios-sim`、`x86_64-apple-ios`）。
-
-### 3.4 Cargo 链接加速配置（Linux x86_64）
-
-建议在 `$CARGO_HOME/config.toml`（或项目级 `.cargo/config.toml`）中为 Linux 主机目标启用 `lld`：
-
-```toml
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-```
-
-### 3.5 一键初始化脚本（Ubuntu 24.04 / 云端开发环境）
-
-仓库内提供了幂等的非交互初始化脚本 [`scripts/setup-env.sh`](../scripts/setup-env.sh)，并已接入 [`.agents/environment.json`](../.agents/environment.json) 供云端开发机自动执行：
-
-```bash
+# 默认：Phase 0–2 服务端 + Web 最小依赖（build-essential、clang、lld、pkg-config、libssl-dev、libsqlite3-dev、sqlite3、bubblewrap）
 bash scripts/setup-env.sh
+
+# 云端开发机（.agents/environment.json 自动调用，额外完成非交互 shell PATH 适配）
+bash scripts/setup-env.sh --cloud
+
+# Phase 3 开发 Tauri v2 Linux 桌面壳时追加桌面依赖（WebKitGTK 4.1 / GTK 3 / AppIndicator / librsvg / xvfb / cargo-tauri）
+bash scripts/setup-env.sh --desktop
+
+# Phase 4 按需构建 Android 时追加 Android NDK 与 Rust Android targets
+bash scripts/setup-env.sh --android
 ```
 
+- 默认执行**不会修改本机 `~/.bashrc`**，也**不会写入全局 `$CARGO_HOME/config.toml`**。
+- 云端环境配置文件 [`.agents/environment.json`](../.agents/environment.json) 默认调用 `bash scripts/setup-env.sh --cloud`，确保新开云端 VM 在数秒内完成服务端与 Web 构建环境初始化。

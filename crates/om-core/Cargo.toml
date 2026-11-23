@@ -1,0 +1,9 @@
+[package]
+name = "om-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared domain models, event contracts, and Harness/Sandbox traits for OpenMirasim"
+
+[dependencies]
