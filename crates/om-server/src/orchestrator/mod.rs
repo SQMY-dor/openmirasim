@@ -18,6 +18,7 @@ mod hub;
 pub use hub::Subscription;
 
 use crate::db::Db;
+pub use crate::harness::HarnessRegistry;
 use actor::{ActorSpec, Command};
 use hub::EventHub;
 use om_core::approval::{ApprovalDecision, ApprovalRecord};
@@ -31,41 +32,6 @@ use om_core::{CoreError, CoreResult};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
-
-/// Registered harnesses, keyed by [`Harness::id`].
-#[derive(Default, Clone)]
-pub struct HarnessRegistry {
-    harnesses: HashMap<String, Arc<dyn Harness>>,
-}
-
-impl HarnessRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers (or replaces) a harness under its id.
-    pub fn register(&mut self, harness: Arc<dyn Harness>) -> &mut Self {
-        self.harnesses.insert(harness.id().to_owned(), harness);
-        self
-    }
-
-    pub fn get(&self, id: &str) -> Option<Arc<dyn Harness>> {
-        self.harnesses.get(id).cloned()
-    }
-
-    /// Like [`HarnessRegistry::get`] but `NotFound` when missing.
-    pub fn require(&self, id: &str) -> CoreResult<Arc<dyn Harness>> {
-        self.get(id)
-            .ok_or_else(|| CoreError::NotFound(format!("harness `{id}`")))
-    }
-
-    /// Registered ids, sorted.
-    pub fn ids(&self) -> Vec<String> {
-        let mut ids: Vec<_> = self.harnesses.keys().cloned().collect();
-        ids.sort();
-        ids
-    }
-}
 
 /// Orchestrator settings.
 #[derive(Debug, Clone)]
@@ -133,7 +99,7 @@ impl Orchestrator {
 
     /// Registered harness ids, sorted.
     pub fn harness_ids(&self) -> Vec<String> {
-        self.registry.ids()
+        self.registry.list().into_iter().map(|d| d.id).collect()
     }
 
     /// Marks sessions left live by a previous process as `Failed`. Call once at startup,
