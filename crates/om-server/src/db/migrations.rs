@@ -158,4 +158,38 @@ pub(super) const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX schedule_runs_schedule ON schedule_runs(schedule_id, fired_at DESC);
     "#,
+    // v6 (W4-1): goals and session-to-session dispatches.
+    r#"
+    CREATE TABLE goals (
+        id            TEXT PRIMARY KEY,
+        space_id      TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        objective     TEXT NOT NULL,
+        done_marker   TEXT NOT NULL,
+        max_turns     INTEGER NOT NULL,
+        turns_used    INTEGER NOT NULL DEFAULT 0,
+        deadline_at   INTEGER,
+        created_by    TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        status        TEXT NOT NULL,
+        ended_reason  TEXT,
+        created_at    INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL
+    );
+    CREATE INDEX goals_session ON goals(session_id, created_at DESC);
+    CREATE UNIQUE INDEX goals_one_active ON goals(session_id) WHERE status = 'active';
+
+    CREATE TABLE dispatches (
+        id               TEXT PRIMARY KEY,
+        space_id         TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        from_session     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        to_session       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        member_id        TEXT NOT NULL,
+        depth            INTEGER NOT NULL,
+        created_session  INTEGER NOT NULL,
+        submit           TEXT NOT NULL,
+        created_at       INTEGER NOT NULL
+    );
+    CREATE INDEX dispatches_from ON dispatches(from_session, created_at DESC);
+    CREATE INDEX dispatches_to ON dispatches(to_session, created_at DESC);
+    "#,
 ];
