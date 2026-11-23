@@ -7,6 +7,9 @@ import type { HarnessCapabilities } from "./HarnessCapabilities";
 import type { MemberId } from "./MemberId";
 import type { PlanEntry } from "./PlanEntry";
 import type { Prompt } from "./Prompt";
+import type { QueueRemoval } from "./QueueRemoval";
+import type { QueuedPrompt } from "./QueuedPrompt";
+import type { QueuedPromptId } from "./QueuedPromptId";
 import type { SessionConfig } from "./SessionConfig";
 import type { SessionStatus } from "./SessionStatus";
 import type { StopReason } from "./StopReason";
@@ -21,4 +24,4 @@ export type EventPayload = { "type": "session_created", config: SessionConfig, c
 /**
  * Policy rule that resolved the request automatically, if any.
  */
-auto_rule?: string, } | { "type": "turn_ended", turn_id: TurnId, stop_reason: StopReason, error?: string, } | { "type": "error", message: string, };
+auto_rule?: string, } | { "type": "turn_ended", turn_id: TurnId, stop_reason: StopReason, error?: string, } | { "type": "error", message: string, } | { "type": "prompt_queued", queued: QueuedPrompt, position: number, } | { "type": "queue_item_removed", queued_id: QueuedPromptId, reason: QueueRemoval, } | { "type": "queue_reordered", order: Array<QueuedPromptId>, } | { "type": "queue_paused", paused: boolean, } | { "type": "prompt_steered", turn_id: TurnId, member_id?: MemberId, prompt: Prompt, };

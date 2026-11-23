@@ -11,12 +11,14 @@ use futures::StreamExt;
 use om_core::approval::{ApprovalDecision, ApprovalRecord, ApprovalStatus};
 use om_core::content::Prompt;
 use om_core::event::{EventPayload, SessionEvent, ToolKind};
+use om_core::harness::HarnessCapabilities;
 use om_core::harness::{Harness, HarnessEvent, HarnessEventStream, HarnessSession, StartContext};
-use om_core::ids::{ApprovalId, MemberId, SessionId, TurnId};
+use om_core::ids::{ApprovalId, MemberId, QueuedPromptId, SessionId, TurnId};
+use om_core::queue::{MAX_QUEUED_PROMPTS, QueueRemoval, QueuedPrompt, SubmitMode, SubmitOutcome};
 use om_core::sandbox::Sandbox;
 use om_core::session::{SessionConfig, SessionStatus, StopReason};
 use om_core::{CoreError, CoreResult, now_ms};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -37,6 +39,28 @@ pub(crate) enum Command {
         reply: oneshot::Sender<CoreResult<ApprovalRecord>>,
     },
     Close {
+        reply: oneshot::Sender<CoreResult<()>>,
+    },
+    Send {
+        member: Option<MemberId>,
+        prompt: Prompt,
+        mode: SubmitMode,
+        reply: oneshot::Sender<CoreResult<SubmitOutcome>>,
+    },
+    ListQueue {
+        reply: oneshot::Sender<CoreResult<Vec<QueuedPrompt>>>,
+    },
+    Withdraw {
+        queued_id: QueuedPromptId,
+        member: Option<MemberId>,
+        reply: oneshot::Sender<CoreResult<()>>,
+    },
+    MoveQueued {
+        queued_id: QueuedPromptId,
+        position: usize,
+        reply: oneshot::Sender<CoreResult<Vec<QueuedPrompt>>>,
+    },
+    ResumeQueue {
         reply: oneshot::Sender<CoreResult<()>>,
     },
 }
@@ -68,6 +92,11 @@ struct Actor {
     tool_calls: HashMap<String, (ToolKind, Vec<String>)>,
     /// When each pending approval times out.
     deadlines: HashMap<ApprovalId, Instant>,
+    capabilities: HarnessCapabilities,
+    /// Prompts waiting for the current turn to end, front first (W2-3).
+    queue: VecDeque<QueuedPrompt>,
+    /// Set by a cancel: queued prompts wait until a member resumes or submits again.
+    paused: bool,
 }
 
 impl Actor {
@@ -128,6 +157,21 @@ impl Actor {
                 to: SessionStatus::Running,
             });
         }
+        if !self.queue.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "prompts are queued; send with a submit mode instead".into(),
+            ));
+        }
+        self.start_turn(member, prompt, None).await
+    }
+
+    /// Starts a turn. `from_queue` records which queued prompt it came from.
+    async fn start_turn(
+        &mut self,
+        member: Option<MemberId>,
+        prompt: Prompt,
+        from_queue: Option<QueuedPromptId>,
+    ) -> CoreResult<TurnId> {
         let session = self
             .session
             .as_ref()
@@ -136,14 +180,228 @@ impl Actor {
         session.prompt(prompt.clone()).await?;
         let turn_id = TurnId::new();
         self.turn = Some(turn_id.clone());
-        let mut payloads = vec![EventPayload::PromptSubmitted {
+        let mut payloads = Vec::new();
+        if let Some(queued_id) = from_queue {
+            payloads.push(EventPayload::QueueItemRemoved {
+                queued_id,
+                reason: QueueRemoval::Started {
+                    turn_id: turn_id.clone(),
+                },
+            });
+        }
+        payloads.push(EventPayload::PromptSubmitted {
             turn_id: turn_id.clone(),
             member_id: member,
             prompt,
-        }];
+        });
         payloads.extend(self.status_change(SessionStatus::Running));
         self.append(payloads).await?;
         Ok(turn_id)
+    }
+
+    async fn set_paused(&mut self, paused: bool) {
+        if self.paused != paused {
+            self.paused = paused;
+            self.record(vec![EventPayload::QueuePaused { paused }])
+                .await;
+        }
+    }
+
+    /// Adds a prompt to the queue (front or back) and returns its position.
+    async fn enqueue(
+        &mut self,
+        member: Option<MemberId>,
+        prompt: Prompt,
+        mode: SubmitMode,
+        front: bool,
+    ) -> CoreResult<(QueuedPromptId, u32)> {
+        if self.queue.len() >= MAX_QUEUED_PROMPTS {
+            return Err(CoreError::LimitExceeded(format!(
+                "a session queues at most {MAX_QUEUED_PROMPTS} prompts"
+            )));
+        }
+        let queued = QueuedPrompt {
+            id: QueuedPromptId::new(),
+            member_id: member,
+            prompt,
+            mode,
+            created_at: now_ms(),
+        };
+        let id = queued.id.clone();
+        let position = if front { 0 } else { self.queue.len() };
+        self.append(vec![EventPayload::PromptQueued {
+            queued: queued.clone(),
+            position: position as u32,
+        }])
+        .await?;
+        self.queue.insert(position, queued);
+        Ok((id, position as u32))
+    }
+
+    fn position_of(&self, id: &QueuedPromptId) -> Option<usize> {
+        self.queue.iter().position(|q| &q.id == id)
+    }
+
+    /// Starts queued prompts while the session is idle and the queue is not paused. A
+    /// prompt the harness refuses is dropped with `Failed` and the next one is tried.
+    async fn drain(&mut self) {
+        while !self.paused
+            && self.turn.is_none()
+            && self.status == SessionStatus::Idle
+            && let Some(next) = self.queue.pop_front()
+        {
+            let id = next.id.clone();
+            if let Err(e) = self
+                .start_turn(next.member_id, next.prompt, Some(id.clone()))
+                .await
+            {
+                self.record(vec![EventPayload::QueueItemRemoved {
+                    queued_id: id,
+                    reason: QueueRemoval::Failed {
+                        error: e.to_string(),
+                    },
+                }])
+                .await;
+            }
+        }
+    }
+
+    /// Drops every queued prompt (session closing or agent gone).
+    fn drop_queue_payloads(&mut self) -> Vec<EventPayload> {
+        self.queue
+            .drain(..)
+            .map(|q| EventPayload::QueueItemRemoved {
+                queued_id: q.id,
+                reason: QueueRemoval::Dropped,
+            })
+            .collect()
+    }
+
+    async fn on_send(
+        &mut self,
+        member: Option<MemberId>,
+        prompt: Prompt,
+        mode: SubmitMode,
+    ) -> CoreResult<SubmitOutcome> {
+        if prompt.is_empty() {
+            return Err(CoreError::InvalidInput("prompt is empty".into()));
+        }
+        match self.status {
+            SessionStatus::Idle if self.turn.is_none() => {
+                // Sending again resumes a paused queue. A plain `Queue` send still waits
+                // behind what is already queued; `Next` / `Steer` go first.
+                self.set_paused(false).await;
+                if mode == SubmitMode::Queue && !self.queue.is_empty() {
+                    let (queued_id, _) = self.enqueue(member, prompt, mode, false).await?;
+                    self.drain().await;
+                    let position = self.position_of(&queued_id).unwrap_or(0) as u32;
+                    return Ok(SubmitOutcome::Queued {
+                        queued_id,
+                        position,
+                    });
+                }
+                let turn_id = self.start_turn(member, prompt, None).await?;
+                Ok(SubmitOutcome::Started { turn_id })
+            }
+            SessionStatus::Running | SessionStatus::WaitingApproval if self.turn.is_some() => {
+                match mode {
+                    SubmitMode::Queue | SubmitMode::Next => {
+                        let (queued_id, position) = self
+                            .enqueue(member, prompt, mode, mode == SubmitMode::Next)
+                            .await?;
+                        Ok(SubmitOutcome::Queued {
+                            queued_id,
+                            position,
+                        })
+                    }
+                    SubmitMode::Steer => self.steer(member, prompt).await,
+                }
+            }
+            from => Err(CoreError::InvalidTransition {
+                from,
+                to: SessionStatus::Running,
+            }),
+        }
+    }
+
+    /// Steers the running turn: natively when the harness can, otherwise by cancelling
+    /// the turn and running this prompt first once it has ended.
+    async fn steer(
+        &mut self,
+        member: Option<MemberId>,
+        prompt: Prompt,
+    ) -> CoreResult<SubmitOutcome> {
+        let turn_id = self.turn.clone().expect("steer requires a running turn");
+        if self.capabilities.steer
+            && let Some(s) = &self.session
+        {
+            match s.steer(prompt.clone()).await {
+                Ok(()) => {
+                    self.append(vec![EventPayload::PromptSteered {
+                        turn_id: turn_id.clone(),
+                        member_id: member,
+                        prompt,
+                    }])
+                    .await?;
+                    return Ok(SubmitOutcome::Steered { turn_id });
+                }
+                Err(CoreError::Unsupported { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let (queued_id, _) = self
+            .enqueue(member, prompt, SubmitMode::Steer, true)
+            .await?;
+        self.set_paused(false).await;
+        if let Some(s) = &self.session
+            && let Err(e) = s.cancel().await
+        {
+            tracing::warn!(session = %self.id, error = %e, "cancel for steer failed");
+        }
+        self.cancel_pending_approvals().await;
+        Ok(SubmitOutcome::Interrupting { queued_id })
+    }
+
+    async fn on_withdraw(
+        &mut self,
+        queued_id: QueuedPromptId,
+        member: Option<MemberId>,
+    ) -> CoreResult<()> {
+        let i = self
+            .position_of(&queued_id)
+            .ok_or_else(|| CoreError::NotFound(format!("queued prompt {queued_id}")))?;
+        self.append(vec![EventPayload::QueueItemRemoved {
+            queued_id,
+            reason: QueueRemoval::Withdrawn { by: member },
+        }])
+        .await?;
+        self.queue.remove(i);
+        Ok(())
+    }
+
+    async fn on_move(
+        &mut self,
+        queued_id: QueuedPromptId,
+        position: usize,
+    ) -> CoreResult<Vec<QueuedPrompt>> {
+        let i = self
+            .position_of(&queued_id)
+            .ok_or_else(|| CoreError::NotFound(format!("queued prompt {queued_id}")))?;
+        let to = position.min(self.queue.len() - 1);
+        if i != to {
+            let item = self.queue.remove(i).expect("index checked");
+            self.queue.insert(to, item);
+            let order = self.queue.iter().map(|q| q.id.clone()).collect();
+            self.append(vec![EventPayload::QueueReordered { order }])
+                .await?;
+        }
+        Ok(self.queue.iter().cloned().collect())
+    }
+
+    async fn on_resume(&mut self) -> CoreResult<()> {
+        self.set_paused(false).await;
+        self.drain().await;
+        Ok(())
     }
 
     async fn on_cancel(&mut self) -> CoreResult<()> {
@@ -157,6 +415,10 @@ impl Actor {
             s.cancel().await?;
         }
         self.cancel_pending_approvals().await;
+        // "Stop" must not immediately start the next queued prompt.
+        if !self.queue.is_empty() {
+            self.set_paused(true).await;
+        }
         Ok(())
     }
 
@@ -409,6 +671,7 @@ impl Actor {
                 error: Some("session closed".into()),
             });
         }
+        payloads.extend(self.drop_queue_payloads());
         payloads.extend(self.status_change(SessionStatus::Closed));
         self.append(payloads).await?;
         Ok(())
@@ -492,6 +755,7 @@ impl Actor {
                     payloads.extend(self.status_change(SessionStatus::Idle));
                 }
                 self.record(payloads).await;
+                self.drain().await;
             }
             HarnessEvent::Exited { error } => {
                 self.on_harness_gone(error).await;
@@ -515,6 +779,7 @@ impl Actor {
         payloads.push(EventPayload::Error {
             message: error.unwrap_or_else(|| "agent process exited".into()),
         });
+        payloads.extend(self.drop_queue_payloads());
         if !self.status.is_terminal() {
             payloads.extend(self.status_change(SessionStatus::Failed));
         }
@@ -543,6 +808,9 @@ pub(crate) async fn run(
         remembered: HashMap::new(),
         tool_calls: HashMap::new(),
         deadlines: HashMap::new(),
+        capabilities: spec.harness.capabilities(),
+        queue: VecDeque::new(),
+        paused: false,
     };
 
     let events = start_harness(&mut actor, &spec).await;
@@ -676,6 +944,39 @@ async fn handle_command(actor: &mut Actor, cmd: Command) -> bool {
             let _ = reply.send(actor.on_close().await);
             true
         }
+        Command::Send {
+            member,
+            prompt,
+            mode,
+            reply,
+        } => {
+            let _ = reply.send(actor.on_send(member, prompt, mode).await);
+            false
+        }
+        Command::ListQueue { reply } => {
+            let _ = reply.send(Ok(actor.queue.iter().cloned().collect()));
+            false
+        }
+        Command::Withdraw {
+            queued_id,
+            member,
+            reply,
+        } => {
+            let _ = reply.send(actor.on_withdraw(queued_id, member).await);
+            false
+        }
+        Command::MoveQueued {
+            queued_id,
+            position,
+            reply,
+        } => {
+            let _ = reply.send(actor.on_move(queued_id, position).await);
+            false
+        }
+        Command::ResumeQueue { reply } => {
+            let _ = reply.send(actor.on_resume().await);
+            false
+        }
     }
 }
 
@@ -685,7 +986,16 @@ fn reject(cmd: Command, err: CoreError) {
         Command::Prompt { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
         }
-        Command::Cancel { reply } | Command::Close { reply } => {
+        Command::Cancel { reply }
+        | Command::Close { reply }
+        | Command::ResumeQueue { reply }
+        | Command::Withdraw { reply, .. } => {
+            let _ = reply.send(Err(CoreError::InvalidInput(msg)));
+        }
+        Command::Send { reply, .. } => {
+            let _ = reply.send(Err(CoreError::InvalidInput(msg)));
+        }
+        Command::ListQueue { reply } | Command::MoveQueued { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
         }
         Command::ResolveApproval { reply, .. } => {

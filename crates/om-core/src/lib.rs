@@ -24,6 +24,7 @@ pub mod error;
 pub mod event;
 pub mod harness;
 pub mod ids;
+pub mod queue;
 pub mod proxy;
 pub mod sandbox;
 pub mod session;
