@@ -14,7 +14,7 @@ use om_core::sandbox::CommandSpec;
 use om_server::acp::AcpHarness;
 use om_server::api::{ApiConfig, AppState, build_router};
 use om_server::db::Db;
-use om_server::harness::default_phase0_registry;
+use om_server::harness::HarnessRegistry;
 use om_server::orchestrator::{Orchestrator, OrchestratorConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let space_name = std::env::var("OM_SPACE_NAME").unwrap_or_else(|_| "default".into());
     let default_space_id = db.ensure_space(&space_name).await?;
 
-    let mut registry = default_phase0_registry();
+    let registry = HarnessRegistry::with_phase0_defaults();
     if let Ok(fake_bin) = std::env::var("OM_FAKE_AGENT_BIN")
         && !fake_bin.trim().is_empty()
     {
