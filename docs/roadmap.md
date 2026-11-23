@@ -21,11 +21,11 @@
 
 ### Phase 1：Linux 裸金属隔离 + 审批闭环 + 多 CLI Agent + `om-cli ctl`
 **可复现 Demo 验收标准**：
-- [ ] 为会话自动创建隔离 Git Worktree，Agent 在 **`bubblewrap` (`bwrap`) + `systemd-run`/cgroups v2** 沙箱内执行（越界写 Worktree 外路径或读取宿主机敏感文件被阻断）
-- [ ] Agent 发起高危工具调用时触发 `ApprovalRequest`，Web 页面弹出审批卡片，审批通过后会话继续执行；并发重复审批被原子拒绝
-- [ ] 在 Web 页面查看当前 Worktree 的文件树与实时 Git Diff
-- [ ] 完整接入 4 个无头 CLI Agent：**`opencode`**、**`dsh`**（DeepSeek Harness）、**`cc`**（Claude Code）、**`codexcli`**（Codex CLI），支持启动前版本与能力探测
-- [ ] 通过 `om-cli ctl` 以纯 JSON 完成状态查询、发 Prompt 与命令行审批
+- [ ] 为会话自动创建隔离 Git Worktree，Agent 在 **`bubblewrap` (`bwrap`) + `systemd-run`/cgroups v2** 沙箱内执行（主入口已接线；待合入 `docs/code-review.md` 中 `git_common_dir` 只读/代理挂载等 P0 加固后完成越界对抗验收）
+- [x] Agent 发起高危工具调用时触发 `ApprovalRequest`，Web 页面弹出审批卡片，审批通过后会话继续执行；并发重复审批被原子拒绝，并支持记住/清空会话级审批规则
+- [x] 在 Web 页面注册 Git 仓库并查看当前会话 Worktree 的文件树、源码预览与实时 Git Diff
+- [x] 完整接入 4 个无头 CLI Agent：**`opencode`**、**`dsh`**（DeepSeek Harness）、**`cc`**（Claude Code）、**`codexcli`**（Codex CLI），支持启动前版本与能力探测（`/api/v1/harnesses/probe`）
+- [x] 通过 `om-cli ctl` 以纯 JSON 完成健康检查、仓库/会话/Worktree/Diff/队列查询、发 Prompt 与命令行审批
 
 ### Phase 2：30 人团队协作 + 密钥隔离 + PWA 推送 + Antigravity GUI 桥接
 **可复现 Demo 验收标准**：

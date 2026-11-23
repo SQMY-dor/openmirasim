@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertCircle,
+  GitCompare,
   Menu,
   Wifi,
   WifiOff,
@@ -12,6 +13,7 @@ import { EventInspector } from "./components/EventInspector";
 import { NewSessionModal } from "./components/NewSessionModal";
 import { SessionStream } from "./components/SessionStream";
 import { sessionDisplayTitle, Sidebar } from "./components/Sidebar";
+import { WorktreeDrawer } from "./components/WorktreeDrawer";
 import type { OpenMirasimClient } from "./protocol/client";
 import { HttpOpenMirasimClient } from "./protocol/httpClient";
 import { MockOpenMirasimClient } from "./protocol/mockClient";
@@ -25,9 +27,13 @@ import type {
   ApprovalId,
   ConnectionState,
   CreateSessionRequest,
+  HarnessDescriptor,
+  QueuedPromptId,
   ServerInfo,
   SessionEvent,
   SessionSummary,
+  SubmitMode,
+  WorkspaceSummary,
 } from "./protocol/types";
 
 const AUTH_STORAGE_KEY = "openmirasim.auth.v1";
@@ -90,9 +96,8 @@ export function App() {
   const [connectError, setConnectError] = useState<string | null>(null);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [harnesses, setHarnesses] = useState<
-    import("./protocol/types").HarnessDescriptor[]
-  >([]);
+  const [harnesses, setHarnesses] = useState<HarnessDescriptor[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
     () => {
       try {
@@ -111,6 +116,7 @@ export function App() {
   const [resyncCount, setResyncCount] = useState(0);
 
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [worktreeOpen, setWorktreeOpen] = useState(false);
   const [newModalOpen, setNewModalOpen] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -140,9 +146,10 @@ export function App() {
       setConnectError(null);
       try {
         const info = await nextClient.connect();
-        const [sessionList, harnessList] = await Promise.all([
+        const [sessionList, harnessList, workspaceList] = await Promise.all([
           nextClient.listSessions(),
           nextClient.listHarnesses().catch(() => []),
+          nextClient.listWorkspaces().catch(() => []),
         ]);
         try {
           window.localStorage.setItem(
@@ -155,6 +162,7 @@ export function App() {
         setClient(nextClient);
         setServerInfo(info);
         setHarnesses(harnessList);
+        setWorkspaces(workspaceList);
         setSessions(sessionList);
         setSelectedSessionId((prev) => {
           if (prev && sessionList.some((s) => s.id === prev)) return prev;
@@ -211,6 +219,9 @@ export function App() {
     setClient(null);
     setServerInfo(null);
     setSessions([]);
+    setWorkspaces([]);
+    setWorktreeOpen(false);
+    setInspectorOpen(false);
     setProjection(null);
     setConnectionState("disconnected");
     setStreamError(null);
@@ -307,6 +318,21 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, selectedSessionId]);
 
+  const handleRegisterWorkspace = useCallback(
+    async (name: string, repoPath: string): Promise<WorkspaceSummary> => {
+      if (!client) {
+        throw new Error("未连接到服务器");
+      }
+      const created = await client.registerWorkspace(name, repoPath);
+      setWorkspaces((prev) => {
+        const filtered = prev.filter((w) => w.id !== created.id);
+        return [created, ...filtered];
+      });
+      return created;
+    },
+    [client]
+  );
+
   const handleCreateSession = useCallback(
     async (req: CreateSessionRequest) => {
       if (!client) return;
@@ -326,17 +352,53 @@ export function App() {
   );
 
   const handleSendPrompt = useCallback(
-    async (text: string) => {
+    async (text: string, mode?: SubmitMode) => {
       if (!client || !selectedSessionId) return;
       setStreamError(null);
       try {
-        await client.submitPrompt(selectedSessionId, text);
+        await client.submitPrompt(selectedSessionId, text, mode);
       } catch (err) {
         setStreamError(err instanceof Error ? err.message : "发送指令失败");
       }
     },
     [client, selectedSessionId]
   );
+
+  const handleWithdrawQueued = useCallback(
+    async (queuedId: QueuedPromptId) => {
+      if (!client || !selectedSessionId) return;
+      setStreamError(null);
+      try {
+        await client.withdrawQueued(selectedSessionId, queuedId);
+      } catch (err) {
+        setStreamError(err instanceof Error ? err.message : "撤回排队指令失败");
+      }
+    },
+    [client, selectedSessionId]
+  );
+
+  const handleMoveQueued = useCallback(
+    async (queuedId: QueuedPromptId, position: number) => {
+      if (!client || !selectedSessionId) return;
+      setStreamError(null);
+      try {
+        await client.moveQueued(selectedSessionId, queuedId, position);
+      } catch (err) {
+        setStreamError(err instanceof Error ? err.message : "调整队列顺序失败");
+      }
+    },
+    [client, selectedSessionId]
+  );
+
+  const handleResumeQueue = useCallback(async () => {
+    if (!client || !selectedSessionId) return;
+    setStreamError(null);
+    try {
+      await client.resumeQueue(selectedSessionId);
+    } catch (err) {
+      setStreamError(err instanceof Error ? err.message : "恢复队列失败");
+    }
+  }, [client, selectedSessionId]);
 
   const handleCancel = useCallback(async () => {
     if (!client || !selectedSessionId) return;
@@ -522,11 +584,36 @@ export function App() {
               </button>
             )}
 
+            {selectedSession && (
+              <button
+                type="button"
+                id="toggle-worktree-btn"
+                className={`icon-btn ${worktreeOpen ? "active" : ""}`}
+                onClick={() => {
+                  setWorktreeOpen((v) => {
+                    const next = !v;
+                    if (next) setInspectorOpen(false);
+                    return next;
+                  });
+                }}
+                aria-label="切换 Worktree Diff / 文件树 / 审批规则面板"
+                title="Worktree Diff · Files · Approval Rules"
+              >
+                <GitCompare size={16} />
+              </button>
+            )}
+
             <button
               type="button"
               id="toggle-inspector-btn"
               className={`icon-btn ${inspectorOpen ? "active" : ""}`}
-              onClick={() => setInspectorOpen((v) => !v)}
+              onClick={() => {
+                setInspectorOpen((v) => {
+                  const next = !v;
+                  if (next) setWorktreeOpen(false);
+                  return next;
+                });
+              }}
               aria-label="切换事件流诊断面板"
               title="Event Stream Inspector"
             >
@@ -556,8 +643,13 @@ export function App() {
               disabled={
                 connectionState === "disconnected" || activeStatus === "closed"
               }
+              queue={projection?.queue ?? []}
+              queuePaused={projection?.queuePaused ?? false}
               onSend={handleSendPrompt}
               onCancel={handleCancel}
+              onWithdrawQueued={handleWithdrawQueued}
+              onMoveQueued={handleMoveQueued}
+              onResumeQueue={handleResumeQueue}
             />
           </>
         ) : (
@@ -574,6 +666,13 @@ export function App() {
           </div>
         )}
       </main>
+
+      <WorktreeDrawer
+        open={worktreeOpen}
+        sessionId={selectedSessionId}
+        client={client}
+        onClose={() => setWorktreeOpen(false)}
+      />
 
       <EventInspector
         open={inspectorOpen}
@@ -595,6 +694,8 @@ export function App() {
         open={newModalOpen}
         creating={creatingSession}
         harnesses={harnesses}
+        workspaces={workspaces}
+        onRegisterWorkspace={handleRegisterWorkspace}
         onClose={() => setNewModalOpen(false)}
         onCreate={handleCreateSession}
       />

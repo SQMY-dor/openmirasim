@@ -213,4 +213,128 @@ test.describe("OpenMirasim Full-Stack Phase 0 E2E (real om-server + SQLite + Web
       fs.rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  test("Phase 1: multi-harness catalog, inline Git workspace registration, live worktree diff, file tree, and approval rules", async ({
+    page,
+  }) => {
+    expect(fs.existsSync(SERVER_BIN)).toBe(true);
+    expect(fs.existsSync(path.join(STATIC_DIR, "index.html"))).toBe(true);
+
+    const { execFileSync } = await import("node:child_process");
+    const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), "om-phase1-e2e-"));
+    const dataDir = path.join(rootTmp, "data");
+    const repoDir = path.join(rootTmp, "sample-repo");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(repoDir, { recursive: true });
+
+    const git = (args: string[]) =>
+      execFileSync("git", args, { cwd: repoDir, stdio: "pipe" });
+    git(["init", "-b", "main"]);
+    git(["config", "user.email", "e2e@openmirasim.dev"]);
+    git(["config", "user.name", "OpenMirasim E2E"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Phase 1 Repo\n");
+    git(["add", "README.md"]);
+    git(["commit", "-m", "initial"]);
+
+    const port = await findFreePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const server = startServer(port, dataDir);
+
+    const consoleErrors: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      consoleErrors.push(err.message);
+    });
+
+    try {
+      await waitForHealthz(baseUrl);
+      await page.goto(baseUrl);
+
+      await page.locator("#server-url-input").fill(baseUrl);
+      await page.locator("#access-token-input").fill(TOKEN);
+      await page.locator("#connect-submit-btn").click();
+      await expect(page.locator("#new-session-btn")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // 1. Open NewSessionModal and verify all 5 Phase 1 harnesses are registered
+      await page.locator("#new-session-btn").click();
+      const harnessValues = await page
+        .locator("#new-session-harness option")
+        .evaluateAll((opts) =>
+          opts.map((o) => (o as HTMLOptionElement).value)
+        );
+      for (const expected of ["mock", "opencode", "dsh", "cc", "codexcli"]) {
+        expect(harnessValues).toContain(expected);
+      }
+
+      // 2. Register the temporary Git repo inline & create a worktree-isolated session
+      await page.locator("#toggle-register-workspace-btn").click();
+      await page.locator("#register-ws-name").fill("phase1-demo");
+      await page.locator("#register-ws-path").fill(repoDir);
+      await page.locator("#confirm-register-ws-btn").click();
+      await expect(page.locator("#new-session-workspace")).not.toHaveValue("");
+
+      await page.locator("#new-session-title").fill("Phase 1 Worktree 会话");
+      await page.locator("#new-session-harness").selectOption("mock");
+      await page.locator("#confirm-create-session-btn").click();
+
+      await expect(page.locator("#active-session-title")).toHaveText(
+        "Phase 1 Worktree 会话",
+        { timeout: 10_000 }
+      );
+      await expect(page.locator("#prompt-textarea")).toBeEnabled({
+        timeout: 10_000,
+      });
+
+      // 3. Modify README.md inside the provisioned session worktree so Diff has real content
+      const sessionsRes = await fetch(`${baseUrl}/api/v1/sessions`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      const sessionsBody = (await sessionsRes.json()) as {
+        sessions: Array<{ id: string }>;
+      };
+      const sid = sessionsBody.sessions[0].id;
+      const wtRes = await fetch(`${baseUrl}/api/v1/sessions/${sid}/worktree`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      const wt = (await wtRes.json()) as { path: string };
+      fs.writeFileSync(
+        path.join(wt.path, "README.md"),
+        "# Phase 1 Repo\nphase1-e2e-live-diff\n"
+      );
+
+      // 4. Open WorktreeDrawer -> inspect Git Diff, File Tree + preview, Approval Rules
+      await page.locator("#toggle-worktree-btn").click();
+      await expect(page.locator("#worktree-drawer")).toBeVisible();
+      await expect(page.locator("#worktree-drawer")).toContainText(
+        "+phase1-e2e-live-diff",
+        { timeout: 10_000 }
+      );
+
+      await page.locator("#tab-worktree-files").click();
+      const readmeBtn = page
+        .locator("#worktree-drawer")
+        .getByRole("button", { name: /README\.md/ });
+      await expect(readmeBtn).toBeVisible({ timeout: 10_000 });
+      await readmeBtn.click();
+      await expect(page.locator("#worktree-drawer")).toContainText(
+        "phase1-e2e-live-diff",
+        { timeout: 10_000 }
+      );
+
+      await page.locator("#tab-approval-rules").click();
+      await expect(page.locator("#worktree-drawer")).toContainText(
+        "0 条记忆规则",
+        { timeout: 10_000 }
+      );
+
+      expect(consoleErrors).toEqual([]);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(rootTmp, { recursive: true, force: true });
+    }
+  });
 });

@@ -8,14 +8,22 @@ import {
   type ApprovalDecision,
   type ApprovalId,
   type ApprovalRecord,
+  type ApprovalRuleView,
   type CreateSessionRequest,
   type EventPayload,
   type HarnessDescriptor,
+  type QueuedPromptId,
   type ServerInfo,
   type SessionEvent,
   type SessionId,
   type SessionSummary,
+  type SubmitMode,
+  type SubmitOutcome,
   type SubmitPromptResponse,
+  type WorkspaceSummary,
+  type WorktreeDiff,
+  type WorktreeEntry,
+  type WorktreeFileContent,
 } from "./types";
 
 const STORAGE_KEY = "openmirasim.mock.store.v2";
@@ -356,6 +364,97 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     });
   }
 
+  async listWorkspaces(): Promise<WorkspaceSummary[]> {
+    return [
+      {
+        id: "ws_demo_openmirasim",
+        space_id: "space_default",
+        name: "openmirasim",
+        repo_path: "/srv/workspaces/openmirasim",
+        default_branch: "main",
+        created_at: nowMs(),
+      },
+    ];
+  }
+
+  async registerWorkspace(
+    name: string,
+    repoPath: string
+  ): Promise<WorkspaceSummary> {
+    return {
+      id: makeId("ws"),
+      space_id: "space_default",
+      name,
+      repo_path: repoPath,
+      default_branch: "main",
+      created_at: nowMs(),
+    };
+  }
+
+  async getWorktreeDiff(_sessionId: SessionId): Promise<WorktreeDiff> {
+    return {
+      base_commit: "2a5344100000",
+      files: [{ path: "README.md", kind: "modified" }],
+      patch:
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,2 +1,3 @@\n # OpenMirasim\n+Local Mock Worktree Diff Preview\n",
+      truncated: false,
+    };
+  }
+
+  async listWorktreeFiles(_sessionId: SessionId): Promise<WorktreeEntry[]> {
+    return [
+      { path: "README.md", size: 1024 },
+      { path: "crates/om-core/src/api.rs", size: 6844 },
+      { path: "apps/web/src/App.tsx", size: 17500 },
+    ];
+  }
+
+  async readWorktreeFile(
+    _sessionId: SessionId,
+    path: string
+  ): Promise<WorktreeFileContent> {
+    return {
+      path,
+      content: `// Local Mock preview of ${path}\n`,
+      utf8: true,
+      size: 32 + path.length,
+    };
+  }
+
+  async listApprovalRules(_sessionId: SessionId): Promise<ApprovalRuleView[]> {
+    return [];
+  }
+
+  async clearApprovalRules(_sessionId: SessionId): Promise<number> {
+    return 0;
+  }
+
+  async withdrawQueued(
+    sessionId: SessionId,
+    queuedId: QueuedPromptId
+  ): Promise<void> {
+    this.appendEvent(sessionId, {
+      type: "queue_item_removed",
+      queued_id: queuedId,
+      reason: { reason: "withdrawn" },
+    });
+  }
+
+  async moveQueued(
+    _sessionId: SessionId,
+    _queuedId: QueuedPromptId,
+    _position: number
+  ): Promise<void> {
+    // no-op in mock preview
+  }
+
+  async resumeQueue(sessionId: SessionId): Promise<void> {
+    this.appendEvent(sessionId, {
+      type: "queue_paused",
+      paused: false,
+    });
+  }
+
   async fetchEvents(
     sessionId: SessionId,
     afterSeq: number
@@ -367,8 +466,9 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
 
   async submitPrompt(
     sessionId: SessionId,
-    text: string
-  ): Promise<SubmitPromptResponse> {
+    text: string,
+    _mode?: SubmitMode
+  ): Promise<SubmitPromptResponse | SubmitOutcome> {
     const trimmed = text.trim();
     const turnId = makeId("turn");
     if (!trimmed) return { turn_id: turnId };

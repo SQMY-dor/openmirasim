@@ -9,19 +9,26 @@ import {
   type ApiError,
   type ApprovalDecision,
   type ApprovalId,
+  type ApprovalRuleView,
   type ClientMessage,
   type CreateSessionRequest,
   type HarnessDescriptor,
   type ListEventsResponse,
   type ListSessionsResponse,
+  type QueuedPromptId,
   type ResolveApprovalRequest,
   type ServerInfo,
   type ServerMessage,
   type SessionEvent,
   type SessionId,
   type SessionSummary,
-  type SubmitPromptRequest,
+  type SubmitMode,
+  type SubmitOutcome,
   type SubmitPromptResponse,
+  type WorkspaceSummary,
+  type WorktreeDiff,
+  type WorktreeEntry,
+  type WorktreeFileContent,
 } from "./types";
 
 const WS_PING_INTERVAL_MS = 25_000;
@@ -33,6 +40,22 @@ interface HealthResponse {
 
 interface ListHarnessesResponse {
   harnesses: HarnessDescriptor[];
+}
+
+interface ListWorkspacesResponse {
+  workspaces: WorkspaceSummary[];
+}
+
+interface ListWorktreeFilesResponse {
+  entries: WorktreeEntry[];
+}
+
+interface ListApprovalRulesResponse {
+  rules: ApprovalRuleView[];
+}
+
+interface ClearApprovalRulesResponse {
+  cleared: number;
 }
 
 export class HttpOpenMirasimClient implements OpenMirasimClient {
@@ -76,7 +99,6 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
   }
 
   async connect(): Promise<ServerInfo> {
-    // Validate Bearer token via protected `/api/v1/harnesses` without double-fetching sessions.
     await this.listHarnesses();
     let serverVersion = "0.1.0";
     try {
@@ -99,6 +121,21 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
   async listHarnesses(): Promise<HarnessDescriptor[]> {
     const res = await this.request<ListHarnessesResponse>("/api/v1/harnesses");
     return res.harnesses;
+  }
+
+  async listWorkspaces(): Promise<WorkspaceSummary[]> {
+    const res = await this.request<ListWorkspacesResponse>("/api/v1/workspaces");
+    return res.workspaces;
+  }
+
+  async registerWorkspace(
+    name: string,
+    repoPath: string
+  ): Promise<WorkspaceSummary> {
+    return this.request<WorkspaceSummary>("/api/v1/workspaces", {
+      method: "POST",
+      body: JSON.stringify({ name, repo_path: repoPath }),
+    });
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -146,12 +183,14 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
 
   async submitPrompt(
     sessionId: SessionId,
-    text: string
-  ): Promise<SubmitPromptResponse> {
-    const body: SubmitPromptRequest = {
+    text: string,
+    mode?: SubmitMode
+  ): Promise<SubmitPromptResponse | SubmitOutcome> {
+    const body = {
       prompt: { content: [{ type: "text", text }] },
+      ...(mode ? { mode } : {}),
     };
-    return this.request<SubmitPromptResponse>(
+    return this.request<SubmitPromptResponse | SubmitOutcome>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompts`,
       {
         method: "POST",
@@ -186,6 +225,75 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
         body: JSON.stringify(body),
       }
     );
+  }
+
+  async withdrawQueued(
+    sessionId: SessionId,
+    queuedId: QueuedPromptId
+  ): Promise<void> {
+    await this.request<void>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queuedId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async moveQueued(
+    sessionId: SessionId,
+    queuedId: QueuedPromptId,
+    position: number
+  ): Promise<void> {
+    await this.request<void>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queuedId)}/move`,
+      {
+        method: "POST",
+        body: JSON.stringify({ position }),
+      }
+    );
+  }
+
+  async resumeQueue(sessionId: SessionId): Promise<void> {
+    await this.request<void>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/resume`,
+      { method: "POST" }
+    );
+  }
+
+  async getWorktreeDiff(sessionId: SessionId): Promise<WorktreeDiff> {
+    return this.request<WorktreeDiff>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/diff`
+    );
+  }
+
+  async listWorktreeFiles(sessionId: SessionId): Promise<WorktreeEntry[]> {
+    const res = await this.request<ListWorktreeFilesResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/files`
+    );
+    return res.entries;
+  }
+
+  async readWorktreeFile(
+    sessionId: SessionId,
+    path: string
+  ): Promise<WorktreeFileContent> {
+    const params = new URLSearchParams({ path });
+    return this.request<WorktreeFileContent>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/file?${params.toString()}`
+    );
+  }
+
+  async listApprovalRules(sessionId: SessionId): Promise<ApprovalRuleView[]> {
+    const res = await this.request<ListApprovalRulesResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/approval-rules`
+    );
+    return res.rules;
+  }
+
+  async clearApprovalRules(sessionId: SessionId): Promise<number> {
+    const res = await this.request<ClearApprovalRulesResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/approval-rules`,
+      { method: "DELETE" }
+    );
+    return res.cleared;
   }
 
   subscribeSession(
