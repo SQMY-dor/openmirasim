@@ -32,3 +32,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
 tempfile = "3"
+sha2 = "0.10"
+getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+bytes = "1"

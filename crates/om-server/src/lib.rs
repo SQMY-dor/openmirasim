@@ -10,6 +10,7 @@ pub mod approval;
 pub mod db;
 pub mod harness;
 pub mod orchestrator;
+pub mod proxy;
 pub mod sandbox;
 pub mod stream;
 pub mod workspace;
