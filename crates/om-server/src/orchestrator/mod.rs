@@ -20,6 +20,7 @@ pub use hub::Subscription;
 use crate::approval::ApprovalPolicy;
 use crate::db::Db;
 pub use crate::harness::HarnessRegistry;
+use crate::proxy::{KeyProxy, ProxyEnvSandbox};
 use crate::sandbox::ScopedSandbox;
 use crate::workspace::WorkspaceManager;
 use actor::{ActorSpec, Command};
@@ -71,6 +72,7 @@ pub struct Orchestrator {
     bwrap: Option<Arc<dyn Sandbox>>,
     workspaces: Option<WorkspaceManager>,
     approval_policy: ApprovalPolicy,
+    key_proxy: Option<KeyProxy>,
 }
 
 impl Orchestrator {
@@ -84,7 +86,20 @@ impl Orchestrator {
             bwrap: None,
             workspaces: None,
             approval_policy: ApprovalPolicy::default(),
+            key_proxy: None,
         }
+    }
+
+    /// Routes model API calls of `Bwrap` sessions through the host key proxy: each
+    /// session's agent gets a session token and loopback base URLs instead of real keys,
+    /// and the token is revoked when the session's agent stops.
+    pub fn with_key_proxy(mut self, proxy: KeyProxy) -> Self {
+        self.key_proxy = Some(proxy);
+        self
+    }
+
+    pub fn key_proxy(&self) -> Option<&KeyProxy> {
+        self.key_proxy.as_ref()
     }
 
     /// Enables workspaces: sessions with a `workspace_id` run in their own Git worktree,
@@ -118,8 +133,24 @@ impl Orchestrator {
             })
     }
 
-    /// The session's sandbox, scoped to its worktree / git dir / HOME when it has one.
+    /// The session's sandbox: scoped to its worktree / git dir / HOME when it has one,
+    /// and given key-proxy credentials instead of real keys when the proxy is enabled.
     async fn session_sandbox(
+        &self,
+        id: &SessionId,
+        config: &SessionConfig,
+    ) -> CoreResult<Arc<dyn Sandbox>> {
+        let sandbox = self.scoped_sandbox(id, config).await?;
+        match &self.key_proxy {
+            Some(proxy) if config.sandbox == SandboxMode::Bwrap => {
+                let grant = proxy.grant(id)?;
+                Ok(Arc::new(ProxyEnvSandbox::new(sandbox, &grant)))
+            }
+            _ => Ok(sandbox),
+        }
+    }
+
+    async fn scoped_sandbox(
         &self,
         id: &SessionId,
         config: &SessionConfig,
@@ -206,7 +237,11 @@ impl Orchestrator {
         // Weak: once every Orchestrator clone is dropped, the command senders go away and
         // actors shut their agents down instead of being kept alive by this callback.
         let live = Arc::downgrade(&self.live);
+        let proxy = self.key_proxy.clone();
         let on_exit = move || {
+            if let Some(proxy) = &proxy {
+                proxy.revoke_session(&id);
+            }
             if let Some(live) = live.upgrade()
                 && let Ok(mut map) = live.lock()
             {
