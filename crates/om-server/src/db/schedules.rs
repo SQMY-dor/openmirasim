@@ -166,6 +166,37 @@ impl Db {
         .await
     }
 
+    /// Pauses or resumes a schedule, touching only those columns so a concurrent
+    /// edit of its definition is not overwritten (review P2-7).
+    pub async fn set_schedule_enabled(
+        &self,
+        id: &ScheduleId,
+        enabled: bool,
+        next_run_at: Option<i64>,
+        updated_at: i64,
+    ) -> CoreResult<Schedule> {
+        let id = id.clone();
+        self.write(move |conn| {
+            let n = conn
+                .execute(
+                    "UPDATE schedules SET enabled = ?2, next_run_at = ?3, updated_at = ?4
+                     WHERE id = ?1",
+                    params![id.as_str(), enabled, next_run_at, updated_at],
+                )
+                .map_err(storage)?;
+            if n == 0 {
+                return Err(CoreError::NotFound(format!("schedule {id}")));
+            }
+            conn.query_row(
+                &format!("{SCHEDULE_COLUMNS} WHERE id = ?1"),
+                [id.as_str()],
+                row_to_schedule,
+            )
+            .map_err(storage)
+        })
+        .await
+    }
+
     /// Deletes a schedule and its runs.
     pub async fn delete_schedule(&self, id: &ScheduleId) -> CoreResult<()> {
         let id = id.clone();
