@@ -1,2 +1,6 @@
 packages:
   - "apps/*"
+  - "tests/e2e"
+
+allowBuilds:
+  esbuild: true
