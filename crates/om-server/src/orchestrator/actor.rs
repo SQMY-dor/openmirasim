@@ -450,12 +450,13 @@ impl Actor {
         decision: ApprovalDecision,
     ) -> ApprovalRecord {
         let approval_id = outcome.approval.record.id.clone();
+        let for_agent = agent_decision(&outcome.approval.record.options, &decision);
         self.hub.publish(std::slice::from_ref(&outcome.event));
         self.pending.remove(&approval_id);
         self.deadlines.remove(&approval_id);
         if let Some(s) = &self.session
             && let Err(e) = s
-                .respond_approval(&outcome.approval.harness_request_id, decision)
+                .respond_approval(&outcome.approval.harness_request_id, for_agent)
                 .await
         {
             tracing::warn!(session = %self.id, error = %e, "harness rejected approval answer");
@@ -556,6 +557,9 @@ impl Actor {
                     .collect();
             }
             Err(e) => {
+                // Fail closed: without a fresh read, keep only remembered rejections so
+                // a revoked "allow always" can never keep answering.
+                self.remembered.retain(|_, r| !r.allow);
                 tracing::error!(session = %self.id, error = %e, "failed to load approval rules")
             }
         }
@@ -1011,5 +1015,62 @@ fn reject(cmd: Command, err: CoreError) {
         Command::ResolveApproval { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
         }
+    }
+}
+
+/// The answer sent to the agent for a member's decision. "Always" choices are kept by
+/// the server (so members can revoke them); the agent gets the matching one-off option
+/// when it offered one, so it never caches a rule of its own.
+fn agent_decision(
+    options: &[om_core::approval::ApprovalOption],
+    decision: &ApprovalDecision,
+) -> ApprovalDecision {
+    use om_core::approval::ApprovalOptionKind as K;
+    let ApprovalDecision::Selected { option_id } = decision else {
+        return decision.clone();
+    };
+    let Some(chosen) = options.iter().find(|o| &o.option_id == option_id) else {
+        return decision.clone();
+    };
+    let once = match chosen.kind {
+        K::AllowAlways => K::AllowOnce,
+        K::RejectAlways => K::RejectOnce,
+        _ => return decision.clone(),
+    };
+    options
+        .iter()
+        .find(|o| o.kind == once)
+        .map(|o| ApprovalDecision::Selected {
+            option_id: o.option_id.clone(),
+        })
+        .unwrap_or_else(|| decision.clone())
+}
+
+#[cfg(test)]
+mod agent_decision_tests {
+    use super::*;
+    use om_core::approval::{ApprovalOption, ApprovalOptionKind as K};
+
+    #[test]
+    fn always_answers_reach_the_agent_as_one_offs() {
+        let opts: Vec<_> = [("a1", K::AllowOnce), ("aa", K::AllowAlways), ("ra", K::RejectAlways)]
+            .into_iter()
+            .map(|(id, kind)| ApprovalOption {
+                option_id: id.into(),
+                name: id.into(),
+                kind,
+            })
+            .collect();
+        let sel = |id: &str| ApprovalDecision::Selected {
+            option_id: id.into(),
+        };
+        assert_eq!(agent_decision(&opts, &sel("aa")), sel("a1"));
+        assert_eq!(agent_decision(&opts, &sel("a1")), sel("a1"));
+        // No one-off reject offered: the member's choice goes through unchanged.
+        assert_eq!(agent_decision(&opts, &sel("ra")), sel("ra"));
+        assert_eq!(
+            agent_decision(&opts, &ApprovalDecision::Cancelled),
+            ApprovalDecision::Cancelled
+        );
     }
 }

@@ -193,6 +193,7 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                     )),
                 );
             }
+            Incoming::Settle(settlement) => settlement.complete(),
             Incoming::Closed => break,
         }
     }
