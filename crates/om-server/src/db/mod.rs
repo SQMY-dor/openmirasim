@@ -638,19 +638,33 @@ impl Db {
                         Some("server_restart".into()),
                     )?;
                 }
-                append_in_tx(
-                    &tx,
-                    &session_id,
-                    vec![
-                        EventPayload::Error {
-                            message: "server restarted; agent process was lost".into(),
-                        },
-                        EventPayload::StatusChanged {
-                            from,
-                            to: SessionStatus::Failed,
-                        },
-                    ],
-                )?;
+                // Close what the lost actor left open in the stream (review P1-9): the
+                // running turn, the in-memory queue and a paused flag.
+                let open = open_stream_state(&tx, &session_id)?;
+                let mut payloads = vec![EventPayload::Error {
+                    message: "server restarted; agent process was lost".into(),
+                }];
+                if let Some(turn_id) = open.turn {
+                    payloads.push(EventPayload::TurnEnded {
+                        turn_id,
+                        stop_reason: om_core::session::StopReason::Failed,
+                        error: Some("server restarted".into()),
+                    });
+                }
+                payloads.extend(open.queued.into_iter().map(|queued_id| {
+                    EventPayload::QueueItemRemoved {
+                        queued_id,
+                        reason: om_core::queue::QueueRemoval::Dropped,
+                    }
+                }));
+                if open.paused {
+                    payloads.push(EventPayload::QueuePaused { paused: false });
+                }
+                payloads.push(EventPayload::StatusChanged {
+                    from,
+                    to: SessionStatus::Failed,
+                });
+                append_in_tx(&tx, &session_id, payloads)?;
                 recovered.push(session_id);
             }
             tx.commit().map_err(storage)?;
@@ -661,6 +675,50 @@ impl Db {
 }
 
 // -------------------------------------------------------------------- helpers
+
+/// What a session's event stream leaves open: a turn without `TurnEnded`, queued
+/// prompts never removed, and whether the queue is paused.
+#[derive(Default)]
+struct OpenStreamState {
+    turn: Option<om_core::ids::TurnId>,
+    queued: Vec<om_core::ids::QueuedPromptId>,
+    paused: bool,
+}
+
+fn open_stream_state(tx: &Transaction<'_>, id: &SessionId) -> CoreResult<OpenStreamState> {
+    let mut st = OpenStreamState::default();
+    let mut stmt = tx
+        .prepare(
+            "SELECT payload FROM events WHERE session_id = ?1
+               AND type IN ('prompt_submitted', 'turn_ended', 'prompt_queued',
+                            'queue_item_removed', 'queue_paused')
+             ORDER BY seq",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([id.as_str()], |r| r.get::<_, String>(0))
+        .map_err(storage)?;
+    for row in rows {
+        let Ok(payload) = serde_json::from_str::<EventPayload>(&row.map_err(storage)?) else {
+            continue;
+        };
+        match payload {
+            EventPayload::PromptSubmitted { turn_id, .. } => st.turn = Some(turn_id),
+            EventPayload::TurnEnded { turn_id, .. } => {
+                if st.turn.as_ref() == Some(&turn_id) {
+                    st.turn = None;
+                }
+            }
+            EventPayload::PromptQueued { queued, .. } => st.queued.push(queued.id),
+            EventPayload::QueueItemRemoved { queued_id, .. } => {
+                st.queued.retain(|q| q != &queued_id)
+            }
+            EventPayload::QueuePaused { paused } => st.paused = paused,
+            _ => {}
+        }
+    }
+    Ok(st)
+}
 
 const SESSION_COLUMNS: &str = "SELECT id, space_id, config, status, head_seq, native_session_id,
                                       created_at, updated_at FROM sessions";

@@ -167,7 +167,10 @@ impl Actor {
                 "prompts are queued; send with a submit mode instead".into(),
             ));
         }
-        self.start_turn(member, prompt, None).await
+        let turn = self.start_turn(member, prompt, None).await?;
+        // An empty queue has nothing left to hold back.
+        self.set_paused(false).await;
+        Ok(turn)
     }
 
     /// Starts a turn. `from_queue` records which queued prompt it came from.
@@ -249,26 +252,33 @@ impl Actor {
 
     /// Starts queued prompts while the session is idle and the queue is not paused. A
     /// prompt the harness refuses is dropped with `Failed` and the next one is tried.
-    async fn drain(&mut self) {
+    /// Returns what happened to each prompt it took off the queue.
+    async fn drain(&mut self) -> Vec<(QueuedPromptId, Result<TurnId, String>)> {
+        let mut out = Vec::new();
         while !self.paused
             && self.turn.is_none()
             && self.status == SessionStatus::Idle
             && let Some(next) = self.queue.pop_front()
         {
             let id = next.id.clone();
-            if let Err(e) = self
+            match self
                 .start_turn(next.member_id, next.prompt, Some(id.clone()))
                 .await
             {
-                self.record(vec![EventPayload::QueueItemRemoved {
-                    queued_id: id,
-                    reason: QueueRemoval::Failed {
-                        error: e.to_string(),
-                    },
-                }])
-                .await;
+                Ok(turn) => out.push((id, Ok(turn))),
+                Err(e) => {
+                    self.record(vec![EventPayload::QueueItemRemoved {
+                        queued_id: id.clone(),
+                        reason: QueueRemoval::Failed {
+                            error: e.to_string(),
+                        },
+                    }])
+                    .await;
+                    out.push((id, Err(e.to_string())));
+                }
             }
         }
+        out
     }
 
     /// Drops every queued prompt (session closing or agent gone).
@@ -294,18 +304,27 @@ impl Actor {
         match self.status {
             SessionStatus::Idle if self.turn.is_none() => {
                 // Sending again resumes a paused queue. A plain `Queue` send still waits
-                // behind what is already queued; `Next` / `Steer` go first.
-                self.set_paused(false).await;
+                // behind what is already queued; `Next` / `Steer` go first. Nothing is
+                // unpaused until the prompt is accepted (review P1-9).
                 if mode == SubmitMode::Queue && !self.queue.is_empty() {
                     let (queued_id, _) = self.enqueue(member, prompt, mode, false).await?;
-                    self.drain().await;
-                    let position = self.position_of(&queued_id).unwrap_or(0) as u32;
-                    return Ok(SubmitOutcome::Queued {
-                        queued_id,
-                        position,
-                    });
+                    self.set_paused(false).await;
+                    let drained = self.drain().await;
+                    if let Some(position) = self.position_of(&queued_id) {
+                        return Ok(SubmitOutcome::Queued {
+                            queued_id,
+                            position: position as u32,
+                        });
+                    }
+                    // The queue ahead failed to start and ours was taken off too.
+                    return match drained.into_iter().find(|(id, _)| id == &queued_id) {
+                        Some((_, Ok(turn_id))) => Ok(SubmitOutcome::Started { turn_id }),
+                        Some((_, Err(e))) => Err(CoreError::Harness(e)),
+                        None => Err(CoreError::Harness("queued prompt was dropped".into())),
+                    };
                 }
                 let turn_id = self.start_turn(member, prompt, None).await?;
+                self.set_paused(false).await;
                 Ok(SubmitOutcome::Started { turn_id })
             }
             SessionStatus::Running | SessionStatus::WaitingApproval if self.turn.is_some() => {
@@ -381,6 +400,9 @@ impl Actor {
         }])
         .await?;
         self.queue.remove(i);
+        if self.queue.is_empty() {
+            self.set_paused(false).await;
+        }
         Ok(())
     }
 

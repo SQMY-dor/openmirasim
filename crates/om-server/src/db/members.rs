@@ -554,11 +554,12 @@ impl Db {
                 .map_err(storage)?;
             let mut token = get_token_in(&tx, &id)?;
             let owner = get_member_in(&tx, &token.member_id)?;
-            authorize_in(&tx, auth, &owner.space_id.clone(), Some(&owner))
-                .map_err(|e| match e {
+            authorize_in(&tx, auth, &owner.space_id.clone(), Some(&owner)).map_err(
+                |e| match e {
                     CoreError::NotFound(_) => CoreError::NotFound(format!("token {id}")),
                     other => other,
-                })?;
+                },
+            )?;
             if token.revoked_at.is_some() {
                 return Ok(token);
             }

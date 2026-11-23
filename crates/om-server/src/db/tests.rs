@@ -455,3 +455,69 @@ async fn approval_rules_upsert_and_clear() {
     assert_eq!(db.clear_approval_rules(&s.id, None).await.unwrap(), 1);
     assert!(db.approval_rules(&s.id).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn recovery_closes_the_open_turn_queue_and_pause() {
+    use om_core::content::Prompt;
+    use om_core::ids::QueuedPromptId;
+    use om_core::queue::{QueueRemoval, QueuedPrompt, SubmitMode};
+    let (_dir, db, space) = setup().await;
+    let (s, _) = db.create_session(space, config(), None).await.unwrap();
+    let turn = TurnId::new();
+    let q = |id: &QueuedPromptId| QueuedPrompt {
+        id: id.clone(),
+        member_id: None,
+        prompt: Prompt::text("later"),
+        mode: SubmitMode::Queue,
+        created_at: 0,
+    };
+    let (q1, q2) = (QueuedPromptId::new(), QueuedPromptId::new());
+    db.append_events(
+        &s.id,
+        vec![
+            status(SessionStatus::Starting, SessionStatus::Idle),
+            EventPayload::PromptSubmitted {
+                turn_id: turn.clone(),
+                member_id: None,
+                prompt: Prompt::text("now"),
+            },
+            status(SessionStatus::Idle, SessionStatus::Running),
+            EventPayload::PromptQueued {
+                queued: q(&q1),
+                position: 0,
+            },
+            EventPayload::PromptQueued {
+                queued: q(&q2),
+                position: 1,
+            },
+            EventPayload::QueueItemRemoved {
+                queued_id: q1.clone(),
+                reason: QueueRemoval::Withdrawn { by: None },
+            },
+            EventPayload::QueuePaused { paused: true },
+        ],
+    )
+    .await
+    .unwrap();
+    db.recover_after_restart().await.unwrap();
+    let page = db.list_events(&s.id, 7, 100).await.unwrap();
+    let tail: Vec<_> = page.events.into_iter().map(|e| e.payload).collect();
+    assert!(tail.iter().any(|p| matches!(p,
+        EventPayload::TurnEnded { turn_id, stop_reason: om_core::session::StopReason::Failed, .. }
+            if *turn_id == turn)));
+    let dropped: Vec<_> = tail
+        .iter()
+        .filter_map(|p| match p {
+            EventPayload::QueueItemRemoved {
+                queued_id,
+                reason: QueueRemoval::Dropped,
+            } => Some(queued_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped, vec![q2]);
+    assert!(
+        tail.iter()
+            .any(|p| matches!(p, EventPayload::QueuePaused { paused: false }))
+    );
+}
