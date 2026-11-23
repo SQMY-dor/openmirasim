@@ -407,6 +407,37 @@ impl Orchestrator {
         .await
     }
 
+    /// Appends a goal / dispatch announcement to a session's stream. A live session
+    /// appends it through its actor, so it is ordered with the session's own events
+    /// and reaches subscribers; an ended session gets it written directly. Only
+    /// payloads with [`EventPayload::is_announcement`] are accepted.
+    pub async fn announce(&self, id: &SessionId, payload: EventPayload) -> CoreResult<()> {
+        if !payload.is_announcement() {
+            return Err(CoreError::InvalidInput(format!(
+                "`{}` events are emitted by the session itself",
+                payload.kind()
+            )));
+        }
+        if let Some(tx) = self.live_sender(id) {
+            let (reply, rx) = oneshot::channel();
+            if tx
+                .send(Command::Announce {
+                    payload: payload.clone(),
+                    reply,
+                })
+                .await
+                .is_ok()
+            {
+                if let Ok(res) = rx.await {
+                    return res;
+                }
+            }
+            // The actor exited between the lookup and the send: fall through.
+        }
+        self.db.get_session(id).await?;
+        self.db.append_events(id, vec![payload]).await.map(|_| ())
+    }
+
     /// The session's queue, front first.
     pub async fn queue(&self, id: &SessionId) -> CoreResult<Vec<QueuedPrompt>> {
         self.send(id, |reply| Command::ListQueue { reply }).await

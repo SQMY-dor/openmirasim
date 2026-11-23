@@ -115,6 +115,22 @@ impl Db {
         .await
     }
 
+    /// Every goal still `active`, across all sessions.
+    pub async fn list_active_goals(&self) -> CoreResult<Vec<Goal>> {
+        self.read(move |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "{GOAL_COLUMNS} WHERE status = 'active' ORDER BY created_at, id"
+                ))
+                .map_err(storage)?;
+            stmt.query_map([], row_to_goal)
+                .map_err(storage)?
+                .collect::<Result<_, _>>()
+                .map_err(storage)
+        })
+        .await
+    }
+
     /// Records one more finished turn on an active goal. Returns `false` when the goal is
     /// no longer active.
     pub async fn bump_goal_turns(&self, id: &GoalId, turns_used: u32) -> CoreResult<bool> {
