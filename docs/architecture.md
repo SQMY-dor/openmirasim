@@ -118,30 +118,30 @@ erDiagram
 
 ### 5.1 统一 `Harness` Trait（位于 `om-core`）
 
+> 契约以 [`crates/om-core/src/harness.rs`](../crates/om-core/src/harness.rs) 为准，此处为摘要。
+
+`Harness` 是按 id 注册的工厂；`start` 返回一个会话控制句柄 `HarnessSession` 与一条 `HarnessEvent` 事件流。恢复（resume）通过 `StartContext.resume_native_session_id` 表达，沙箱通过 `StartContext.sandbox` 注入。Harness 不感知存储、成员与广播：`turn_id`、`seq` 与审批记录均由 Orchestrator 分配并转换为持久化的 `EventPayload`。
+
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HarnessCapabilities {
-    pub native_approval: bool,
-    pub steer: bool,
-    pub resume: bool,
-    pub structured_tools: bool,
-    pub pty_attach: bool,
-    pub remote_screen: bool,
+#[async_trait]
+pub trait Harness: Send + Sync {
+    fn id(&self) -> &str;
+    fn capabilities(&self) -> HarnessCapabilities;
+    async fn start(&self, ctx: StartContext) -> CoreResult<StartedSession>; // { session, events }
 }
 
 #[async_trait]
-pub trait Harness: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn capabilities(&self) -> HarnessCapabilities;
-    async fn start(&self, cfg: SessionConfig) -> Result<SessionHandle>;
-    async fn send(&self, h: &SessionHandle, prompt: Prompt) -> Result<()>;
-    async fn steer(&self, h: &SessionHandle, msg: Prompt) -> Result<()>;
-    async fn respond_approval(&self, h: &SessionHandle, req_id: &str, decision: ApprovalDecision) -> Result<()>;
-    async fn cancel(&self, h: &SessionHandle) -> Result<()>;
-    async fn resume(&self, cfg: SessionConfig, native_session_id: &str) -> Result<SessionHandle>;
-    fn events(&self, h: &SessionHandle) -> BoxStream<'static, HarnessEvent>;
+pub trait HarnessSession: Send + Sync {
+    fn native_session_id(&self) -> Option<String>;
+    async fn prompt(&self, prompt: Prompt) -> CoreResult<()>;          // 受理即返回，结果以 TurnEnded 事件上报
+    async fn steer(&self, prompt: Prompt) -> CoreResult<()>;           // 默认 Unsupported，由编排层降级
+    async fn respond_approval(&self, request_id: &str, decision: ApprovalDecision) -> CoreResult<()>;
+    async fn cancel(&self) -> CoreResult<()>;
+    async fn shutdown(&self) -> CoreResult<()>;
 }
 ```
+
+会话状态（`SessionStatus`）：`Starting -> Idle -> Running <-> WaitingApproval -> Idle`，以及 `Failed`（可 resume）与终态 `Closed`。原文中的 `Settled / Cancelled` 属于**单轮**结果，由 `StopReason`（`end_turn` / `cancelled` / ...）表达，单轮结束后会话回到 `Idle`。
 
 ### 5.2 分层接入优先级
 

@@ -37,6 +37,15 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Check ts-rs bindings are up to date
+        run: |
+          if [ -n "$(git status --porcelain -- apps/web/src/generated)" ]; then
+            echo "::error::apps/web/src/generated is out of date. Run 'cargo test -p om-core' and commit the result."
+            git status --porcelain -- apps/web/src/generated
+            git diff -- apps/web/src/generated
+            exit 1
+          fi
+
   web:
     name: Web (typecheck)
     runs-on: ubuntu-latest
