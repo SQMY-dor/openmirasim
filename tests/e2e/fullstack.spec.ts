@@ -337,4 +337,166 @@ test.describe("OpenMirasim Full-Stack Phase 0 E2E (real om-server + SQLite + Web
       fs.rmSync(rootTmp, { recursive: true, force: true });
     }
   });
+
+  test("Phase 2: PWA manifest/SW, RBAC Team Console + Viewer device-token login + Audit Log + Antigravity GUI bridge noVNC takeover", async ({
+    page,
+  }) => {
+    const GUI_BRIDGE_BIN =
+      process.env.OM_GUI_BRIDGE_BIN ??
+      path.join(REPO_ROOT, "target/debug/om-gui-bridge");
+    expect(fs.existsSync(SERVER_BIN)).toBe(true);
+    expect(fs.existsSync(GUI_BRIDGE_BIN)).toBe(true);
+    expect(fs.existsSync(path.join(STATIC_DIR, "index.html"))).toBe(true);
+
+    const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), "om-phase2-e2e-"));
+    const dataDir = path.join(rootTmp, "data");
+    const guiProfiles = path.join(rootTmp, "gui-profiles");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(guiProfiles, { recursive: true });
+
+    const bridgePort = await findFreePort();
+    const bridgeUrl = `http://127.0.0.1:${bridgePort}`;
+    const bridge = spawn(
+      GUI_BRIDGE_BIN,
+      [
+        "--bind",
+        `127.0.0.1:${bridgePort}`,
+        "--profile-root",
+        guiProfiles,
+        "--driver",
+        "simulated",
+        "--max-sessions",
+        "2",
+      ],
+      {
+        cwd: REPO_ROOT,
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    const port = await findFreePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const server = spawn(SERVER_BIN, [], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        OM_BIND: `127.0.0.1:${port}`,
+        OM_DATA_DIR: dataDir,
+        OM_TOKEN: TOKEN,
+        OM_ALLOW_DIRECT_SANDBOX: "1",
+        OM_STATIC_DIR: STATIC_DIR,
+        OM_GUI_BRIDGE_URL: bridgeUrl,
+        RUST_LOG: "info",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const consoleErrors: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      consoleErrors.push(err.message);
+    });
+
+    try {
+      await waitForHealthz(bridgeUrl);
+      await waitForHealthz(baseUrl);
+
+      // 1. Verify PWA manifest and Service Worker are served cleanly
+      const manifestRes = await fetch(`${baseUrl}/manifest.webmanifest`);
+      expect(manifestRes.ok).toBe(true);
+      const manifest = (await manifestRes.json()) as { short_name: string };
+      expect(manifest.short_name).toBe("OpenMirasim");
+
+      const swRes = await fetch(`${baseUrl}/sw.js`);
+      expect(swRes.ok).toBe(true);
+      expect(await swRes.text()).toContain("notificationclick");
+
+      // 2. Owner logs in and sees OWNER role badge + Team Console button
+      await page.goto(baseUrl);
+      await page.locator("#server-url-input").fill(baseUrl);
+      await page.locator("#access-token-input").fill(TOKEN);
+      await page.locator("#connect-submit-btn").click();
+      await expect(page.locator("#principal-role-badge")).toHaveText("OWNER", {
+        timeout: 10_000,
+      });
+
+      // 3. Create an `antigravity-gui` session and verify message forwarding + noVNC takeover link
+      await page.locator("#new-session-btn").click();
+      await page.locator("#new-session-title").fill("Antigravity GUI 远程桥接");
+      await page
+        .locator("#new-session-harness")
+        .selectOption("antigravity-gui");
+      await page.locator("#new-session-cwd").fill(dataDir);
+      await page.locator("#confirm-create-session-btn").click();
+
+      await expect(page.locator("#open-remote-screen-btn")).toBeVisible({
+        timeout: 10_000,
+      });
+      const takeoverHref = await page
+        .locator("#open-remote-screen-btn")
+        .getAttribute("href");
+      expect(takeoverHref).toContain("/takeover/");
+      const takeoverHtml = await (await fetch(takeoverHref!)).text();
+      expect(takeoverHtml).toContain("Antigravity GUI 远程人工接管");
+
+      await page.locator("#prompt-textarea").fill("请打开项目配置页");
+      await page.locator("#send-prompt-btn").click();
+      const guiReply = page.locator('[data-turn-kind="assistant"]').first();
+      await expect(guiReply).toHaveAttribute("data-completed", "true", {
+        timeout: 10_000,
+      });
+      await expect(guiReply).toContainText("请打开项目配置页");
+
+      // 4. Open Team Console -> add a Viewer member -> issue `omt_...` device token -> check Audit Log
+      await page.locator("#open-team-console-btn").click();
+      await expect(page.locator("#team-console-modal")).toBeVisible();
+      await page.locator("#add-member-name").fill("Alice Viewer");
+      await page.locator("#add-member-role").selectOption("viewer");
+      await page.locator("#confirm-add-member-btn").click();
+      await expect(page.locator("#team-members-list")).toContainText(
+        "Alice Viewer",
+        { timeout: 10_000 }
+      );
+
+      await page.locator("#tab-team-tokens").click();
+      await page.locator("#issue-token-label").fill("Alice Mobile PWA");
+      await page.locator("#confirm-issue-token-btn").click();
+      const secretEl = page.locator("#issued-token-secret");
+      await expect(secretEl).toBeVisible({ timeout: 10_000 });
+      const viewerSecret = (await secretEl.innerText()).trim();
+      expect(viewerSecret.startsWith("omt_")).toBe(true);
+
+      await page.locator("#tab-team-security").click();
+      await expect(page.locator("#audit-log-list")).toContainText(
+        "member.created",
+        { timeout: 10_000 }
+      );
+      await expect(page.locator("#audit-log-list")).toContainText(
+        "token.issued",
+        { timeout: 10_000 }
+      );
+
+      // 5. Disconnect and log in as Alice Viewer with her `omt_...` device token -> read-only enforced
+      await page.locator('#team-console-modal button[aria-label="关闭团队控制台"]').click();
+      await page.locator("#disconnect-btn").click();
+      await page.locator("#server-url-input").fill(baseUrl);
+      await page.locator("#access-token-input").fill(viewerSecret);
+      await page.locator("#connect-submit-btn").click();
+
+      await expect(page.locator("#principal-role-badge")).toHaveText("VIEWER", {
+        timeout: 10_000,
+      });
+      await expect(page.locator("#viewer-readonly-hint")).toBeVisible();
+      await expect(page.locator("#viewer-composer-banner")).toBeVisible();
+      await expect(page.locator("#new-session-btn")).toHaveCount(0);
+
+      expect(consoleErrors).toEqual([]);
+    } finally {
+      await stopServer(server);
+      await stopServer(bridge);
+      fs.rmSync(rootTmp, { recursive: true, force: true });
+    }
+  });
 });

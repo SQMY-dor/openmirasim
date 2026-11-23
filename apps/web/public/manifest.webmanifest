@@ -1,0 +1,19 @@
+{
+  "name": "OpenMirasim Workbench",
+  "short_name": "OpenMirasim",
+  "description": "Linux 裸金属中心服务器驱动的团队协作式 AI Agent 工作台（支持审批推送与 noVNC 远程接管）",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0e1116",
+  "theme_color": "#0e1116",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

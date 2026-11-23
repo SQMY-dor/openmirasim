@@ -3,22 +3,30 @@ import {
   Moon,
   Plus,
   Search,
+  Shield,
   Sun,
   TerminalSquare,
 } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { ServerInfo, SessionSummary } from "../protocol/types";
+import {
+  roleCan,
+  type Principal,
+  type ServerInfo,
+  type SessionSummary,
+} from "../protocol/types";
 
 interface SidebarProps {
   serverInfo: ServerInfo;
   serverUrl: string;
   mode: "http" | "mock";
+  principal: Principal | null;
   sessions: SessionSummary[];
   selectedSessionId: string | null;
   theme: "dark" | "light";
   mobileOpen: boolean;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
+  onOpenTeamConsole: () => void;
   onToggleTheme: () => void;
   onDisconnect: () => void;
   onCloseMobile: () => void;
@@ -52,17 +60,20 @@ export function Sidebar({
   serverInfo,
   serverUrl,
   mode,
+  principal,
   sessions,
   selectedSessionId,
   theme,
   mobileOpen,
   onSelectSession,
   onNewSession,
+  onOpenTeamConsole,
   onToggleTheme,
   onDisconnect,
   onCloseMobile,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
+  const canCreate = !principal || roleCan(principal.role, "create_session");
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -115,16 +126,48 @@ export function Sidebar({
           </div>
         </div>
 
+        {principal && (
+          <div className="sidebar-identity" id="sidebar-principal">
+            <div className="sidebar-identity-info">
+              <span className="sidebar-identity-name" title={principal.display_name}>
+                {principal.display_name}
+              </span>
+              <span
+                className={`chip ${principal.role === "owner" ? "ok" : principal.role === "viewer" ? "warn" : ""}`}
+                id="principal-role-badge"
+              >
+                {principal.role.toUpperCase()}
+              </span>
+            </div>
+            <button
+              type="button"
+              id="open-team-console-btn"
+              className="btn btn-sm"
+              onClick={onOpenTeamConsole}
+              title="成员管理、设备 Token、KeyProxy 与审计日志"
+            >
+              <Shield size={12} />
+              <span>团队与安全</span>
+            </button>
+          </div>
+        )}
+
         <div className="sidebar-controls">
-          <button
-            type="button"
-            id="new-session-btn"
-            className="btn btn-primary"
-            onClick={onNewSession}
-          >
-            <Plus size={15} />
-            <span>新建会话</span>
-          </button>
+          {canCreate ? (
+            <button
+              type="button"
+              id="new-session-btn"
+              className="btn btn-primary"
+              onClick={onNewSession}
+            >
+              <Plus size={15} />
+              <span>新建会话</span>
+            </button>
+          ) : (
+            <div className="viewer-readonly-hint" id="viewer-readonly-hint">
+              只读观察者模式（Viewer）
+            </div>
+          )}
 
           <div className="search-wrap">
             <Search size={13} />

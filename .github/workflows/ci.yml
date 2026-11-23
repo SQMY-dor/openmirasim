@@ -103,8 +103,8 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: Build om-server
-        run: cargo build --bin om-server
+      - name: Build om-server and om-gui-bridge
+        run: cargo build --bin om-server --bin om-gui-bridge
 
       - name: Install & build Web frontend
         run: |

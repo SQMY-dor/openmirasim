@@ -1,8 +1,11 @@
 import {
   Activity,
   AlertCircle,
+  Bell,
+  BellRing,
   GitCompare,
   Menu,
+  Monitor,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -13,6 +16,7 @@ import { EventInspector } from "./components/EventInspector";
 import { NewSessionModal } from "./components/NewSessionModal";
 import { SessionStream } from "./components/SessionStream";
 import { sessionDisplayTitle, Sidebar } from "./components/Sidebar";
+import { TeamConsole } from "./components/TeamConsole";
 import { WorktreeDrawer } from "./components/WorktreeDrawer";
 import type { OpenMirasimClient } from "./protocol/client";
 import { HttpOpenMirasimClient } from "./protocol/httpClient";
@@ -22,19 +26,30 @@ import {
   createEmptyProjection,
   type SessionProjection,
 } from "./protocol/reducer";
-import type {
-  ApprovalDecision,
-  ApprovalId,
-  ConnectionState,
-  CreateSessionRequest,
-  HarnessDescriptor,
-  QueuedPromptId,
-  ServerInfo,
-  SessionEvent,
-  SessionSummary,
-  SubmitMode,
-  WorkspaceSummary,
+import {
+  roleCan,
+  type ApprovalDecision,
+  type ApprovalId,
+  type ConnectionState,
+  type CreateSessionRequest,
+  type HarnessDescriptor,
+  type Principal,
+  type QueuedPromptId,
+  type RemoteScreenInfo,
+  type ServerInfo,
+  type SessionEvent,
+  type SessionSummary,
+  type SubmitMode,
+  type WorkspaceSummary,
 } from "./protocol/types";
+import {
+  enableApprovalPush,
+  notifyPendingApproval,
+  readPushPreference,
+  registerServiceWorker,
+  savePushPreference,
+  subscribeServiceWorkerActions,
+} from "./pwa/push";
 
 const AUTH_STORAGE_KEY = "openmirasim.auth.v1";
 const THEME_STORAGE_KEY = "openmirasim.theme.v1";
@@ -92,6 +107,7 @@ export function App() {
   const [theme, setTheme] = useState<"dark" | "light">(readSavedTheme);
   const [client, setClient] = useState<OpenMirasimClient | null>(null);
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
+  const [principal, setPrincipal] = useState<Principal | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
 
@@ -101,6 +117,9 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
     () => {
       try {
+        const params = new URLSearchParams(window.location.search);
+        const fromUrl = params.get("session");
+        if (fromUrl) return fromUrl;
         return window.localStorage.getItem(ACTIVE_SESSION_KEY);
       } catch {
         return null;
@@ -117,15 +136,27 @@ export function App() {
 
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [worktreeOpen, setWorktreeOpen] = useState(false);
+  const [teamConsoleOpen, setTeamConsoleOpen] = useState(false);
   const [newModalOpen, setNewModalOpen] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [simulatingDrop, setSimulatingDrop] = useState(false);
+  const [remoteScreen, setRemoteScreen] = useState<RemoteScreenInfo | null>(null);
+  const [pushEnabled, setPushEnabled] = useState<boolean>(readPushPreference);
 
   const lastSeqRef = useRef(0);
+  const liveConnectedRef = useRef(false);
   useEffect(() => {
     lastSeqRef.current = projection?.lastSeq ?? 0;
   }, [projection]);
+
+  useEffect(() => {
+    liveConnectedRef.current = connectionState === "connected";
+  }, [connectionState]);
+
+  useEffect(() => {
+    void registerServiceWorker();
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -146,7 +177,8 @@ export function App() {
       setConnectError(null);
       try {
         const info = await nextClient.connect();
-        const [sessionList, harnessList, workspaceList] = await Promise.all([
+        const [me, sessionList, harnessList, workspaceList] = await Promise.all([
+          nextClient.getMe().catch(() => null),
           nextClient.listSessions(),
           nextClient.listHarnesses().catch(() => []),
           nextClient.listWorkspaces().catch(() => []),
@@ -161,6 +193,7 @@ export function App() {
         }
         setClient(nextClient);
         setServerInfo(info);
+        setPrincipal(me);
         setHarnesses(harnessList);
         setWorkspaces(workspaceList);
         setSessions(sessionList);
@@ -218,10 +251,13 @@ export function App() {
     }
     setClient(null);
     setServerInfo(null);
+    setPrincipal(null);
     setSessions([]);
     setWorkspaces([]);
     setWorktreeOpen(false);
     setInspectorOpen(false);
+    setTeamConsoleOpen(false);
+    setRemoteScreen(null);
     setProjection(null);
     setConnectionState("disconnected");
     setStreamError(null);
@@ -244,6 +280,77 @@ export function App() {
       // ignore
     }
   }, [selectedSessionId]);
+
+  // Handle PWA notification click actions via Service Worker postMessage or URL deep-link
+  useEffect(() => {
+    if (!client) return;
+    const unsubscribe = subscribeServiceWorkerActions({
+      onFocusSession: (sid) => {
+        if (sid) setSelectedSessionId(sid);
+      },
+      onApprovalAction: ({ approvalId, sessionId, optionId }) => {
+        if (sessionId) setSelectedSessionId(sessionId);
+        void client
+          .resolveApproval(approvalId, {
+            outcome: "selected",
+            option_id: optionId,
+          })
+          .catch((err) => {
+            setStreamError(
+              err instanceof Error ? err.message : "通过推送通知处理审批失败"
+            );
+          });
+      },
+    });
+
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const approveId = params.get("approve");
+      const optionId = params.get("option");
+      if (approveId && optionId) {
+        void client
+          .resolveApproval(approveId, {
+            outcome: "selected",
+            option_id: optionId,
+          })
+          .catch(() => {});
+        params.delete("approve");
+        params.delete("option");
+        const nextQs = params.toString();
+        window.history.replaceState(
+          null,
+          "",
+          nextQs ? `/?${nextQs}` : window.location.pathname
+        );
+      }
+    } catch {
+      // ignore
+    }
+
+    return unsubscribe;
+  }, [client]);
+
+  // Fetch remote-screen takeover metadata when an `antigravity-gui` session is active
+  const refreshRemoteScreen = useCallback(
+    async (sid: string) => {
+      if (!client) return;
+      try {
+        const res = await client.getRemoteScreen(sid);
+        setRemoteScreen(res.available && res.screen ? res.screen : null);
+      } catch {
+        setRemoteScreen(null);
+      }
+    },
+    [client]
+  );
+
+  useEffect(() => {
+    if (!client || !selectedSessionId) {
+      setRemoteScreen(null);
+      return;
+    }
+    void refreshRemoteScreen(selectedSessionId);
+  }, [client, selectedSessionId, refreshRemoteScreen]);
 
   // Subscribe to selected session with `Hello -> Welcome -> Subscribe { last_seq }`
   useEffect(() => {
@@ -274,6 +381,20 @@ export function App() {
       });
 
       setHeadSeq((prev) => Math.max(prev, record.seq));
+
+      if (
+        record.payload.type === "harness_ready" &&
+        record.payload.capabilities.remote_screen
+      ) {
+        void refreshRemoteScreen(record.session_id);
+      }
+
+      if (
+        record.payload.type === "approval_requested" &&
+        liveConnectedRef.current
+      ) {
+        void notifyPendingApproval(record.session_id, record.payload.approval);
+      }
 
       setSessions((prev) =>
         prev.map((s) => {
@@ -424,6 +545,7 @@ export function App() {
     setStreamError(null);
     try {
       await client.closeSession(selectedSessionId);
+      setRemoteScreen(null);
     } catch (err) {
       setStreamError(err instanceof Error ? err.message : "关闭会话失败");
     }
@@ -440,6 +562,20 @@ export function App() {
     },
     [client]
   );
+
+  const handleTogglePush = useCallback(async () => {
+    if (!client) return;
+    if (pushEnabled) {
+      savePushPreference(false);
+      setPushEnabled(false);
+      return;
+    }
+    const res = await enableApprovalPush(client);
+    setPushEnabled(res.ok);
+    if (!res.ok) {
+      setStreamError(res.detail);
+    }
+  }, [client, pushEnabled]);
 
   const handleSimulateDrop = useCallback(async () => {
     if (!client?.simulateNetworkDrop || !selectedSessionId || simulatingDrop) {
@@ -479,6 +615,9 @@ export function App() {
   const activeSeq = projection?.lastSeq ?? selectedSession?.head_seq ?? 0;
   const activeStatus = projection?.status ?? selectedSession?.status ?? "idle";
   const badge = connectionBadge(connectionState, activeSeq);
+  const canManageSession =
+    !principal || roleCan(principal.role, "create_session");
+  const canPrompt = !principal || roleCan(principal.role, "prompt_session");
 
   return (
     <div className="workbench">
@@ -486,12 +625,14 @@ export function App() {
         serverInfo={serverInfo}
         serverUrl={client.serverUrl}
         mode={client.mode}
+        principal={principal}
         sessions={sessions}
         selectedSessionId={selectedSessionId}
         theme={theme}
         mobileOpen={mobileSidebarOpen}
         onSelectSession={setSelectedSessionId}
         onNewSession={() => setNewModalOpen(true)}
+        onOpenTeamConsole={() => setTeamConsoleOpen(true)}
         onToggleTheme={toggleTheme}
         onDisconnect={handleDisconnect}
         onCloseMobile={() => setMobileSidebarOpen(false)}
@@ -537,6 +678,20 @@ export function App() {
               </span>
             )}
 
+            {remoteScreen && remoteScreen.available && (
+              <a
+                id="open-remote-screen-btn"
+                className="btn btn-primary btn-sm"
+                href={remoteScreen.takeover_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                title={`隔离显示 ${remoteScreen.display} (${remoteScreen.driver})`}
+              >
+                <Monitor size={13} />
+                <span>接管 GUI (noVNC)</span>
+              </a>
+            )}
+
             {selectedSession && (
               <span className={`chip ${badge.cls}`} id="sync-status-chip">
                 {connectionState === "connected" ? (
@@ -548,7 +703,7 @@ export function App() {
               </span>
             )}
 
-            {selectedSession && activeStatus === "failed" && (
+            {selectedSession && activeStatus === "failed" && canManageSession && (
               <button
                 type="button"
                 id="resume-session-btn"
@@ -559,7 +714,7 @@ export function App() {
               </button>
             )}
 
-            {selectedSession && activeStatus !== "closed" && (
+            {selectedSession && activeStatus !== "closed" && canManageSession && (
               <button
                 type="button"
                 id="close-session-btn"
@@ -583,6 +738,21 @@ export function App() {
                 {simulatingDrop ? "断网续传中…" : "模拟断网"}
               </button>
             )}
+
+            <button
+              type="button"
+              id="toggle-push-btn"
+              className={`icon-btn ${pushEnabled ? "active" : ""}`}
+              onClick={() => void handleTogglePush()}
+              aria-label="切换 PWA 审批推送提醒"
+              title={
+                pushEnabled
+                  ? "PWA 审批推送提醒已开启（点击关闭）"
+                  : "开启 PWA 审批推送提醒"
+              }
+            >
+              {pushEnabled ? <BellRing size={16} /> : <Bell size={16} />}
+            </button>
 
             {selectedSession && (
               <button
@@ -638,31 +808,46 @@ export function App() {
               items={projection?.items ?? []}
               onResolveApproval={handleResolveApproval}
             />
-            <Composer
-              status={activeStatus}
-              disabled={
-                connectionState === "disconnected" || activeStatus === "closed"
-              }
-              queue={projection?.queue ?? []}
-              queuePaused={projection?.queuePaused ?? false}
-              onSend={handleSendPrompt}
-              onCancel={handleCancel}
-              onWithdrawQueued={handleWithdrawQueued}
-              onMoveQueued={handleMoveQueued}
-              onResumeQueue={handleResumeQueue}
-            />
+            {canPrompt ? (
+              <Composer
+                status={activeStatus}
+                disabled={
+                  connectionState === "disconnected" || activeStatus === "closed"
+                }
+                queue={projection?.queue ?? []}
+                queuePaused={projection?.queuePaused ?? false}
+                onSend={handleSendPrompt}
+                onCancel={handleCancel}
+                onWithdrawQueued={handleWithdrawQueued}
+                onMoveQueued={handleMoveQueued}
+                onResumeQueue={handleResumeQueue}
+              />
+            ) : (
+              <div className="composer-wrap">
+                <div className="viewer-composer-banner" id="viewer-composer-banner">
+                  当前角色为 <strong>Viewer（只读观察者）</strong>
+                  ：可实时同步查看会话流式输出、文件树与 Git Diff，无法发送指令或操作审批。
+                </div>
+              </div>
+            )}
           </>
         ) : (
           <div className="empty-stage">
             <h2>欢迎来到 OpenMirasim</h2>
-            <p>创建一个新的 Agent 会话开始工作，或从左侧列表恢复历史会话。</p>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => setNewModalOpen(true)}
-            >
-              新建会话
-            </button>
+            <p>
+              {canManageSession
+                ? "创建一个新的 Agent 会话开始工作，或从左侧列表恢复历史会话。"
+                : "从左侧列表选择任意会话以只读模式实时观摩协作流。"}
+            </p>
+            {canManageSession && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => setNewModalOpen(true)}
+              >
+                新建会话
+              </button>
+            )}
           </div>
         )}
       </main>
@@ -698,6 +883,14 @@ export function App() {
         onRegisterWorkspace={handleRegisterWorkspace}
         onClose={() => setNewModalOpen(false)}
         onCreate={handleCreateSession}
+      />
+
+      <TeamConsole
+        open={teamConsoleOpen}
+        client={client}
+        principal={principal}
+        onClose={() => setTeamConsoleOpen(false)}
+        onPushStateChanged={setPushEnabled}
       />
     </div>
   );

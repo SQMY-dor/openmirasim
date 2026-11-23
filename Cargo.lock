@@ -934,6 +934,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "om-gui-bridge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "om-server"
 version = "0.1.0"
 dependencies = [
@@ -946,6 +964,7 @@ dependencies = [
  "http",
  "libc",
  "om-core",
+ "om-gui-bridge",
  "reqwest",
  "rusqlite",
  "serde",

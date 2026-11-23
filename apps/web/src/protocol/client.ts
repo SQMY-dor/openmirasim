@@ -2,10 +2,24 @@ import type {
   ApprovalDecision,
   ApprovalId,
   ApprovalRuleView,
+  AuditEntry,
   ConnectionState,
   CreateSessionRequest,
+  DeviceTokenRecord,
   HarnessDescriptor,
+  IssuedToken,
+  MemberId,
+  MemberRecord,
+  Principal,
+  ProviderInfo,
+  ProxyStats,
+  PushConfigResponse,
+  PushSubscriptionRecord,
+  PushTestResponse,
   QueuedPromptId,
+  RegisterPushSubscriptionRequest,
+  RemoteScreenResponse,
+  Role,
   ServerInfo,
   SessionEvent,
   SessionId,
@@ -13,6 +27,7 @@ import type {
   SubmitMode,
   SubmitOutcome,
   SubmitPromptResponse,
+  TokenId,
   WorkspaceSummary,
   WorktreeDiff,
   WorktreeEntry,
@@ -37,6 +52,63 @@ export interface OpenMirasimClient {
 
   /** Verify token against the server and return server metadata. */
   connect(): Promise<ServerInfo>;
+
+  /** Return the authenticated member principal (`GET /api/v1/me`). */
+  getMe(): Promise<Principal>;
+
+  /** List team members in the active space (`GET /api/v1/members`). */
+  listMembers(): Promise<MemberRecord[]>;
+
+  /** Add a team member (`POST /api/v1/members`). */
+  addMember(displayName: string, role: Role): Promise<MemberRecord>;
+
+  /** Change a member's role (`PATCH /api/v1/members/:id`). */
+  changeMemberRole(memberId: MemberId, role: Role): Promise<MemberRecord>;
+
+  /** Disable a member and revoke their tokens (`DELETE /api/v1/members/:id`). */
+  disableMember(memberId: MemberId): Promise<MemberRecord>;
+
+  /** List device tokens for a member (`GET /api/v1/members/:id/tokens`). */
+  listMemberTokens(memberId: MemberId): Promise<DeviceTokenRecord[]>;
+
+  /** Issue a new device token (`POST /api/v1/members/:id/tokens`). */
+  issueMemberToken(
+    memberId: MemberId,
+    label: string,
+    ttlSecs?: number
+  ): Promise<IssuedToken>;
+
+  /** Revoke a device token (`DELETE /api/v1/tokens/:id`). */
+  revokeToken(tokenId: TokenId): Promise<DeviceTokenRecord>;
+
+  /** Query space audit logs (`GET /api/v1/audit`, Admin/Owner). */
+  listAudit(target?: string, limit?: number): Promise<AuditEntry[]>;
+
+  /** List configured KeyProxy upstream providers (`GET /api/v1/providers`). */
+  listProviders(): Promise<ProviderInfo[]>;
+
+  /** Fetch per-session KeyProxy request counters (`GET /api/v1/sessions/:id/proxy/stats`). */
+  getSessionProxyStats(sessionId: SessionId): Promise<ProxyStats>;
+
+  /** Fetch remote GUI takeover screen metadata (`GET /api/v1/sessions/:id/remote-screen`). */
+  getRemoteScreen(sessionId: SessionId): Promise<RemoteScreenResponse>;
+
+  /** Fetch PWA Web Push configuration (`GET /api/v1/push/config`). */
+  getPushConfig(): Promise<PushConfigResponse>;
+
+  /** List current member's Web Push subscriptions (`GET /api/v1/push/subscriptions`). */
+  listPushSubscriptions(): Promise<PushSubscriptionRecord[]>;
+
+  /** Register a Web Push subscription (`POST /api/v1/push/subscriptions`). */
+  registerPushSubscription(
+    req: RegisterPushSubscriptionRequest
+  ): Promise<PushSubscriptionRecord>;
+
+  /** Delete a Web Push subscription (`DELETE /api/v1/push/subscriptions/:id`). */
+  deletePushSubscription(subId: string): Promise<void>;
+
+  /** Trigger a Web Push test check (`POST /api/v1/push/test`). */
+  testPush(): Promise<PushTestResponse>;
 
   /** List registered harnesses and their capabilities (`GET /api/v1/harnesses`). */
   listHarnesses(): Promise<HarnessDescriptor[]>;

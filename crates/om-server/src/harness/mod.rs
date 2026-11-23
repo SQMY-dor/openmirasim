@@ -10,6 +10,7 @@
 pub mod cc;
 pub mod codexcli;
 pub mod dsh;
+pub mod gui_bridge;
 pub mod mock;
 pub mod opencode;
 pub mod probe;
@@ -18,6 +19,10 @@ pub mod stream_cli;
 pub use cc::{ClaudeCodeConfig, ClaudeCodeHarness, cc_harness, probe_cc};
 pub use codexcli::{CodexCliConfig, CodexCliHarness, codexcli_harness, probe_codexcli};
 pub use dsh::{DshConfig, dsh_harness, probe_dsh};
+pub use gui_bridge::{
+    GuiBridgeConfig, GuiBridgeHarness, GuiBridgeProbe, RemoteScreenInfo, RemoteScreenRegistry,
+    probe_gui_bridge,
+};
 pub use mock::{MockHarness, MockHarnessConfig};
 pub use opencode::{OpenCodeConfig, OpenCodeProbe, opencode_harness, probe_opencode};
 pub use probe::CliProbe;
@@ -187,6 +192,28 @@ pub async fn probe_registered_harnesses(registry: &HarnessRegistry) -> Vec<Harne
                     binary_path: p.binary_path.map(|b| b.to_string_lossy().into_owned()),
                     error: p.error,
                     capabilities: desc.capabilities,
+                }
+            }
+            "antigravity-gui" => {
+                if let Some(cfg) = GuiBridgeConfig::from_env() {
+                    let p = probe_gui_bridge(&cfg).await;
+                    HarnessProbeReport {
+                        id: desc.id,
+                        available: p.available,
+                        version: p.version,
+                        binary_path: Some(cfg.base_url),
+                        error: p.error,
+                        capabilities: desc.capabilities,
+                    }
+                } else {
+                    HarnessProbeReport {
+                        id: desc.id,
+                        available: true,
+                        version: Some("bridge-registered".into()),
+                        binary_path: None,
+                        error: None,
+                        capabilities: desc.capabilities,
+                    }
                 }
             }
             _ => HarnessProbeReport {

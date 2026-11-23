@@ -2,6 +2,7 @@
 
 use clap::{Args, Subcommand, ValueEnum};
 use om_core::approval::ApprovalDecision;
+use om_core::auth::Role;
 use om_core::content::Prompt;
 use om_core::ids::WorkspaceId;
 use om_core::queue::SubmitMode;
@@ -18,7 +19,7 @@ pub struct CtlArgs {
     #[arg(long, env = "OM_SERVER_URL", default_value = "http://127.0.0.1:4939")]
     pub server: String,
 
-    /// Bearer access token.
+    /// Bearer access token (`omt_...` device token or static bootstrap token).
     #[arg(long, env = "OM_TOKEN", default_value = "")]
     pub token: String,
 
@@ -34,6 +35,18 @@ pub struct CtlArgs {
 pub enum CtlCommand {
     /// Check server health (`GET /healthz`).
     Health,
+    /// Show the currently authenticated member principal (`GET /api/v1/me`).
+    Me,
+    /// Manage team members and roles (W2-1 RBAC).
+    Members {
+        #[command(subcommand)]
+        action: MemberCmd,
+    },
+    /// Manage device tokens (W2-1 RBAC).
+    Tokens {
+        #[command(subcommand)]
+        action: TokenCmd,
+    },
     /// List registered harnesses (or probe live host binaries with `--probe`).
     Harnesses {
         #[arg(long)]
@@ -46,7 +59,7 @@ pub enum CtlCommand {
         #[command(subcommand)]
         action: WorkspaceCmd,
     },
-    /// Manage sessions, events, worktrees, files, and live Git diffs.
+    /// Manage sessions, events, worktrees, files, live Git diffs, proxy stats, and remote GUI screens.
     Sessions {
         #[command(subcommand)]
         action: SessionCmd,
@@ -70,13 +83,69 @@ pub enum CtlCommand {
         #[command(subcommand)]
         action: ApprovalCmd,
     },
-    /// Query audit logs (`GET /api/v1/audit`).
+    /// Query audit logs (`GET /api/v1/audit`, Admin/Owner only).
     Audit {
         #[arg(long)]
         target: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliRole {
+    Viewer,
+    Member,
+    Admin,
+    Owner,
+}
+
+impl From<CliRole> for Role {
+    fn from(v: CliRole) -> Self {
+        match v {
+            CliRole::Viewer => Role::Viewer,
+            CliRole::Member => Role::Member,
+            CliRole::Admin => Role::Admin,
+            CliRole::Owner => Role::Owner,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemberCmd {
+    /// List space members.
+    List,
+    /// Add a new member to the space (Admin/Owner).
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum, default_value_t = CliRole::Member)]
+        role: CliRole,
+    },
+    /// Change a member's role.
+    SetRole {
+        member_id: String,
+        #[arg(long, value_enum)]
+        role: CliRole,
+    },
+    /// Disable a member and revoke all of their tokens.
+    Disable { member_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TokenCmd {
+    /// List device tokens for a member.
+    List { member_id: String },
+    /// Issue a new device token (secret is printed once in JSON output).
+    Issue {
+        member_id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    /// Revoke a device token immediately.
+    Revoke { token_id: String },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -169,6 +238,10 @@ pub enum SessionCmd {
     File { id: String, path: String },
     /// Get live Git diff for a session's worktree.
     Diff { id: String },
+    /// Get KeyProxy request counters for a session.
+    ProxyStats { id: String },
+    /// Get remote GUI takeover screen info (for `antigravity-gui` sessions).
+    RemoteScreen { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -309,6 +382,96 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
 
     match args.command {
         CtlCommand::Health => client.send(Method::GET, "/healthz", &[], None, false).await,
+        CtlCommand::Me => {
+            client
+                .send(Method::GET, "/api/v1/me", &[], None, true)
+                .await
+        }
+        CtlCommand::Members { action } => match action {
+            MemberCmd::List => {
+                client
+                    .send(Method::GET, "/api/v1/members", &[], None, true)
+                    .await
+            }
+            MemberCmd::Add { name, role } => {
+                let r: Role = role.into();
+                client
+                    .send(
+                        Method::POST,
+                        "/api/v1/members",
+                        &[],
+                        Some(json!({ "display_name": name, "role": r })),
+                        true,
+                    )
+                    .await
+            }
+            MemberCmd::SetRole { member_id, role } => {
+                let r: Role = role.into();
+                client
+                    .send(
+                        Method::PATCH,
+                        &format!("/api/v1/members/{member_id}"),
+                        &[],
+                        Some(json!({ "role": r })),
+                        true,
+                    )
+                    .await
+            }
+            MemberCmd::Disable { member_id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/members/{member_id}"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Tokens { action } => match action {
+            TokenCmd::List { member_id } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/members/{member_id}/tokens"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            TokenCmd::Issue {
+                member_id,
+                label,
+                ttl_secs,
+            } => {
+                let mut body = json!({ "label": label });
+                if let Some(ttl) = ttl_secs {
+                    body["ttl_secs"] = json!(ttl);
+                }
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/members/{member_id}/tokens"),
+                        &[],
+                        Some(body),
+                        true,
+                    )
+                    .await
+            }
+            TokenCmd::Revoke { token_id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/tokens/{token_id}"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
         CtlCommand::Harnesses { probe } => {
             let path = if probe {
                 "/api/v1/harnesses/probe"
@@ -484,6 +647,28 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .send(
                         Method::GET,
                         &format!("/api/v1/sessions/{id}/diff"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            SessionCmd::ProxyStats { id } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/sessions/{id}/proxy/stats"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            SessionCmd::RemoteScreen { id } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/sessions/{id}/remote-screen"),
                         &[],
                         None,
                         true,
