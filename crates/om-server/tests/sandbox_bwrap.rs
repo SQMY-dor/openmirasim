@@ -335,3 +335,101 @@ async fn agent_commits_in_worktree_but_cannot_touch_git_config_or_repo() {
     let d = mgr.diff(&sid).await.unwrap();
     assert!(d.files.iter().any(|f| f.path == "note.txt"));
 }
+
+/// W1-3: inside bwrap, a read of a worktree path is auto-allowed by policy while a
+/// command still waits for a member.
+#[tokio::test]
+async fn sandboxed_reads_auto_allow_but_commands_wait_for_members() {
+    let Some(sb) = sandbox().await else { return };
+    let data = tempfile::tempdir().unwrap();
+    let db = Db::open(data.path().join("om.db")).unwrap();
+    let space = db.ensure_space("default").await.unwrap();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(AcpHarness::new(
+        "fake",
+        CommandSpec::new(env!("CARGO_BIN_EXE_om-fake-acp-agent")),
+    )));
+    let mgr =
+        WorkspaceManager::new(db.clone(), WorkspaceConfig::new(data.path().join("ws"))).unwrap();
+    let orch = Orchestrator::new(db, registry, OrchestratorConfig::default())
+        .with_bwrap_sandbox(Arc::new(sb))
+        .with_workspaces(mgr);
+    let config = SessionConfig {
+        harness_id: "fake".into(),
+        cwd: "/".into(),
+        workspace_id: None,
+        model: None,
+        sandbox: SandboxMode::Bwrap,
+        title: None,
+    };
+    let s = orch.create_session(space, config, None).await.unwrap();
+    let mut sub = orch.subscribe(&s.id, 0).await.unwrap();
+    let idle = |p: &EventPayload| {
+        matches!(
+            p,
+            EventPayload::StatusChanged {
+                to: SessionStatus::Idle,
+                ..
+            }
+        )
+    };
+    while !idle(&next(&mut sub).await.payload) {}
+
+    // Read inside the scratch cwd: resolved by policy, no WaitingApproval.
+    orch.submit_prompt(&s.id, None, Prompt::text("read"))
+        .await
+        .unwrap();
+    let mut rule = None;
+    loop {
+        let ev = next(&mut sub).await;
+        match &ev.payload {
+            EventPayload::StatusChanged {
+                to: SessionStatus::WaitingApproval,
+                ..
+            } => panic!("read inside the sandbox should not wait for members"),
+            EventPayload::ApprovalResolved { auto_rule, .. } => rule = auto_rule.clone(),
+            p if idle(p) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(rule.as_deref(), Some("read_in_worktree"));
+
+    // A command still asks.
+    orch.submit_prompt(&s.id, None, Prompt::text("tool"))
+        .await
+        .unwrap();
+    let approval = loop {
+        if let EventPayload::ApprovalRequested { approval, .. } = next(&mut sub).await.payload {
+            break approval;
+        }
+    };
+    assert_eq!(approval.tool_kind, Some(om_core::event::ToolKind::Execute));
+    loop {
+        if let EventPayload::StatusChanged {
+            to: SessionStatus::WaitingApproval,
+            ..
+        } = next(&mut sub).await.payload
+        {
+            break;
+        }
+    }
+    orch.resolve_approval(
+        &approval.id,
+        om_core::approval::ApprovalDecision::Selected {
+            option_id: "reject".into(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    while !idle(&next(&mut sub).await.payload) {}
+    orch.close_session(&s.id).await.unwrap();
+}
+
+async fn next(sub: &mut om_server::orchestrator::Subscription) -> om_core::event::SessionEvent {
+    tokio::time::timeout(Duration::from_secs(20), sub.next())
+        .await
+        .expect("timeout")
+        .unwrap()
+        .unwrap()
+}

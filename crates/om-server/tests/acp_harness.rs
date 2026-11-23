@@ -121,12 +121,18 @@ async fn tool_turn(decision: ApprovalDecision) -> Vec<HarnessEvent> {
         request_id,
         tool_call_id,
         title,
+        kind,
+        locations,
         options,
     } = next(&mut events).await
     else {
         panic!("expected permission request");
     };
     assert_eq!(tool_call_id.as_deref(), Some("call-1"));
+    // The fake agent's request carries only the id; the orchestrator classifies it
+    // from the earlier tool_call.
+    assert_eq!(kind, None);
+    assert!(locations.is_empty());
     assert_eq!(
         title, "rm -rf build",
         "title is filled in from the earlier tool_call"

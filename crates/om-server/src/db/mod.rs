@@ -9,6 +9,8 @@
 //! - Readers run on `spawn_blocking` with read-only connections; WAL lets them proceed
 //!   while the writer commits.
 
+mod audit;
+pub use audit::{ApprovalRule, AuditEntry};
 mod migrations;
 #[cfg(test)]
 mod tests;
@@ -421,8 +423,8 @@ impl Db {
             let r = &approval.record;
             tx.execute(
                 "INSERT INTO approvals (id, session_id, harness_request_id, tool_call_id, title,
-                                        options, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                        options, status, created_at, tool_kind, locations)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     r.id.as_str(),
                     r.session_id.as_str(),
@@ -431,10 +433,24 @@ impl Db {
                     r.title,
                     to_json(&r.options).map_err(storage)?,
                     enum_str(&ApprovalStatus::Pending),
-                    r.created_at
+                    r.created_at,
+                    r.tool_kind.as_ref().map(enum_str),
+                    to_json(&r.locations).map_err(storage)?
                 ],
             )
             .map_err(storage)?;
+            audit::insert(
+                &tx,
+                None,
+                "approval.requested",
+                r.id.as_str(),
+                &serde_json::json!({
+                    "session_id": r.session_id,
+                    "title": r.title,
+                    "tool_kind": r.tool_kind,
+                    "locations": r.locations,
+                }),
+            )?;
             let mut events = append_in_tx(
                 &tx,
                 &r.session_id,
@@ -461,7 +477,25 @@ impl Db {
         let approval_id = approval_id.clone();
         self.write(move |conn| {
             let tx = conn.transaction().map_err(storage)?;
-            let outcome = resolve_in_tx(&tx, &approval_id, decision, resolved_by)?;
+            let outcome = resolve_in_tx(&tx, &approval_id, decision, resolved_by, None)?;
+            tx.commit().map_err(storage)?;
+            Ok(outcome)
+        })
+        .await
+    }
+
+    /// Like [`Db::resolve_approval`], but records that the server's approval policy
+    /// (not a member) made the decision, naming the rule that matched.
+    pub async fn resolve_approval_by_policy(
+        &self,
+        approval_id: &ApprovalId,
+        decision: ApprovalDecision,
+        rule: String,
+    ) -> CoreResult<ApprovalOutcome> {
+        let approval_id = approval_id.clone();
+        self.write(move |conn| {
+            let tx = conn.transaction().map_err(storage)?;
+            let outcome = resolve_in_tx(&tx, &approval_id, decision, None, Some(rule))?;
             tx.commit().map_err(storage)?;
             Ok(outcome)
         })
@@ -494,6 +528,7 @@ impl Db {
                     &tx,
                     &ApprovalId(id),
                     ApprovalDecision::Cancelled,
+                    None,
                     None,
                 )?);
             }
@@ -575,6 +610,7 @@ impl Db {
                         &ApprovalId(approval_id),
                         ApprovalDecision::Cancelled,
                         None,
+                        Some("server_restart".into()),
                     )?;
                 }
                 append_in_tx(
@@ -606,7 +642,8 @@ const SESSION_COLUMNS: &str = "SELECT id, space_id, config, status, head_seq, na
 
 const APPROVAL_COLUMNS: &str = "SELECT id, session_id, harness_request_id, tool_call_id, title,
                                        options, status, decision, resolved_by, created_at,
-                                       resolved_at FROM approvals";
+                                       resolved_at, tool_kind, locations, auto_rule
+                                FROM approvals";
 
 fn row_to_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
     let config: String = r.get(2)?;
@@ -629,6 +666,8 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredApproval> {
     let status: String = r.get(6)?;
     let decision: Option<String> = r.get(7)?;
     let resolved_by: Option<String> = r.get(8)?;
+    let tool_kind: Option<String> = r.get(11)?;
+    let locations: Option<String> = r.get(12)?;
     Ok(StoredApproval {
         harness_request_id: r.get(2)?,
         record: ApprovalRecord {
@@ -636,12 +675,18 @@ fn row_to_approval(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredApproval> {
             session_id: SessionId(r.get(1)?),
             tool_call_id: r.get(3)?,
             title: r.get(4)?,
+            tool_kind: tool_kind.map(|k| parse_enum(11, &k)).transpose()?,
+            locations: locations
+                .map(|l| from_json(12, &l))
+                .transpose()?
+                .unwrap_or_default(),
             options: from_json(5, &options)?,
             status: parse_enum(6, &status)?,
             decision: decision.map(|d| from_json(7, &d)).transpose()?,
             resolved_by: resolved_by.map(MemberId),
             created_at: r.get(9)?,
             resolved_at: r.get(10)?,
+            auto_rule: r.get(13)?,
         },
     })
 }
@@ -763,6 +808,7 @@ fn resolve_in_tx(
     approval_id: &ApprovalId,
     decision: ApprovalDecision,
     resolved_by: Option<MemberId>,
+    auto_rule: Option<String>,
 ) -> CoreResult<ApprovalOutcome> {
     let current = load_approval(tx, approval_id)?;
     if let ApprovalDecision::Selected { option_id } = &decision
@@ -783,20 +829,39 @@ fn resolve_in_tx(
     let now = now_ms();
     let changed = tx
         .execute(
-            "UPDATE approvals SET status = ?2, decision = ?3, resolved_by = ?4, resolved_at = ?5
+            "UPDATE approvals SET status = ?2, decision = ?3, resolved_by = ?4, resolved_at = ?5,
+                                  auto_rule = ?6
              WHERE id = ?1 AND status = 'pending'",
             params![
                 approval_id.as_str(),
                 enum_str(&new_status),
                 to_json(&decision).map_err(storage)?,
                 resolved_by.as_ref().map(|m| m.as_str()),
-                now
+                now,
+                auto_rule
             ],
         )
         .map_err(storage)?;
     if changed == 0 {
         return Err(CoreError::ApprovalAlreadyResolved(approval_id.to_string()));
     }
+    let action = match (&decision, &auto_rule) {
+        (ApprovalDecision::Cancelled, _) => "approval.cancelled",
+        (_, Some(_)) => "approval.auto_resolved",
+        (_, None) => "approval.resolved",
+    };
+    audit::insert(
+        tx,
+        resolved_by.as_ref(),
+        action,
+        approval_id.as_str(),
+        &serde_json::json!({
+            "session_id": current.record.session_id,
+            "title": current.record.title,
+            "decision": decision,
+            "rule": auto_rule,
+        }),
+    )?;
     let mut events = append_in_tx(
         tx,
         &current.record.session_id,
@@ -804,6 +869,7 @@ fn resolve_in_tx(
             approval_id: approval_id.clone(),
             decision,
             resolved_by,
+            auto_rule,
         }],
     )?;
     let approval = load_approval(tx, approval_id)?;

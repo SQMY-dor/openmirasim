@@ -6,6 +6,7 @@
 
 pub mod acp;
 pub mod api;
+pub mod approval;
 pub mod db;
 pub mod harness;
 pub mod orchestrator;

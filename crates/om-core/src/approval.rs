@@ -3,6 +3,7 @@
 //! Option kinds mirror ACP `PermissionOptionKind` so harnesses can map a member's
 //! decision back to the agent's own option id.
 
+use crate::event::ToolKind;
 use crate::ids::{ApprovalId, MemberId, SessionId};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -68,6 +69,13 @@ pub struct ApprovalRecord {
     #[ts(optional)]
     pub tool_call_id: Option<String>,
     pub title: String,
+    /// Kind of the gated tool call, when the harness reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool_kind: Option<ToolKind>,
+    /// Paths the gated tool call touches, as reported by the agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<String>,
     pub options: Vec<ApprovalOption>,
     pub status: ApprovalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,6 +89,11 @@ pub struct ApprovalRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub resolved_at: Option<i64>,
+    /// Set when the server resolved the request without a member: the policy rule
+    /// that matched (`read_in_worktree`, `remembered:<key>`, `timeout`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub auto_rule: Option<String>,
 }
 
 #[cfg(test)]

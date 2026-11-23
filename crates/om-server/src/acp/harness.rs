@@ -5,6 +5,7 @@ use crate::stream::ReceiverStream;
 use async_trait::async_trait;
 use om_core::approval::ApprovalDecision;
 use om_core::content::Prompt;
+use om_core::event::ToolKind;
 use om_core::harness::{
     Harness, HarnessCapabilities, HarnessEvent, HarnessSession, StartContext, StartedSession,
 };
@@ -148,6 +149,20 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                         titles.get(tool_call_id.as_deref()?).cloned()
                     })
                     .unwrap_or_else(|| "Permission requested".to_owned());
+                let kind = tool_call
+                    .get("kind")
+                    .and_then(|k| serde_json::from_value::<ToolKind>(k.clone()).ok());
+                let locations = tool_call
+                    .get("locations")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|l| l.get("path").and_then(Value::as_str))
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let options = mapping::permission_options_from_acp(
                     params.get("options").unwrap_or(&Value::Null),
                 );
@@ -163,6 +178,8 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                     request_id,
                     tool_call_id,
                     title,
+                    kind,
+                    locations,
                     options,
                 });
             }

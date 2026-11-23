@@ -5,6 +5,7 @@ import type { ApprovalOption } from "./ApprovalOption";
 import type { ApprovalStatus } from "./ApprovalStatus";
 import type { MemberId } from "./MemberId";
 import type { SessionId } from "./SessionId";
+import type { ToolKind } from "./ToolKind";
 
 /**
  * An approval request as stored and listed by the server.
@@ -13,4 +14,17 @@ export type ApprovalRecord = { id: ApprovalId, session_id: SessionId,
 /**
  * The tool call this approval gates, when the harness reports one.
  */
-tool_call_id?: string, title: string, options: Array<ApprovalOption>, status: ApprovalStatus, decision?: ApprovalDecision, resolved_by?: MemberId, created_at: number, resolved_at?: number, };
+tool_call_id?: string, title: string, 
+/**
+ * Kind of the gated tool call, when the harness reports one.
+ */
+tool_kind?: ToolKind, 
+/**
+ * Paths the gated tool call touches, as reported by the agent.
+ */
+locations?: Array<string>, options: Array<ApprovalOption>, status: ApprovalStatus, decision?: ApprovalDecision, resolved_by?: MemberId, created_at: number, resolved_at?: number, 
+/**
+ * Set when the server resolved the request without a member: the policy rule
+ * that matched (`read_in_worktree`, `remembered:<key>`, `timeout`, ...).
+ */
+auto_rule?: string, };

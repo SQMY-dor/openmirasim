@@ -1,6 +1,7 @@
 use super::*;
 use om_core::approval::{ApprovalOption, ApprovalOptionKind};
 use om_core::content::ContentBlock;
+use om_core::event::ToolKind;
 use om_core::ids::TurnId;
 use om_core::sandbox::SandboxMode;
 
@@ -41,6 +42,8 @@ fn pending_approval(session_id: &SessionId) -> StoredApproval {
             session_id: session_id.clone(),
             tool_call_id: Some("call-1".into()),
             title: "rm -rf build".into(),
+            tool_kind: Some(ToolKind::Execute),
+            locations: vec!["build".into()],
             options: vec![
                 ApprovalOption {
                     option_id: "allow".into(),
@@ -56,6 +59,7 @@ fn pending_approval(session_id: &SessionId) -> StoredApproval {
             status: ApprovalStatus::Pending,
             decision: None,
             resolved_by: None,
+            auto_rule: None,
             created_at: now_ms(),
             resolved_at: None,
         },
@@ -371,4 +375,80 @@ async fn concurrent_appends_stay_gapless() {
     let page = db.list_events(&s.id, 0, 1000).await.unwrap();
     let seqs: Vec<u64> = page.events.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, (1..=41).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn policy_resolution_records_rule_metadata_and_audit() {
+    let (_dir, db, space) = setup().await;
+    let (s, _) = db.create_session(space, config(), None).await.unwrap();
+    let a = pending_approval(&s.id);
+    let id = a.record.id.clone();
+    db.create_approval(a, None).await.unwrap();
+
+    let stored = db.get_approval(&id).await.unwrap();
+    assert_eq!(stored.record.tool_kind, Some(ToolKind::Execute));
+    assert_eq!(stored.record.locations, vec!["build".to_string()]);
+
+    let outcome = db
+        .resolve_approval_by_policy(
+            &id,
+            ApprovalDecision::Selected {
+                option_id: "reject".into(),
+            },
+            "timeout".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.approval.record.auto_rule.as_deref(),
+        Some("timeout")
+    );
+    assert_eq!(outcome.approval.record.resolved_by, None);
+    assert!(matches!(
+        &outcome.event.payload,
+        EventPayload::ApprovalResolved { auto_rule: Some(r), resolved_by: None, .. } if r == "timeout"
+    ));
+    // First writer wins against members too.
+    assert!(matches!(
+        db.resolve_approval(
+            &id,
+            ApprovalDecision::Selected {
+                option_id: "allow".into()
+            },
+            Some(MemberId::from("alice"))
+        )
+        .await,
+        Err(CoreError::ApprovalAlreadyResolved(_))
+    ));
+
+    let audit = db.list_audit(Some(id.to_string()), 10).await.unwrap();
+    let actions: Vec<_> = audit.iter().map(|a| a.action.as_str()).collect();
+    assert_eq!(actions, ["approval.auto_resolved", "approval.requested"]);
+}
+
+#[tokio::test]
+async fn approval_rules_upsert_and_clear() {
+    let (_dir, db, space) = setup().await;
+    let (s, _) = db.create_session(space, config(), None).await.unwrap();
+    let rule = |allow: bool| ApprovalRule {
+        rule_key: "execute:cargo test".into(),
+        allow,
+        option_kind: if allow {
+            ApprovalOptionKind::AllowAlways
+        } else {
+            ApprovalOptionKind::RejectAlways
+        },
+        created_by: Some(MemberId::from("alice")),
+        created_at: 1,
+    };
+    db.remember_approval_rule(&s.id, rule(true)).await.unwrap();
+    db.remember_approval_rule(&s.id, rule(false)).await.unwrap();
+    let rules = db.approval_rules(&s.id).await.unwrap();
+    assert_eq!(
+        rules,
+        vec![rule(false)],
+        "latest answer replaces the earlier one"
+    );
+    assert_eq!(db.clear_approval_rules(&s.id, None).await.unwrap(), 1);
+    assert!(db.approval_rules(&s.id).await.unwrap().is_empty());
 }
