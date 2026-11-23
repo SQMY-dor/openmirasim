@@ -47,6 +47,7 @@ impl SessionStatus {
             (Starting, Idle)
                 | (Starting, Failed)
                 | (Idle, Running)
+                | (Idle, Failed)
                 | (Running, WaitingApproval)
                 | (Running, Idle)
                 | (Running, Failed)
@@ -178,6 +179,11 @@ mod tests {
         assert!(Idle.transition(WaitingApproval).is_err());
         assert!(Starting.transition(Running).is_err());
         assert!(Failed.transition(Running).is_err());
+    }
+
+    #[test]
+    fn idle_harness_crash_fails_session() {
+        assert!(Idle.transition(Failed).is_ok());
     }
 
     #[test]
