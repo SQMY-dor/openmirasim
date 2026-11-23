@@ -12,6 +12,9 @@
 mod migrations;
 #[cfg(test)]
 mod tests;
+mod workspaces;
+
+pub use workspaces::{StoredWorkspace, StoredWorktree};
 
 use om_core::approval::{ApprovalDecision, ApprovalRecord, ApprovalStatus};
 use om_core::event::{EventPayload, SessionEvent};

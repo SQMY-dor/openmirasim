@@ -19,6 +19,8 @@ pub use hub::Subscription;
 
 use crate::db::Db;
 pub use crate::harness::HarnessRegistry;
+use crate::sandbox::ScopedSandbox;
+use crate::workspace::WorkspaceManager;
 use actor::{ActorSpec, Command};
 use hub::EventHub;
 use om_core::approval::{ApprovalDecision, ApprovalRecord};
@@ -66,6 +68,7 @@ pub struct Orchestrator {
     config: OrchestratorConfig,
     live: Live,
     bwrap: Option<Arc<dyn Sandbox>>,
+    workspaces: Option<WorkspaceManager>,
 }
 
 impl Orchestrator {
@@ -77,7 +80,61 @@ impl Orchestrator {
             config,
             live: Live::default(),
             bwrap: None,
+            workspaces: None,
         }
+    }
+
+    /// Enables workspaces: sessions with a `workspace_id` run in their own Git worktree,
+    /// and sandboxed sessions without one get a private scratch dir.
+    pub fn with_workspaces(mut self, manager: WorkspaceManager) -> Self {
+        self.workspaces = Some(manager);
+        self
+    }
+
+    pub fn workspaces(&self) -> Option<&WorkspaceManager> {
+        self.workspaces.as_ref()
+    }
+
+    fn workspace_manager(&self) -> CoreResult<&WorkspaceManager> {
+        self.workspaces
+            .as_ref()
+            .ok_or_else(|| CoreError::Unsupported {
+                harness: "server".into(),
+                capability: "workspaces (not configured on this server)",
+            })
+    }
+
+    /// The session's sandbox, scoped to its worktree / git dir / HOME when it has one.
+    async fn session_sandbox(
+        &self,
+        id: &SessionId,
+        config: &SessionConfig,
+    ) -> CoreResult<Arc<dyn Sandbox>> {
+        let base = self.sandbox_for(config.sandbox)?;
+        let Some(mgr) = &self.workspaces else {
+            return Ok(base);
+        };
+        let wt = match self.db.get_worktree(id).await? {
+            Some(wt) if wt.info.removed_at.is_none() => wt,
+            Some(_) => {
+                return Err(CoreError::InvalidInput(
+                    "the session's worktree has been removed".into(),
+                ));
+            }
+            None if config.workspace_id.is_some() || config.sandbox == SandboxMode::Bwrap => {
+                return Err(CoreError::Workspace(
+                    "session has no worktree record".into(),
+                ));
+            }
+            None => return Ok(base),
+        };
+        let paths = mgr.sandbox_paths(&wt).await?;
+        Ok(Arc::new(ScopedSandbox::new(
+            base,
+            paths.writable,
+            paths.readonly,
+            paths.home,
+        )))
     }
 
     /// Enables `SandboxMode::Bwrap` sessions with the given (probed) sandbox, e.g.
@@ -178,16 +235,48 @@ impl Orchestrator {
     pub async fn create_session(
         &self,
         space_id: SpaceId,
-        config: SessionConfig,
+        mut config: SessionConfig,
         created_by: Option<MemberId>,
     ) -> CoreResult<SessionSummary> {
         let harness = self.harness_for(&config.harness_id)?;
-        let sandbox = self.sandbox_for(config.sandbox)?;
-        let (summary, event) = self
+        self.sandbox_for(config.sandbox)?;
+        // Sandboxed sessions never run in a caller-chosen host directory: they get a
+        // worktree of their workspace, or a private scratch dir.
+        let needs_tree = config.workspace_id.is_some() || config.sandbox == SandboxMode::Bwrap;
+        let prepared = if needs_tree {
+            let mgr = self.workspace_manager()?;
+            if let Some(ws_id) = &config.workspace_id {
+                let ws = mgr.get(ws_id).await?;
+                if ws.space_id != space_id {
+                    return Err(CoreError::NotFound(format!("workspace {ws_id}")));
+                }
+            }
+            let p = mgr
+                .prepare(config.workspace_id.as_ref(), None, created_by.as_ref())
+                .await?;
+            config.cwd = p.cwd().to_string();
+            Some(p)
+        } else {
+            None
+        };
+        let created = self
             .db
             .create_session(space_id, config.clone(), created_by)
-            .await?;
+            .await;
+        let (summary, event) = match created {
+            Ok(v) => v,
+            Err(e) => {
+                if let (Some(p), Some(mgr)) = (prepared, &self.workspaces) {
+                    mgr.discard(p).await;
+                }
+                return Err(e);
+            }
+        };
+        if let (Some(p), Some(mgr)) = (prepared, &self.workspaces) {
+            mgr.attach(&summary.id, p).await?;
+        }
         self.hub.publish(std::slice::from_ref(&event));
+        let sandbox = self.session_sandbox(&summary.id, &config).await?;
         self.spawn_actor(ActorSpec {
             session_id: summary.id.clone(),
             config,
@@ -211,7 +300,7 @@ impl Orchestrator {
         let summary = self.db.get_session(id).await?;
         summary.status.transition(SessionStatus::Starting)?;
         let harness = self.harness_for(&summary.config.harness_id)?;
-        let sandbox = self.sandbox_for(summary.config.sandbox)?;
+        let sandbox = self.session_sandbox(&summary.id, &summary.config).await?;
         let resume = summary
             .native_session_id
             .clone()

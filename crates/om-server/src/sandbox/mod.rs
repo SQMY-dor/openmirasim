@@ -322,13 +322,6 @@ impl Sandbox for BwrapSandbox {
 
         let mut exposed: Vec<PathBuf> = Vec::new();
         let mut seen = BTreeSet::new();
-        for p in &spec.readonly_paths {
-            let s = absolute(p, "read-only path")?;
-            if seen.insert(s.clone()) {
-                args.extend(["--ro-bind-try".into(), s.clone(), s]);
-                exposed.push(p.clone());
-            }
-        }
         for p in &spec.writable_paths {
             let s = absolute(p, "writable path")?;
             if !p.exists() {
@@ -354,6 +347,15 @@ impl Sandbox for BwrapSandbox {
                 SANDBOX_TMP_HOME.into()
             }
         };
+        // Read-only paths go last so they can overlay parts of writable binds
+        // (e.g. `.git/config` inside a writable `.git`).
+        for p in &spec.readonly_paths {
+            let s = absolute(p, "read-only path")?;
+            if seen.insert(s.clone()) {
+                args.extend(["--ro-bind-try".into(), s.clone(), s]);
+                exposed.push(p.clone());
+            }
+        }
         env.insert("HOME".into(), home);
         env.insert("TMPDIR".into(), "/tmp".into());
 
@@ -398,6 +400,51 @@ impl Sandbox for BwrapSandbox {
             env,
             clear_env: true,
         })
+    }
+}
+
+/// Adds per-session paths (worktree, git dir overlays, private HOME) to every spec
+/// before delegating to the real sandbox.
+pub struct ScopedSandbox {
+    inner: std::sync::Arc<dyn Sandbox>,
+    writable: Vec<PathBuf>,
+    readonly: Vec<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl ScopedSandbox {
+    pub fn new(
+        inner: std::sync::Arc<dyn Sandbox>,
+        writable: Vec<PathBuf>,
+        readonly: Vec<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            inner,
+            writable,
+            readonly,
+            home,
+        }
+    }
+}
+
+impl Sandbox for ScopedSandbox {
+    fn mode(&self) -> SandboxMode {
+        self.inner.mode()
+    }
+
+    fn wrap(&self, spec: &SandboxSpec, cmd: CommandSpec) -> CoreResult<CommandSpec> {
+        let mut spec = spec.clone();
+        for p in &self.writable {
+            if !spec.writable_paths.contains(p) {
+                spec.writable_paths.push(p.clone());
+            }
+        }
+        spec.readonly_paths.extend(self.readonly.iter().cloned());
+        if spec.home.is_none() {
+            spec.home = self.home.clone();
+        }
+        self.inner.wrap(&spec, cmd)
     }
 }
 
