@@ -21,7 +21,7 @@ fn open_at(
 ) -> std::io::Result<OwnedFd> {
     let c = CString::new(name.as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let dirfd = dir.map_or(libc::AT_FDCWD, |d| std::os::fd::AsRawFd::as_raw_fd(d));
+    let dirfd = dir.map_or(libc::AT_FDCWD, std::os::fd::AsRawFd::as_raw_fd);
     // SAFETY: `c` is a valid NUL-terminated string and `dirfd` a live descriptor (or
     // AT_FDCWD); the returned descriptor is owned by the `OwnedFd`.
     let fd = unsafe { libc::openat(dirfd, c.as_ptr(), flags | libc::O_CLOEXEC) };

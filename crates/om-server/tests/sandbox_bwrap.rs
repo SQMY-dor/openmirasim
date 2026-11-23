@@ -294,11 +294,10 @@ async fn agent_commits_in_worktree_but_cannot_touch_git_config_or_repo() {
         "set -u; echo \"HOME=$HOME\"; \
          echo hi > note.txt && git add note.txt && git -c user.name=a -c user.email=a@a commit -qm agent && echo COMMITTED; \
          git config --global user.name agent && echo GLOBAL-OK; \
-         for f in '{c}/config' '{c}/hooks/post-checkout' '{c}/info/attributes' '{a}/commondir' '{a}/gitdir' '{a}/config.worktree'; do \
+         for f in '{a}/config' '{a}/hooks/post-checkout' '{a}/info/attributes' '{a}/commondir' '{a}/objects/info/alternates'; do \
            if echo pwn >> \"$f\" 2>/dev/null; then echo LEAK-WRITE:$f; fi; done; \
          if cat '{r}/README.md' 2>/dev/null; then echo LEAK-REPO; fi; \
          true",
-        c = common.display(),
         a = admin,
         r = repo.display(),
     );
@@ -323,9 +322,35 @@ async fn agent_commits_in_worktree_but_cannot_touch_git_config_or_repo() {
     );
     assert!(out.stdout.contains("GLOBAL-OK"), "{}", out.stdout);
     assert!(!out.stdout.contains("LEAK"), "{}", out.stdout);
+    // The repository's own git dir is not mounted at all: whatever the agent writes
+    // under its path lands in the sandbox's tmpfs, never on the host.
+    let probe = format!(
+        "for f in '{c}/config' '{c}/HEAD' '{c}/refs/heads'; do \
+           if echo pwn >> \"$f\" 2>/dev/null; then :; fi; done; true",
+        c = common.display(),
+    );
+    let _ = run(
+        &scoped,
+        &SandboxSpec::default(),
+        &probe,
+        Some(Path::new(&info.path)),
+    )
+    .await;
+    assert!(
+        !std::fs::read_to_string(common.join("config"))
+            .unwrap()
+            .contains("pwn")
+    );
+    assert!(
+        !std::fs::read_to_string(common.join("HEAD"))
+            .unwrap()
+            .contains("pwn")
+    );
+    assert!(!common.join("info/attributes").exists());
 
-    // The commit landed on the session branch in the real repository.
+    // The commit lands on the session branch in the real repository once synced.
     let branch = info.branch.unwrap();
+    mgr.sync_branch(&sid).await.unwrap();
     assert_eq!(
         host_git(&repo, &["log", "-1", "--format=%s", &branch]),
         "agent"
