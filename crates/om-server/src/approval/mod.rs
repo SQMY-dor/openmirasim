@@ -14,6 +14,11 @@
 //!   (except through a member's explicit "allow always" for that exact rule key).
 //! - Paths inside `.git` never auto-allow: git internals are how a worktree escapes.
 //! - A remembered "reject always" wins over everything else.
+//! - A remembered "allow always" for a file tool (`Read`, `Search`, `Edit`, `Delete`,
+//!   `Move`) only applies under the same conditions as the automatic allow: a
+//!   sandboxed session and paths that stay inside the worktree and out of `.git`.
+//! - Requests without a meaningful title (empty, or the harness's placeholder) are never
+//!   remembered, so no rule can act as a wildcard.
 
 #[cfg(test)]
 mod tests;
@@ -24,6 +29,17 @@ use om_core::sandbox::SandboxMode;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+
+/// Title a harness uses when the agent gave none. Never part of a remembered rule.
+pub const PLACEHOLDER_TITLE: &str = "Permission requested";
+
+/// Tools whose scope is the paths they touch.
+fn is_file_tool(kind: Option<ToolKind>) -> bool {
+    matches!(
+        kind,
+        Some(ToolKind::Read | ToolKind::Search | ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
+    )
+}
 
 /// Server-wide approval settings.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,9 +136,13 @@ impl ApprovalPolicy {
                     ],
                 )
             };
-            // A remembered reject still applies outside the sandbox; a remembered
-            // allow was given by a member for this exact key, so it does too.
-            if let Some(option_id) = picked {
+            // A remembered reject applies everywhere. A remembered allow for a file tool
+            // stays inside the sandboxed worktree; for anything else it was given by a
+            // member for this exact command or URL, so it applies as is.
+            let allow_in_scope = !r.allow
+                || !is_file_tool(req.kind)
+                || (req.sandbox == SandboxMode::Bwrap && all_within(req.cwd, req.locations));
+            if allow_in_scope && let Some(option_id) = picked {
                 return Verdict::Auto {
                     option_id,
                     rule: format!("remembered:{key}"),
@@ -167,16 +187,19 @@ impl ApprovalPolicy {
 ///
 /// Side-effect-free kinds remember per kind; commands, fetches and anything unknown
 /// remember per exact title (which carries the command line or URL), so "always allow
-/// `cargo test`" never allows `rm -rf`. Requests without a kind are never remembered.
+/// `cargo test`" never allows `rm -rf`. Requests without a kind, and per-title kinds
+/// without a real title, are never remembered.
 pub fn rule_key(kind: Option<ToolKind>, title: &str) -> Option<String> {
     let kind = kind?;
+    let title = title.trim();
     let name = serde_json::to_value(kind)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "other".into());
     Some(match kind {
         ToolKind::Read | ToolKind::Search | ToolKind::Think | ToolKind::Edit => name,
-        _ => format!("{name}:{}", title.trim()),
+        _ if title.is_empty() || title == PLACEHOLDER_TITLE => return None,
+        _ => format!("{name}:{title}"),
     })
 }
 
@@ -209,6 +232,9 @@ pub fn all_within(cwd: &str, locations: &[String]) -> bool {
         return false;
     }
     locations.iter().all(|loc| {
+        if loc.trim().is_empty() || loc.contains('\0') {
+            return false;
+        }
         let p = Path::new(loc);
         let joined = if p.is_absolute() {
             p.to_path_buf()

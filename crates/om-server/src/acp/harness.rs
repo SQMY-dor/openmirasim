@@ -148,7 +148,7 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                         let titles = state.tool_titles.lock().ok()?;
                         titles.get(tool_call_id.as_deref()?).cloned()
                     })
-                    .unwrap_or_else(|| "Permission requested".to_owned());
+                    .unwrap_or_else(|| crate::approval::PLACEHOLDER_TITLE.to_owned());
                 let kind = tool_call
                     .get("kind")
                     .and_then(|k| serde_json::from_value::<ToolKind>(k.clone()).ok());
