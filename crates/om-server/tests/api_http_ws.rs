@@ -38,7 +38,7 @@ async fn setup_server(
     let db = Db::open(&db_path).unwrap();
     let space_id = db.ensure_space("default").await.unwrap();
 
-    let mut registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness::instant()));
     registry.register(Arc::new(AcpHarness::new(
         "fake-acp",

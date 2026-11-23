@@ -157,7 +157,7 @@ async fn agent_runs_end_to_end_inside_bwrap() {
     let worktree = tempfile::tempdir().unwrap();
     let db = Db::open(data.path().join("om.db")).unwrap();
     let space = db.ensure_space("default").await.unwrap();
-    let mut registry = HarnessRegistry::new();
+    let registry = HarnessRegistry::new();
     registry.register(Arc::new(AcpHarness::new(
         "fake",
         CommandSpec::new(env!("CARGO_BIN_EXE_om-fake-acp-agent")),
