@@ -80,6 +80,10 @@ define_id!(
     /// A device token issued to a member.
     TokenId
 );
+define_id!(
+    /// A prompt waiting in a session's queue (W2-3).
+    QueuedPromptId
+);
 
 #[cfg(test)]
 mod tests {

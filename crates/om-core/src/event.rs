@@ -8,7 +8,8 @@
 use crate::approval::{ApprovalDecision, ApprovalRecord};
 use crate::content::{ContentBlock, Prompt};
 use crate::harness::HarnessCapabilities;
-use crate::ids::{ApprovalId, MemberId, SessionId, TurnId};
+use crate::ids::{ApprovalId, MemberId, QueuedPromptId, SessionId, TurnId};
+use crate::queue::{QueueRemoval, QueuedPrompt};
 use crate::session::{SessionConfig, SessionStatus, StopReason};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -107,6 +108,25 @@ pub enum EventPayload {
     },
     /// A session-level error not tied to a turn (e.g. the harness process exited).
     Error { message: String },
+    /// A prompt was added to the session's queue at `position` (0 = next).
+    PromptQueued { queued: QueuedPrompt, position: u32 },
+    /// A prompt left the queue.
+    QueueItemRemoved {
+        queued_id: QueuedPromptId,
+        reason: QueueRemoval,
+    },
+    /// The queue's order changed; `order` is the whole queue, front first.
+    QueueReordered { order: Vec<QueuedPromptId> },
+    /// Queue draining stopped (after a cancel) or resumed.
+    QueuePaused { paused: bool },
+    /// A member's message was injected into the running turn (native steer).
+    PromptSteered {
+        turn_id: TurnId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        member_id: Option<MemberId>,
+        prompt: Prompt,
+    },
 }
 
 impl EventPayload {
@@ -126,6 +146,11 @@ impl EventPayload {
             Self::ApprovalResolved { .. } => "approval_resolved",
             Self::TurnEnded { .. } => "turn_ended",
             Self::Error { .. } => "error",
+            Self::PromptQueued { .. } => "prompt_queued",
+            Self::QueueItemRemoved { .. } => "queue_item_removed",
+            Self::QueueReordered { .. } => "queue_reordered",
+            Self::QueuePaused { .. } => "queue_paused",
+            Self::PromptSteered { .. } => "prompt_steered",
         }
     }
 }

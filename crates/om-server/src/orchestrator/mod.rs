@@ -9,8 +9,8 @@
 //!   broadcast. Subscribers therefore see a gapless stream (see [`Subscription`]).
 //! - Approvals are resolved through the actor with a first-writer-wins update, so two
 //!   members answering at once get exactly one success.
-//! - Phase 0: one prompt at a time per session; a prompt while a turn runs is refused
-//!   with a conflict. Queue & Steer arrives in Phase 2 (W2-3).
+//! - One turn at a time per session. `submit_prompt` refuses a prompt while a turn runs;
+//!   `send_prompt` (W2-3) queues it, puts it next, or steers the running turn.
 
 mod actor;
 mod hub;
@@ -28,7 +28,8 @@ use om_core::approval::{ApprovalDecision, ApprovalRecord};
 use om_core::content::Prompt;
 use om_core::event::EventPayload;
 use om_core::harness::Harness;
-use om_core::ids::{ApprovalId, MemberId, SessionId, SpaceId, TurnId};
+use om_core::ids::{ApprovalId, MemberId, QueuedPromptId, SessionId, SpaceId, TurnId};
+use om_core::queue::{QueuedPrompt, SubmitMode, SubmitOutcome};
 use om_core::sandbox::{DirectSandbox, Sandbox, SandboxMode};
 use om_core::session::{SessionConfig, SessionStatus, SessionSummary};
 use om_core::{CoreError, CoreResult};
@@ -350,6 +351,66 @@ impl Orchestrator {
             reply,
         })
         .await
+    }
+
+    /// Sends a prompt with Queue & Steer semantics (W2-3): starts a turn when idle,
+    /// otherwise queues it, puts it next, or steers the running turn (degrading to
+    /// cancel-and-resend when the harness cannot steer natively).
+    pub async fn send_prompt(
+        &self,
+        id: &SessionId,
+        member: Option<MemberId>,
+        prompt: Prompt,
+        mode: SubmitMode,
+    ) -> CoreResult<SubmitOutcome> {
+        self.send(id, |reply| Command::Send {
+            member,
+            prompt,
+            mode,
+            reply,
+        })
+        .await
+    }
+
+    /// The session's queue, front first.
+    pub async fn queue(&self, id: &SessionId) -> CoreResult<Vec<QueuedPrompt>> {
+        self.send(id, |reply| Command::ListQueue { reply }).await
+    }
+
+    /// Withdraws a queued prompt before it runs.
+    pub async fn withdraw_queued(
+        &self,
+        id: &SessionId,
+        queued_id: QueuedPromptId,
+        member: Option<MemberId>,
+    ) -> CoreResult<()> {
+        self.send(id, |reply| Command::Withdraw {
+            queued_id,
+            member,
+            reply,
+        })
+        .await
+    }
+
+    /// Moves a queued prompt to `position` (0 = next; clamped to the end). Returns the
+    /// new queue.
+    pub async fn move_queued(
+        &self,
+        id: &SessionId,
+        queued_id: QueuedPromptId,
+        position: usize,
+    ) -> CoreResult<Vec<QueuedPrompt>> {
+        self.send(id, |reply| Command::MoveQueued {
+            queued_id,
+            position,
+            reply,
+        })
+        .await
+    }
+
+    /// Resumes a queue paused by a cancel; starts the next prompt if the session is idle.
+    pub async fn resume_queue(&self, id: &SessionId) -> CoreResult<()> {
+        self.send(id, |reply| Command::ResumeQueue { reply }).await
     }
 
     /// Cancels the running turn; `TurnEnded { cancelled }` follows on the stream.
