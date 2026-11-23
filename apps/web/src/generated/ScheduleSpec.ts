@@ -4,4 +4,4 @@ import type { Weekday } from "./Weekday";
 /**
  * When a schedule fires.
  */
-export type ScheduleSpec = { "kind": "once", at: number, } | { "kind": "every", interval_secs: number, start_at: number, } | { "kind": "daily", minute_of_day: number, utc_offset_minutes: number, weekdays: Array<Weekday>, };
+export type ScheduleSpec = { "kind": "once", at: number, } | { "kind": "every", interval_secs: number, start_at: number, } | { "kind": "daily", minute_of_day: number, utc_offset_minutes?: number, weekdays?: Array<Weekday>, };

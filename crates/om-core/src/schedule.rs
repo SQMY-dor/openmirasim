@@ -91,8 +91,10 @@ pub enum ScheduleSpec {
     Daily {
         minute_of_day: u16,
         #[serde(default)]
+        #[ts(as = "Option<i16>", optional)]
         utc_offset_minutes: i16,
         #[serde(default)]
+        #[ts(as = "Option<Vec<Weekday>>", optional)]
         weekdays: Vec<Weekday>,
     },
 }
@@ -190,6 +192,7 @@ pub enum ScheduleTarget {
         session_id: SessionId,
         prompt: Prompt,
         #[serde(default)]
+        #[ts(as = "Option<SubmitMode>", optional)]
         mode: SubmitMode,
     },
 }
@@ -265,10 +268,13 @@ pub struct NewSchedule {
     pub spec: ScheduleSpec,
     pub target: ScheduleTarget,
     #[serde(default = "enabled_default")]
+    #[ts(as = "Option<bool>", optional)]
     pub enabled: bool,
     #[serde(default)]
+    #[ts(as = "Option<MissedRunPolicy>", optional)]
     pub missed: MissedRunPolicy,
     #[serde(default)]
+    #[ts(as = "Option<OverlapPolicy>", optional)]
     pub overlap: OverlapPolicy,
 }
 

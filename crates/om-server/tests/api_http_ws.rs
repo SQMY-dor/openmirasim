@@ -238,6 +238,7 @@ async fn full_rest_ws_approval_and_resume_with_real_fake_acp_agent() {
     // 4. Submit approval-triggering prompt ("tool") to real `om-fake-acp-agent`
     let prompt_req = SubmitPromptRequest {
         prompt: Prompt::text("tool"),
+        mode: None,
     };
     let res = app
         .clone()
@@ -338,6 +339,7 @@ async fn full_rest_ws_approval_and_resume_with_real_fake_acp_agent() {
             Some(
                 serde_json::to_string(&SubmitPromptRequest {
                     prompt: Prompt::text("offline turn"),
+                    mode: None,
                 })
                 .unwrap(),
             ),
@@ -459,6 +461,7 @@ async fn server_restart_recovery_and_resume_over_rest_and_ws() {
                 Some(
                     serde_json::to_string(&SubmitPromptRequest {
                         prompt: Prompt::text("please approve deploy"),
+                        mode: None,
                     })
                     .unwrap(),
                 ),

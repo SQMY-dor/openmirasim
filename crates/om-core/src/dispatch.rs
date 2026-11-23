@@ -44,6 +44,7 @@ pub enum DispatchTarget {
     Session {
         session_id: SessionId,
         #[serde(default)]
+        #[ts(as = "Option<SubmitMode>", optional)]
         mode: SubmitMode,
     },
     /// A new session, given the prompt once its agent is ready.
