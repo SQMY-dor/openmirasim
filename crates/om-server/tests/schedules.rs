@@ -611,7 +611,7 @@ async fn editing_a_schedule_makes_the_editor_its_stored_owner() {
             &f.member,
             new_schedule(
                 "edit-owner",
-                every_minute(0),
+                every_minute(1_000),
                 new_session_target("hold", "a"),
             ),
         )
@@ -623,7 +623,7 @@ async fn editing_a_schedule_makes_the_editor_its_stored_owner() {
             &bob,
             new_schedule(
                 "edit-owner",
-                every_minute(0),
+                every_minute(1_000),
                 new_session_target("hold", "b"),
             ),
         )

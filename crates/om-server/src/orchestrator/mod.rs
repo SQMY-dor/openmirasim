@@ -519,7 +519,10 @@ impl Orchestrator {
             // The actor exited between the lookup and the send: fall through.
         }
         self.db.get_session(id).await?;
-        self.db.append_events(id, vec![payload]).await.map(|_| ())
+        let events = self.db.append_events(id, vec![payload]).await?;
+        // Subscribers of an ended session still get it live.
+        self.hub.publish(&events);
+        Ok(())
     }
 
     /// The session's queue, front first.

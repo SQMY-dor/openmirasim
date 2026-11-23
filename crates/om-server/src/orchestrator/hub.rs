@@ -30,21 +30,45 @@ impl EventHub {
         }
     }
 
-    pub(crate) fn sender(&self, id: &SessionId) -> broadcast::Sender<SessionEvent> {
-        let mut map = self.senders.lock().expect("hub poisoned");
+    /// Subscribes to a session's live events. Done under the map lock, so the channel
+    /// cannot be pruned between lookup and subscribe.
+    pub(crate) fn subscribe(&self, id: &SessionId) -> broadcast::Receiver<SessionEvent> {
+        let mut map = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(id.clone())
             .or_insert_with(|| broadcast::channel(self.capacity).0)
-            .clone()
+            .subscribe()
     }
 
+    /// Broadcasts persisted events. A session's channel is dropped once nobody listens
+    /// (review P1-10), so the map only holds sessions with subscribers; a later
+    /// subscriber replays from storage anyway.
     pub(crate) fn publish(&self, events: &[SessionEvent]) {
-        if let Some(first) = events.first() {
-            let tx = self.sender(&first.session_id);
-            for ev in events {
-                // No receivers is fine: events are already persisted.
-                let _ = tx.send(ev.clone());
-            }
+        let Some(first) = events.first() else {
+            return;
+        };
+        let mut map = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tx) = map.get(&first.session_id) else {
+            return;
+        };
+        if tx.receiver_count() == 0 {
+            map.remove(&first.session_id);
+            return;
         }
+        for ev in events {
+            // No receivers is fine: events are already persisted.
+            let _ = tx.send(ev.clone());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channels(&self) -> usize {
+        self.senders.lock().map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -66,7 +90,7 @@ impl Subscription {
         last_seq: u64,
     ) -> CoreResult<Self> {
         // Subscribe first, then read: see module docs.
-        let rx = hub.sender(&session_id).subscribe();
+        let rx = hub.subscribe(&session_id);
         let mut sub = Self {
             db,
             session_id,
@@ -76,7 +100,14 @@ impl Subscription {
             head_seq: 0,
         };
         sub.refill().await?;
-        sub.head_seq = sub.head_seq.max(last_seq);
+        if last_seq > sub.head_seq {
+            // The client claims events this session never had (another server, a reset
+            // database). Accepting it would silently skip every event up to `last_seq`.
+            return Err(om_core::CoreError::InvalidInput(format!(
+                "last_seq {last_seq} is ahead of the session head {}; resubscribe from 0",
+                sub.head_seq
+            )));
+        }
         Ok(sub)
     }
 
@@ -141,5 +172,40 @@ impl Subscription {
                 Err(broadcast::error::RecvError::Closed) => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use om_core::event::EventPayload;
+
+    fn ev(id: &SessionId, seq: u64) -> SessionEvent {
+        SessionEvent {
+            session_id: id.clone(),
+            seq,
+            ts: 0,
+            payload: EventPayload::Error {
+                message: "x".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn channels_without_listeners_are_dropped() {
+        let hub = EventHub::new(8);
+        let a = SessionId::new();
+        hub.publish(&[ev(&a, 1)]);
+        assert_eq!(hub.channels(), 0, "publishing alone creates nothing");
+        let mut rx = hub.subscribe(&a);
+        hub.publish(&[ev(&a, 2)]);
+        assert_eq!(rx.try_recv().unwrap().seq, 2);
+        drop(rx);
+        hub.publish(&[ev(&a, 3)]);
+        assert_eq!(
+            hub.channels(),
+            0,
+            "the last listener leaving frees the channel"
+        );
     }
 }
