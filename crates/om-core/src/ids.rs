@@ -84,6 +84,14 @@ define_id!(
     /// A prompt waiting in a session's queue (W2-3).
     QueuedPromptId
 );
+define_id!(
+    /// A schedule that sends prompts on a timetable (W4-1).
+    ScheduleId
+);
+define_id!(
+    /// One fire of a schedule (W4-1).
+    ScheduleRunId
+);
 
 #[cfg(test)]
 mod tests {

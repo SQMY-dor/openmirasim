@@ -14,6 +14,8 @@
 //! - [`api`]: REST request/response DTOs and the `/ws/events` protocol.
 //! - [`harness`]: the `Harness` trait every agent adapter implements.
 //! - [`sandbox`]: the `Sandbox` trait that wraps agent processes.
+//! - [`queue`]: Queue & Steer submit modes (W2-3).
+//! - [`schedule`]: schedules that send prompts on a timetable (W4-1).
 //! - [`error`]: shared error type.
 
 pub mod api;
@@ -24,9 +26,10 @@ pub mod error;
 pub mod event;
 pub mod harness;
 pub mod ids;
-pub mod queue;
 pub mod proxy;
+pub mod queue;
 pub mod sandbox;
+pub mod schedule;
 pub mod session;
 pub mod workspace;
 

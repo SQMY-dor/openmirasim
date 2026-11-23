@@ -14,6 +14,7 @@ mod members;
 pub use audit::{ApprovalRule, AuditEntry};
 pub use members::TOKEN_TOUCH_INTERVAL_MS;
 mod migrations;
+mod schedules;
 #[cfg(test)]
 mod tests;
 mod workspaces;

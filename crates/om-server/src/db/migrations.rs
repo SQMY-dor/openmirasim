@@ -127,4 +127,35 @@ pub(super) const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX audit_logs_actor ON audit_logs(actor, ts);
     "#,
+    // v5 (W4-1): schedules and their runs.
+    r#"
+    CREATE TABLE schedules (
+        id           TEXT PRIMARY KEY,
+        space_id     TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        spec         TEXT NOT NULL,
+        target       TEXT NOT NULL,
+        created_by   TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        enabled      INTEGER NOT NULL,
+        missed       TEXT NOT NULL,
+        overlap      TEXT NOT NULL,
+        next_run_at  INTEGER,
+        last_run_at  INTEGER,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL,
+        UNIQUE (space_id, name)
+    );
+    CREATE INDEX schedules_due ON schedules(next_run_at) WHERE enabled = 1;
+
+    CREATE TABLE schedule_runs (
+        id             TEXT PRIMARY KEY,
+        schedule_id    TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+        scheduled_for  INTEGER NOT NULL,
+        fired_at       INTEGER NOT NULL,
+        outcome        TEXT NOT NULL,
+        session_id     TEXT,
+        manual         INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX schedule_runs_schedule ON schedule_runs(schedule_id, fired_at DESC);
+    "#,
 ];
