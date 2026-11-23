@@ -92,6 +92,14 @@ define_id!(
     /// One fire of a schedule (W4-1).
     ScheduleRunId
 );
+define_id!(
+    /// A goal driving a session in a loop until it is met (W4-1).
+    GoalId
+);
+define_id!(
+    /// One session handing a prompt to another (W4-1).
+    DispatchId
+);
 
 #[cfg(test)]
 mod tests {

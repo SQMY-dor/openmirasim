@@ -1,4 +1,7 @@
-//! Schedules runtime (W4-1): fires schedules on their timetable as the member who owns
+//! Schedules runtime (W4-1). Goals ([`GoalRunner`]) and Session-to-Session dispatch
+//! ([`Dispatcher`]) live in submodules.
+//!
+//! [`Scheduler`] fires schedules on their timetable as the member who owns
 //! them.
 //!
 //! - Due schedules are found in the database (`next_run_at <= now`) and claimed with a
@@ -33,6 +36,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+
+mod dispatch;
+mod goals;
+
+pub use dispatch::Dispatcher;
+pub use goals::GoalRunner;
 
 /// A fire later than this after its slot counts as missed (server was down or busy).
 pub const MISSED_GRACE_MS: i64 = 60_000;
@@ -388,7 +397,9 @@ impl Scheduler {
                     Ok(summary) => summary.id,
                     Err(e) => return failed(e, None),
                 };
-                if let Err(e) = self.wait_ready(&session_id).await {
+                if let Err(e) =
+                    wait_ready(&self.inner.orch, &session_id, self.inner.ready_timeout).await
+                {
                     return failed(e, Some(session_id));
                 }
                 match self
@@ -413,36 +424,40 @@ impl Scheduler {
             Ok(SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval)
         )
     }
+}
 
-    /// Waits until the new session's agent is idle.
-    async fn wait_ready(&self, id: &SessionId) -> CoreResult<()> {
-        let mut sub = self.inner.orch.subscribe(id, 0).await?;
-        let wait = async {
-            loop {
-                let Some(ev) = sub.next().await? else {
-                    return Err(CoreError::Harness(
-                        "session ended before it was ready".into(),
-                    ));
-                };
-                if let EventPayload::StatusChanged { to, .. } = ev.payload {
-                    match to {
-                        SessionStatus::Idle => return Ok(()),
-                        SessionStatus::Failed | SessionStatus::Closed => {
-                            return Err(CoreError::Harness(format!(
-                                "session became {} before it was ready",
-                                serde_json::to_value(to)
-                                    .ok()
-                                    .and_then(|v| v.as_str().map(str::to_owned))
-                                    .unwrap_or_default()
-                            )));
-                        }
-                        _ => {}
+/// Waits until the new session's agent is idle.
+pub(crate) async fn wait_ready(
+    orch: &Orchestrator,
+    id: &SessionId,
+    timeout: Duration,
+) -> CoreResult<()> {
+    let mut sub = orch.subscribe(id, 0).await?;
+    let wait = async {
+        loop {
+            let Some(ev) = sub.next().await? else {
+                return Err(CoreError::Harness(
+                    "session ended before it was ready".into(),
+                ));
+            };
+            if let EventPayload::StatusChanged { to, .. } = ev.payload {
+                match to {
+                    SessionStatus::Idle => return Ok(()),
+                    SessionStatus::Failed | SessionStatus::Closed => {
+                        return Err(CoreError::Harness(format!(
+                            "session became {} before it was ready",
+                            serde_json::to_value(to)
+                                .ok()
+                                .and_then(|v| v.as_str().map(str::to_owned))
+                                .unwrap_or_default()
+                        )));
                     }
+                    _ => {}
                 }
             }
-        };
-        tokio::time::timeout(self.inner.ready_timeout, wait)
-            .await
-            .map_err(|_| CoreError::Harness("agent did not become ready in time".into()))?
-    }
+        }
+    };
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| CoreError::Harness("agent did not become ready in time".into()))?
 }
