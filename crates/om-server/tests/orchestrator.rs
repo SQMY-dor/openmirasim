@@ -21,7 +21,7 @@ struct Fixture {
 }
 
 fn registry() -> HarnessRegistry {
-    let r = HarnessRegistry::new();
+    let mut r = HarnessRegistry::new();
     r.register(Arc::new(AcpHarness::new(
         "fake",
         CommandSpec::new(env!("CARGO_BIN_EXE_om-fake-acp-agent")),

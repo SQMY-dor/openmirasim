@@ -581,7 +581,7 @@ impl WorkspaceManager {
             .filter_map(|p| {
                 // `symlink_metadata`: never follow links out of the checkout.
                 let meta = std::fs::symlink_metadata(root.join(&p)).ok()?;
-                (!meta.is_dir()).then(|| WorktreeEntry {
+                (!meta.is_dir()).then_some(WorktreeEntry {
                     path: p,
                     size: meta.len(),
                 })
