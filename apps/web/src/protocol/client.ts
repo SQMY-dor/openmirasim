@@ -1,14 +1,22 @@
 import type {
   ApprovalDecision,
   ApprovalId,
+  ApprovalRuleView,
   ConnectionState,
   CreateSessionRequest,
   HarnessDescriptor,
+  QueuedPromptId,
   ServerInfo,
   SessionEvent,
   SessionId,
   SessionSummary,
+  SubmitMode,
+  SubmitOutcome,
   SubmitPromptResponse,
+  WorkspaceSummary,
+  WorktreeDiff,
+  WorktreeEntry,
+  WorktreeFileContent,
 } from "./types";
 
 export interface EventSubscriptionHandlers {
@@ -33,6 +41,12 @@ export interface OpenMirasimClient {
   /** List registered harnesses and their capabilities (`GET /api/v1/harnesses`). */
   listHarnesses(): Promise<HarnessDescriptor[]>;
 
+  /** List registered Git workspaces (`GET /api/v1/workspaces`). */
+  listWorkspaces(): Promise<WorkspaceSummary[]>;
+
+  /** Register a local Git repository as a workspace (`POST /api/v1/workspaces`). */
+  registerWorkspace(name: string, repoPath: string): Promise<WorkspaceSummary>;
+
   /** List all persisted sessions (`GET /api/v1/sessions`). */
   listSessions(): Promise<SessionSummary[]>;
 
@@ -45,11 +59,12 @@ export interface OpenMirasimClient {
   /** Fetch all historical events strictly after `afterSeq` (`GET /api/v1/sessions/:id/events`). */
   fetchEvents(sessionId: SessionId, afterSeq: number): Promise<SessionEvent[]>;
 
-  /** Submit a prompt (`POST /api/v1/sessions/:id/prompts`). */
+  /** Submit a prompt (`POST /api/v1/sessions/:id/prompts`, supports optional W2-3 `mode`). */
   submitPrompt(
     sessionId: SessionId,
-    text: string
-  ): Promise<SubmitPromptResponse>;
+    text: string,
+    mode?: SubmitMode
+  ): Promise<SubmitPromptResponse | SubmitOutcome>;
 
   /** Cancel an in-flight turn (`POST /api/v1/sessions/:id/cancel`). */
   cancelSession(sessionId: SessionId): Promise<void>;
@@ -62,6 +77,37 @@ export interface OpenMirasimClient {
     approvalId: ApprovalId,
     decision: ApprovalDecision
   ): Promise<void>;
+
+  /** Withdraw a queued prompt (`DELETE /api/v1/sessions/:id/queue/:qid`). */
+  withdrawQueued(sessionId: SessionId, queuedId: QueuedPromptId): Promise<void>;
+
+  /** Move a queued prompt to `position` (`POST /api/v1/sessions/:id/queue/:qid/move`). */
+  moveQueued(
+    sessionId: SessionId,
+    queuedId: QueuedPromptId,
+    position: number
+  ): Promise<void>;
+
+  /** Resume a paused queue (`POST /api/v1/sessions/:id/queue/resume`). */
+  resumeQueue(sessionId: SessionId): Promise<void>;
+
+  /** Fetch live Git diff for a session's worktree (`GET /api/v1/sessions/:id/diff`). */
+  getWorktreeDiff(sessionId: SessionId): Promise<WorktreeDiff>;
+
+  /** List files in a session's worktree (`GET /api/v1/sessions/:id/files`). */
+  listWorktreeFiles(sessionId: SessionId): Promise<WorktreeEntry[]>;
+
+  /** Read a relative file inside a session's worktree (`GET /api/v1/sessions/:id/file`). */
+  readWorktreeFile(
+    sessionId: SessionId,
+    path: string
+  ): Promise<WorktreeFileContent>;
+
+  /** List remembered approval rules on a session (`GET /api/v1/sessions/:id/approval-rules`). */
+  listApprovalRules(sessionId: SessionId): Promise<ApprovalRuleView[]>;
+
+  /** Clear remembered approval rules on a session (`DELETE /api/v1/sessions/:id/approval-rules`). */
+  clearApprovalRules(sessionId: SessionId): Promise<number>;
 
   /**
    * Subscribe to `/ws/events` using the `Hello -> Welcome -> Subscribe { last_seq }` handshake.

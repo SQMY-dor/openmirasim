@@ -586,3 +586,410 @@ async fn static_spa_fallback_serves_index_without_swallowing_api_routes() {
         .unwrap();
     assert_eq!(api_res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn phase1_workspaces_worktree_queue_rules_probe_and_audit_routes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("sample-repo");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Initialize a real temporary Git repository
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo_dir)
+            .output()
+            .expect("git must be installed");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "test@openmirasim.dev"]);
+    git(&["config", "user.name", "OpenMirasim Test"]);
+    std::fs::write(repo_dir.join("hello.txt"), "initial\n").unwrap();
+    git(&["add", "hello.txt"]);
+    git(&["commit", "-m", "initial commit"]);
+
+    let db = Db::open(data_dir.join("phase1.db")).unwrap();
+    let space_id = db.ensure_space("default").await.unwrap();
+    let workspaces = om_server::workspace::WorkspaceManager::new(
+        db.clone(),
+        om_server::workspace::WorkspaceConfig::new(&data_dir),
+    )
+    .unwrap();
+    let registry = om_server::harness::HarnessRegistry::with_phase1_defaults(false);
+    // Replace mock with instant mock for deterministic test speed
+    registry.register(Arc::new(MockHarness::instant()));
+
+    let orchestrator = Orchestrator::new(
+        db,
+        registry,
+        OrchestratorConfig {
+            allow_direct_sandbox: true,
+            ..Default::default()
+        },
+    )
+    .with_workspaces(workspaces);
+
+    let app = build_router(AppState {
+        orchestrator,
+        config: ApiConfig {
+            auth_token: TEST_TOKEN.into(),
+            default_space_id: space_id,
+            static_dir: None,
+            allow_cors_origin: None,
+        },
+    });
+    let addr = spawn_tcp_server(app.clone()).await;
+
+    // 1. Harness probe & provider routes
+    let res = app
+        .clone()
+        .oneshot(authed_req("GET", "/api/v1/harnesses/probe", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let probed: serde_json::Value = read_body_json(res).await;
+    let probe_ids: Vec<&str> = probed["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["id"].as_str())
+        .collect();
+    for expected in ["mock", "opencode", "dsh", "cc", "codexcli"] {
+        assert!(
+            probe_ids.contains(&expected),
+            "missing probe for {expected}"
+        );
+    }
+
+    let res = app
+        .clone()
+        .oneshot(authed_req("GET", "/api/v1/providers", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. Register & list Git workspace
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            "/api/v1/workspaces",
+            Some(
+                serde_json::json!({
+                    "name": "demo-repo",
+                    "repo_path": repo_dir.to_string_lossy(),
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let ws: serde_json::Value = read_body_json(res).await;
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+
+    let res = app
+        .clone()
+        .oneshot(authed_req("GET", "/api/v1/workspaces", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ws_list: serde_json::Value = read_body_json(res).await;
+    assert_eq!(ws_list["workspaces"].as_array().unwrap().len(), 1);
+
+    // 3. Create session bound to workspace -> auto-provisions worktree
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            "/api/v1/sessions",
+            Some(
+                serde_json::to_string(&CreateSessionRequest {
+                    config: SessionConfig {
+                        harness_id: "mock".into(),
+                        cwd: String::new(),
+                        workspace_id: Some(ws_id.clone().into()),
+                        model: None,
+                        sandbox: SandboxMode::Direct,
+                        title: Some("Phase 1 Route Test".into()),
+                    },
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let created: SessionSummary = read_body_json(res).await;
+    let sid = created.id.as_str().to_string();
+
+    // Wait for Idle via WS
+    let mut ws_conn = connect_ws(addr).await;
+    ws_send(
+        &mut ws_conn,
+        &ClientMessage::Subscribe {
+            session_id: created.id.clone(),
+            last_seq: 0,
+        },
+    )
+    .await;
+    let _ = ws_recv(&mut ws_conn).await;
+    loop {
+        if let ServerMessage::Event { event } = ws_recv(&mut ws_conn).await
+            && matches!(
+                event.payload,
+                EventPayload::StatusChanged {
+                    to: SessionStatus::Idle,
+                    ..
+                }
+            )
+        {
+            break;
+        }
+    }
+
+    // 4. Worktree inspection, file read, live diff
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/worktree"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let wt: serde_json::Value = read_body_json(res).await;
+    let wt_path = PathBuf::from(wt["path"].as_str().unwrap());
+
+    std::fs::write(wt_path.join("hello.txt"), "initial\nupdated in worktree\n").unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/files"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let files: serde_json::Value = read_body_json(res).await;
+    assert!(
+        files["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "hello.txt")
+    );
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/file?path=hello.txt"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let file_body: serde_json::Value = read_body_json(res).await;
+    assert!(
+        file_body["content"]
+            .as_str()
+            .unwrap()
+            .contains("updated in worktree")
+    );
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/diff"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let diff: serde_json::Value = read_body_json(res).await;
+    assert!(
+        diff["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+updated in worktree")
+    );
+
+    // 5. W2-3 Queue: start an approval-gated turn so the session stays busy deterministically
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            &format!("/api/v1/sessions/{sid}/prompts"),
+            Some(
+                serde_json::json!({
+                    "prompt": { "content": [{ "type": "text", "text": "please approve deploy" }] },
+                    "mode": "queue",
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+
+    let approval_id = loop {
+        if let ServerMessage::Event { event } = ws_recv(&mut ws_conn).await
+            && let EventPayload::ApprovalRequested { approval, .. } = event.payload
+        {
+            break approval.id;
+        }
+    };
+
+    // Enqueue two follow-up prompts while session is WaitingApproval
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            &format!("/api/v1/sessions/{sid}/prompts"),
+            Some(
+                serde_json::json!({
+                    "prompt": { "content": [{ "type": "text", "text": "second" }] },
+                    "mode": "queue",
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let q1: serde_json::Value = read_body_json(res).await;
+    assert_eq!(q1["outcome"], "queued");
+    let q1_id = q1["queued_id"].as_str().unwrap().to_string();
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            &format!("/api/v1/sessions/{sid}/prompts"),
+            Some(
+                serde_json::json!({
+                    "prompt": { "content": [{ "type": "text", "text": "third-next" }] },
+                    "mode": "next",
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let q2: serde_json::Value = read_body_json(res).await;
+    assert_eq!(q2["outcome"], "queued");
+    let q2_id = q2["queued_id"].as_str().unwrap().to_string();
+
+    // List queue -> `next` prompt is at index 0
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/queue"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let queue: serde_json::Value = read_body_json(res).await;
+    let items = queue["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], q2_id);
+    assert_eq!(items[1]["id"], q1_id);
+
+    // Move q1 to front (index 0) and withdraw q2
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            &format!("/api/v1/sessions/{sid}/queue/{q1_id}/move"),
+            Some(serde_json::json!({ "position": 0 }).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let moved: serde_json::Value = read_body_json(res).await;
+    assert_eq!(moved["items"][0]["id"], q1_id);
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "DELETE",
+            &format!("/api/v1/sessions/{sid}/queue/{q2_id}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // 6. Resolve approval with `allow_always` -> verify remembered approval rule + clear
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "POST",
+            &format!("/api/v1/approvals/{approval_id}/resolve"),
+            Some(
+                serde_json::to_string(&ResolveApprovalRequest {
+                    decision: ApprovalDecision::Selected {
+                        option_id: "allow_always".into(),
+                    },
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "GET",
+            &format!("/api/v1/sessions/{sid}/approval-rules"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let rules: serde_json::Value = read_body_json(res).await;
+    assert_eq!(rules["rules"].as_array().unwrap().len(), 1);
+
+    let res = app
+        .clone()
+        .oneshot(authed_req(
+            "DELETE",
+            &format!("/api/v1/sessions/{sid}/approval-rules"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let cleared: serde_json::Value = read_body_json(res).await;
+    assert_eq!(cleared["cleared"], 1);
+
+    // 7. Audit log route returns structured entries
+    let res = app
+        .oneshot(authed_req("GET", "/api/v1/audit?limit=20", None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let audit: serde_json::Value = read_body_json(res).await;
+    assert!(
+        !audit["entries"].as_array().unwrap().is_empty(),
+        "expected audit entries after approval resolution"
+    );
+}

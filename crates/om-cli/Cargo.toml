@@ -8,3 +8,13 @@ description = "CLI, scriptable ctl control plane, and TUI client for OpenMirasim
 
 [dependencies]
 om-core.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+om-server = { path = "../om-server" }
+tempfile.workspace = true

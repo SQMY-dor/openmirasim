@@ -114,6 +114,23 @@ export interface HarnessDescriptor {
   capabilities: HarnessCapabilities;
 }
 
+/** Matches `GET /api/v1/sessions/:id/approval-rules`. */
+export interface ApprovalRuleView {
+  rule_key: string;
+  allow: boolean;
+  option_kind: import("../generated/ApprovalOptionKind").ApprovalOptionKind;
+  created_by?: import("../generated/MemberId").MemberId;
+  created_at: number;
+}
+
+/** Matches `GET /api/v1/sessions/:id/file?path=...`. */
+export interface WorktreeFileContent {
+  path: string;
+  content: string;
+  utf8: boolean;
+  size: number;
+}
+
 export interface HarnessCatalogEntry {
   id: string;
   label: string;
