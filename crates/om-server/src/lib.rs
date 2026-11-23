@@ -6,4 +6,5 @@
 
 pub mod acp;
 pub mod db;
+pub mod harness;
 pub mod stream;
