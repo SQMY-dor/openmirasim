@@ -20,7 +20,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::db::{AuditEntry, Db};
+use crate::db::{AuditEntry, Authorize, Db};
 use om_core::auth::{
     Action, DeviceTokenRecord, IssuedToken, MemberRecord, Principal, Role, TOKEN_PREFIX,
 };
@@ -68,6 +68,11 @@ fn unauthenticated() -> CoreError {
 fn denied(p: &Principal, what: impl std::fmt::Display) -> CoreError {
     CoreError::Forbidden(format!("role {:?} may not {what}", p.role))
 }
+
+/// Shortest lifetime a token may be issued with.
+pub const MIN_TOKEN_TTL: Duration = Duration::from_millis(1);
+/// Most live (unrevoked, unexpired) tokens one member may hold.
+pub const MAX_LIVE_TOKENS_PER_MEMBER: u32 = 50;
 
 /// Membership, roles and tokens for one server.
 #[derive(Clone)]
@@ -160,8 +165,22 @@ impl Auth {
         if !p.role.can_assign(role) {
             return Err(denied(p, format!("add a {role:?}")));
         }
+        // Checked again inside the write, against the actor's current role.
+        let auth = Authorize::new(p.member_id.clone(), move |actor, _| {
+            if actor.role.can_assign(role) {
+                Ok(())
+            } else {
+                Err(CoreError::Forbidden(format!("add a {role:?}")))
+            }
+        });
         self.db
-            .create_member(&p.space_id, display_name, role, Some(p.member_id.clone()))
+            .create_member_checked(
+                &p.space_id,
+                display_name,
+                role,
+                Some(p.member_id.clone()),
+                Some(auth),
+            )
             .await
     }
 
@@ -179,8 +198,20 @@ impl Auth {
         if !self_owner && !(p.role.can_manage(target.role) && p.role.can_assign(role)) {
             return Err(denied(p, format!("change a {:?} to {role:?}", target.role)));
         }
+        let auth = Authorize::new(p.member_id.clone(), move |actor, target| {
+            let target = target.expect("role change has a target");
+            let self_owner = target.id == actor.id && actor.role == Role::Owner;
+            if self_owner || (actor.role.can_manage(target.role) && actor.role.can_assign(role)) {
+                Ok(())
+            } else {
+                Err(CoreError::Forbidden(format!(
+                    "change a {:?} to {role:?}",
+                    target.role
+                )))
+            }
+        });
         self.db
-            .set_member_role(member_id, role, Some(p.member_id.clone()))
+            .set_member_role_checked(member_id, role, Some(p.member_id.clone()), Some(auth))
             .await
     }
 
@@ -196,8 +227,17 @@ impl Auth {
         if !self_owner && !p.role.can_manage(target.role) {
             return Err(denied(p, format!("disable a {:?}", target.role)));
         }
+        let auth = Authorize::new(p.member_id.clone(), move |actor, target| {
+            let target = target.expect("disable has a target");
+            let self_owner = target.id == actor.id && actor.role == Role::Owner;
+            if self_owner || actor.role.can_manage(target.role) {
+                Ok(())
+            } else {
+                Err(CoreError::Forbidden(format!("disable a {:?}", target.role)))
+            }
+        });
         self.db
-            .disable_member(member_id, Some(p.member_id.clone()))
+            .disable_member_checked(member_id, Some(p.member_id.clone()), Some(auth))
             .await
     }
 
@@ -212,24 +252,44 @@ impl Auth {
     ) -> CoreResult<IssuedToken> {
         let target = self.member_in_space(p, member_id).await?;
         self.ensure_manages(p, &target, "issue a token for")?;
-        let expires_at = match ttl {
-            Some(ttl) if ttl.is_zero() => {
-                return Err(CoreError::InvalidInput("token ttl must be positive".into()));
+        let now = now_ms();
+        let mut expires_at = match ttl {
+            Some(ttl) if ttl < MIN_TOKEN_TTL => {
+                return Err(CoreError::InvalidInput(format!(
+                    "token ttl must be at least {MIN_TOKEN_TTL:?}"
+                )));
             }
-            Some(ttl) => {
-                Some(now_ms().saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64))
-            }
+            Some(ttl) => Some(now.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64)),
             None => None,
         };
+        // A token can never mint one that outlives it.
+        if let Ok(own) = self.db.get_token(&p.token_id).await
+            && let Some(own_exp) = own.expires_at
+        {
+            expires_at = Some(expires_at.map_or(own_exp, |e| e.min(own_exp)));
+        }
+        let auth = Authorize::new(p.member_id.clone(), |actor, target| {
+            let target = target.expect("token has an owner");
+            if target.id == actor.id || actor.role.can_manage(target.role) {
+                Ok(())
+            } else {
+                Err(CoreError::Forbidden(format!(
+                    "issue a token for a {:?}",
+                    target.role
+                )))
+            }
+        });
         let secret = generate_secret()?;
         let token = self
             .db
-            .create_token(
+            .create_token_checked(
                 member_id,
                 hash_secret(&secret),
                 label,
                 expires_at,
                 Some(p.member_id.clone()),
+                Some(auth),
+                Some(MAX_LIVE_TOKENS_PER_MEMBER),
             )
             .await?;
         Ok(IssuedToken { token, secret })
@@ -257,8 +317,19 @@ impl Auth {
             .await
             .map_err(|_| CoreError::NotFound(format!("token {token_id}")))?;
         self.ensure_manages(p, &owner, "revoke a token of")?;
+        let auth = Authorize::new(p.member_id.clone(), |actor, owner| {
+            let owner = owner.expect("token has an owner");
+            if owner.id == actor.id || actor.role.can_manage(owner.role) {
+                Ok(())
+            } else {
+                Err(CoreError::Forbidden(format!(
+                    "revoke a token of a {:?}",
+                    owner.role
+                )))
+            }
+        });
         self.db
-            .revoke_token(token_id, Some(p.member_id.clone()))
+            .revoke_token_checked(token_id, Some(p.member_id.clone()), Some(auth))
             .await
     }
 
