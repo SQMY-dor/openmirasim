@@ -3,6 +3,7 @@ import type {
   ApprovalId,
   ConnectionState,
   CreateSessionRequest,
+  HarnessDescriptor,
   ServerInfo,
   SessionEvent,
   SessionId,
@@ -29,11 +30,17 @@ export interface OpenMirasimClient {
   /** Verify token against the server and return server metadata. */
   connect(): Promise<ServerInfo>;
 
+  /** List registered harnesses and their capabilities (`GET /api/v1/harnesses`). */
+  listHarnesses(): Promise<HarnessDescriptor[]>;
+
   /** List all persisted sessions (`GET /api/v1/sessions`). */
   listSessions(): Promise<SessionSummary[]>;
 
   /** Create a new session (`POST /api/v1/sessions`). */
   createSession(req: CreateSessionRequest): Promise<SessionSummary>;
+
+  /** Close a session permanently (`DELETE /api/v1/sessions/:id`). */
+  closeSession(sessionId: SessionId): Promise<void>;
 
   /** Fetch all historical events strictly after `afterSeq` (`GET /api/v1/sessions/:id/events`). */
   fetchEvents(sessionId: SessionId, afterSeq: number): Promise<SessionEvent[]>;

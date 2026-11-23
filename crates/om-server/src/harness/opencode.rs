@@ -14,7 +14,24 @@ use tokio::process::Command;
 /// Environment variable overriding the `opencode` binary path.
 pub const ENV_OPENCODE_BIN: &str = "OM_OPENCODE_BIN";
 
-/// BYOK / model-provider env vars safely forwarded when present in the server host env.
+/// Non-secret host environment variables safe to preserve when `clear_env` is enabled
+/// under `DirectSandbox` (under `BwrapSandbox`, the sandbox itself manages env isolation).
+const SAFE_BASE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "USER",
+    "TERM",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// BYOK / model-provider env vars forwarded only when the server is NOT using [`crate::proxy::KeyProxy`].
 const FORWARDED_PROVIDER_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -52,15 +69,28 @@ impl Default for OpenCodeConfig {
 
 impl OpenCodeConfig {
     /// Builds configuration from host environment variables (`OM_OPENCODE_BIN` plus
-    /// allowlisted BYOK provider keys). Server auth tokens are intentionally excluded.
+    /// allowlisted BYOK provider keys). Server auth tokens (`OM_*`) are never forwarded.
     pub fn from_env() -> Self {
+        let mut cfg = Self::from_env_for_proxy();
+        cfg.env = FORWARDED_PROVIDER_ENV
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|val| ((*key).to_string(), val)))
+            .collect();
+        cfg
+    }
+
+    /// Builds configuration from `OM_OPENCODE_BIN` **without** forwarding raw host API keys.
+    ///
+    /// Use this when [`crate::proxy::KeyProxy`] or strict [`crate::sandbox::BwrapSandbox`]
+    /// key isolation is active so raw upstream secrets are never placed in `CommandSpec::env`.
+    pub fn from_env_for_proxy() -> Self {
         let binary = std::env::var(ENV_OPENCODE_BIN)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "opencode".into());
 
-        let env = FORWARDED_PROVIDER_ENV
+        let env = ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"]
             .iter()
             .filter_map(|key| std::env::var(key).ok().map(|val| ((*key).to_string(), val)))
             .collect();
@@ -74,8 +104,17 @@ impl OpenCodeConfig {
     }
 
     /// Builds the [`CommandSpec`] executed inside the session sandbox.
+    ///
+    /// Always sets `clear_env = true` and copies only [`SAFE_BASE_ENV`] plus explicit `self.env`
+    /// so `OM_TOKEN` and other server secrets never leak under `DirectSandbox`.
     pub fn command_spec(&self) -> CommandSpec {
         let mut spec = CommandSpec::new(&self.binary).arg("acp");
+        spec.clear_env = true;
+        for key in SAFE_BASE_ENV {
+            if let Ok(val) = std::env::var(key) {
+                spec = spec.env(*key, val);
+            }
+        }
         for arg in &self.extra_args {
             spec = spec.arg(arg);
         }

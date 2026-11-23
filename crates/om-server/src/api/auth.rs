@@ -4,19 +4,17 @@
 
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 /// Constant-time equality check for secret token strings.
+///
+/// Compares fixed-length SHA-256 digests via [`subtle::ConstantTimeEq`] so neither byte
+/// differences nor length differences leak timing information.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
-    let mut diff = ab.len() ^ bb.len();
-    let max_len = ab.len().max(bb.len());
-    for i in 0..max_len {
-        let x = ab.get(i).copied().unwrap_or(0);
-        let y = bb.get(i).copied().unwrap_or(0);
-        diff |= usize::from(x ^ y);
-    }
-    diff == 0
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    bool::from(ha.as_slice().ct_eq(hb.as_slice()))
 }
 
 /// Extracts `<token>` from `Authorization: Bearer <token>` (case-insensitive scheme).

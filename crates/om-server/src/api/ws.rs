@@ -8,6 +8,9 @@
 //!    - Sends `Subscribed { session_id, head_seq: sub.head_seq() }`.
 //!    - Streams every event with `seq > last_seq` via `sub.next().await` (backlog + live,
 //!      self-healing from SQLite on lag).
+//!    - Outbound frames are bounded; if a slow/stalled client fills the event queue, the
+//!      server emits `Resync { session_id }` and ends that subscription so the client can
+//!      re-subscribe from its last applied `seq` without unbounded server memory growth.
 //! 3. Client may send `Unsubscribe { session_id }` or `Ping { nonce }` at any time.
 
 use super::AppState;
@@ -22,10 +25,18 @@ use om_core::ids::SessionId;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 /// Current `/ws/events` protocol version.
 pub const WS_PROTOCOL_VERSION: u32 = 1;
+
+/// Bounded per-connection outbound buffer for session event frames.
+const WS_EVENT_QUEUE_CAPACITY: usize = 256;
+
+/// Bounded per-connection outbound buffer for control frames (`Welcome`, `Subscribed`,
+/// `Resync`, `Error`, `Pong`).
+const WS_CONTROL_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
@@ -50,12 +61,28 @@ pub async fn ws_events_handler(
         .into_response()
 }
 
+async fn send_control(tx: &mpsc::Sender<ServerMessage>, msg: ServerMessage) -> bool {
+    tx.send(msg).await.is_ok()
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ServerMessage>(WS_CONTROL_QUEUE_CAPACITY);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<ServerMessage>(WS_EVENT_QUEUE_CAPACITY);
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
+        loop {
+            let next_msg = tokio::select! {
+                biased;
+                msg = ctrl_rx.recv() => match msg {
+                    Some(m) => Some(m),
+                    None => break,
+                },
+                msg = evt_rx.recv() => msg,
+            };
+            let Some(msg) = next_msg else {
+                break;
+            };
             let Ok(text) = serde_json::to_string(&msg) else {
                 continue;
             };
@@ -74,13 +101,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let msg: ClientMessage = match serde_json::from_str(&text) {
                     Ok(m) => m,
                     Err(e) => {
-                        let _ = out_tx.send(ServerMessage::Error {
-                            session_id: None,
-                            error: ApiError {
-                                code: ApiErrorCode::InvalidInput,
-                                message: format!("invalid client message: {e}"),
+                        if !send_control(
+                            &ctrl_tx,
+                            ServerMessage::Error {
+                                session_id: None,
+                                error: ApiError {
+                                    code: ApiErrorCode::InvalidInput,
+                                    message: format!("invalid client message: {e}"),
+                                },
                             },
-                        });
+                        )
+                        .await
+                        {
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -88,38 +122,58 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 match msg {
                     ClientMessage::Hello { protocol_version } => {
                         if protocol_version != WS_PROTOCOL_VERSION {
-                            let _ = out_tx.send(ServerMessage::Error {
-                                session_id: None,
-                                error: ApiError {
-                                    code: ApiErrorCode::Unsupported,
-                                    message: format!(
-                                        "unsupported protocol_version {protocol_version} (expected {WS_PROTOCOL_VERSION})"
-                                    ),
+                            let _ = send_control(
+                                &ctrl_tx,
+                                ServerMessage::Error {
+                                    session_id: None,
+                                    error: ApiError {
+                                        code: ApiErrorCode::Unsupported,
+                                        message: format!(
+                                            "unsupported protocol_version {protocol_version} (expected {WS_PROTOCOL_VERSION})"
+                                        ),
+                                    },
                                 },
-                            });
+                            )
+                            .await;
                             break;
                         }
                         welcomed = true;
-                        let _ = out_tx.send(ServerMessage::Welcome {
-                            protocol_version: WS_PROTOCOL_VERSION,
-                            server_version: env!("CARGO_PKG_VERSION").to_string(),
-                        });
+                        if !send_control(
+                            &ctrl_tx,
+                            ServerMessage::Welcome {
+                                protocol_version: WS_PROTOCOL_VERSION,
+                                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                            },
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                     ClientMessage::Ping { nonce } => {
-                        let _ = out_tx.send(ServerMessage::Pong { nonce });
+                        if !send_control(&ctrl_tx, ServerMessage::Pong { nonce }).await {
+                            break;
+                        }
                     }
                     ClientMessage::Subscribe {
                         session_id,
                         last_seq,
                     } => {
                         if !welcomed {
-                            let _ = out_tx.send(ServerMessage::Error {
-                                session_id: Some(session_id),
-                                error: ApiError {
-                                    code: ApiErrorCode::InvalidInput,
-                                    message: "must send Hello before Subscribe".into(),
+                            if !send_control(
+                                &ctrl_tx,
+                                ServerMessage::Error {
+                                    session_id: Some(session_id),
+                                    error: ApiError {
+                                        code: ApiErrorCode::InvalidInput,
+                                        message: "must send Hello before Subscribe".into(),
+                                    },
                                 },
-                            });
+                            )
+                            .await
+                            {
+                                break;
+                            }
                             continue;
                         }
 
@@ -130,34 +184,46 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         match state.orchestrator.subscribe(&session_id, last_seq).await {
                             Ok(mut sub) => {
                                 let head_seq = sub.head_seq();
-                                if out_tx
-                                    .send(ServerMessage::Subscribed {
+                                if !send_control(
+                                    &ctrl_tx,
+                                    ServerMessage::Subscribed {
                                         session_id: session_id.clone(),
                                         head_seq,
-                                    })
-                                    .is_err()
+                                    },
+                                )
+                                .await
                                 {
                                     break;
                                 }
 
-                                let tx = out_tx.clone();
+                                let ev_tx = evt_tx.clone();
+                                let ct_tx = ctrl_tx.clone();
                                 let sid = session_id.clone();
                                 let handle = tokio::spawn(async move {
                                     loop {
                                         match sub.next().await {
                                             Ok(Some(event)) => {
-                                                if tx
-                                                    .send(ServerMessage::Event {
-                                                        event: Box::new(event),
-                                                    })
-                                                    .is_err()
-                                                {
-                                                    break;
+                                                match ev_tx.try_send(ServerMessage::Event {
+                                                    event: Box::new(event),
+                                                }) {
+                                                    Ok(()) => {}
+                                                    Err(TrySendError::Full(_)) => {
+                                                        tracing::debug!(
+                                                            session = %sid,
+                                                            "slow WS subscriber queue full; requesting resync"
+                                                        );
+                                                        let _ =
+                                                            ct_tx.try_send(ServerMessage::Resync {
+                                                                session_id: sid,
+                                                            });
+                                                        break;
+                                                    }
+                                                    Err(TrySendError::Closed(_)) => break,
                                                 }
                                             }
                                             Ok(None) => break,
                                             Err(err) => {
-                                                let _ = tx.send(ServerMessage::Error {
+                                                let _ = ct_tx.try_send(ServerMessage::Error {
                                                     session_id: Some(sid),
                                                     error: ApiError::from(&err),
                                                 });
@@ -169,10 +235,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 subscriptions.insert(session_id, handle);
                             }
                             Err(err) => {
-                                let _ = out_tx.send(ServerMessage::Error {
-                                    session_id: Some(session_id),
-                                    error: ApiError::from(&err),
-                                });
+                                if !send_control(
+                                    &ctrl_tx,
+                                    ServerMessage::Error {
+                                        session_id: Some(session_id),
+                                        error: ApiError::from(&err),
+                                    },
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -191,6 +264,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     for (_, handle) in subscriptions.drain() {
         handle.abort();
     }
-    drop(out_tx);
+    drop(evt_tx);
+    drop(ctrl_tx);
     let _ = writer.await;
 }

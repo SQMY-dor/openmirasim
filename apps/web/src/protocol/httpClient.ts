@@ -11,6 +11,7 @@ import {
   type ApprovalId,
   type ClientMessage,
   type CreateSessionRequest,
+  type HarnessDescriptor,
   type ListEventsResponse,
   type ListSessionsResponse,
   type ResolveApprovalRequest,
@@ -22,6 +23,17 @@ import {
   type SubmitPromptRequest,
   type SubmitPromptResponse,
 } from "./types";
+
+const WS_PING_INTERVAL_MS = 25_000;
+
+interface HealthResponse {
+  status: string;
+  version: string;
+}
+
+interface ListHarnessesResponse {
+  harnesses: HarnessDescriptor[];
+}
 
 export class HttpOpenMirasimClient implements OpenMirasimClient {
   readonly mode = "http" as const;
@@ -64,12 +76,29 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
   }
 
   async connect(): Promise<ServerInfo> {
-    // Validate Bearer token via GET /api/v1/sessions (Phase 0 minimal REST surface).
-    await this.listSessions();
+    // Validate Bearer token via protected `/api/v1/harnesses` without double-fetching sessions.
+    await this.listHarnesses();
+    let serverVersion = "0.1.0";
+    try {
+      const res = await fetch(`${this.serverUrl}/healthz`);
+      if (res.ok) {
+        const health = (await res.json()) as Partial<HealthResponse>;
+        if (health.version) {
+          serverVersion = health.version;
+        }
+      }
+    } catch {
+      // ignore optional healthz metadata fetch failure
+    }
     return {
-      serverVersion: "0.1.0",
+      serverVersion,
       spaceLabel: "OpenMirasim Space",
     };
+  }
+
+  async listHarnesses(): Promise<HarnessDescriptor[]> {
+    const res = await this.request<ListHarnessesResponse>("/api/v1/harnesses");
+    return res.harnesses;
   }
 
   async listSessions(): Promise<SessionSummary[]> {
@@ -82,6 +111,13 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       method: "POST",
       body: JSON.stringify(req),
     });
+  }
+
+  async closeSession(sessionId: SessionId): Promise<void> {
+    await this.request<void>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" }
+    );
   }
 
   async fetchEvents(
@@ -158,9 +194,19 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     handlers: EventSubscriptionHandlers
   ): EventSubscription {
     let closed = false;
+    let fatalError = false;
     let ws: WebSocket | null = null;
     let retryTimer: number | null = null;
+    let pingTimer: number | null = null;
+    let pingNonce = 1;
     let attempt = 0;
+
+    const clearPing = () => {
+      if (pingTimer !== null) {
+        window.clearInterval(pingTimer);
+        pingTimer = null;
+      }
+    };
 
     const sendFrame = (socket: WebSocket, msg: ClientMessage) => {
       if (socket.readyState === WebSocket.OPEN) {
@@ -175,7 +221,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     };
 
     const scheduleReconnect = (reason: string) => {
-      if (closed) return;
+      if (closed || fatalError) return;
       attempt += 1;
       handlers.onReconnectAttempt?.(attempt);
       handlers.onStateChange("reconnecting", reason);
@@ -186,7 +232,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     };
 
     const openSocket = () => {
-      if (closed) return;
+      if (closed || fatalError) return;
       handlers.onStateChange(
         attempt === 0 ? "connecting" : "reconnecting",
         null
@@ -205,6 +251,10 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
           type: "hello",
           protocol_version: WIRE_PROTOCOL_VERSION,
         });
+        clearPing();
+        pingTimer = window.setInterval(() => {
+          sendFrame(socket, { type: "ping", nonce: pingNonce++ });
+        }, WS_PING_INTERVAL_MS);
       };
 
       socket.onmessage = (raw) => {
@@ -248,6 +298,15 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
             break;
           }
           case "error": {
+            const isFatal =
+              msg.error.code === "not_found" ||
+              msg.error.code === "unauthorized" ||
+              msg.error.code === "forbidden" ||
+              msg.error.code === "unsupported";
+            if (isFatal) {
+              fatalError = true;
+              clearPing();
+            }
             handlers.onStateChange(
               "error",
               `[${msg.error.code}] ${msg.error.message}`
@@ -260,12 +319,13 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       };
 
       socket.onerror = () => {
-        if (closed) return;
+        if (closed || fatalError) return;
         handlers.onStateChange("reconnecting", "WebSocket 连接异常，正在重连");
       };
 
       socket.onclose = () => {
-        if (closed) return;
+        clearPing();
+        if (closed || fatalError) return;
         scheduleReconnect("连接已断开，等待自动重连");
       };
     };
@@ -275,6 +335,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     return {
       close: () => {
         closed = true;
+        clearPing();
         if (retryTimer !== null) {
           window.clearTimeout(retryTimer);
         }

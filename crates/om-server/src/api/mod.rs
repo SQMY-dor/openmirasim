@@ -98,12 +98,28 @@ pub fn build_router(state: AppState) -> Router {
     {
         let cors = CorsLayer::new()
             .allow_origin(val)
-            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
         router = router.layer(cors);
     }
 
-    router.layer(TraceLayer::new_for_http()).with_state(state)
+    // Never log query strings (e.g. `/ws/events?token=...`) to avoid leaking access tokens.
+    let trace = TraceLayer::new_for_http().make_span_with(|req: &http::Request<_>| {
+        tracing::info_span!(
+            "http_request",
+            method = %req.method(),
+            path = %req.uri().path(),
+        )
+    });
+
+    router.layer(trace).with_state(state)
 }
 
 async fn require_bearer_token(State(state): State<AppState>, req: Request, next: Next) -> Response {

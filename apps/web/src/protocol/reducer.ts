@@ -2,8 +2,11 @@ import {
   renderContentBlockText,
   renderContentBlocks,
   type ApprovalRecord,
+  type Dispatch,
+  type Goal,
   type HarnessCapabilities,
   type PlanEntry,
+  type QueuedPrompt,
   type SessionEvent,
   type SessionStatus,
   type StopReason,
@@ -30,6 +33,7 @@ export type TimelineItem =
       turn_id: string;
       author: string;
       text: string;
+      steered?: boolean;
       ts: number;
       seq: number;
     }
@@ -49,6 +53,21 @@ export type TimelineItem =
       seq: number;
     }
   | {
+      kind: "goal";
+      id: string;
+      goal: Goal;
+      ts: number;
+      seq: number;
+    }
+  | {
+      kind: "dispatch";
+      id: string;
+      direction: "sent" | "received";
+      dispatch: Dispatch;
+      ts: number;
+      seq: number;
+    }
+  | {
       kind: "error";
       id: string;
       message: string;
@@ -64,6 +83,9 @@ export interface SessionProjection {
   lastSeq: number;
   dedupedCount: number;
   gapDetectedCount: number;
+  queue: QueuedPrompt[];
+  queuePaused: boolean;
+  goal: Goal | null;
   items: TimelineItem[];
   rawEvents: SessionEvent[];
 }
@@ -82,6 +104,9 @@ export function createEmptyProjection(
     lastSeq: 0,
     dedupedCount: 0,
     gapDetectedCount: 0,
+    queue: [],
+    queuePaused: false,
+    goal: null,
     items: [],
     rawEvents: [],
   };
@@ -126,9 +151,11 @@ function findOrCreateAssistantIndex(
 }
 
 /**
- * Pure, idempotent projector for `om-core::SessionEvent`.
+ * Pure, exhaustive, idempotent projector for `om-core::SessionEvent`.
  * - Deduplicates any `seq <= state.lastSeq` (safe across REST catchup + WS overlap).
  * - Flags sequence gaps (`seq > state.lastSeq + 1`) so callers can trigger resync.
+ * - Treats `status_changed` as the sole authoritative source for `SessionStatus`
+ *   (matching `om-server::orchestrator::actor` and W1-3 auto-resolved approvals).
  */
 export function applySessionEvent(
   state: SessionProjection,
@@ -150,6 +177,9 @@ export function applySessionEvent(
   let status = state.status;
   let capabilities = state.capabilities;
   let nativeSessionId = state.nativeSessionId;
+  let queue = state.queue;
+  let queuePaused = state.queuePaused;
+  let goal = state.goal;
 
   const ev = record.payload;
   switch (ev.type) {
@@ -174,6 +204,19 @@ export function applySessionEvent(
         turn_id: ev.turn_id,
         author: ev.member_id ?? "member",
         text: renderContentBlocks(ev.prompt.content),
+        ts: record.ts,
+        seq: record.seq,
+      });
+      break;
+    }
+    case "prompt_steered": {
+      items.push({
+        kind: "user",
+        id: `steer:${ev.turn_id}:${record.seq}`,
+        turn_id: ev.turn_id,
+        author: ev.member_id ?? "member",
+        text: renderContentBlocks(ev.prompt.content),
+        steered: true,
         ts: record.ts,
         seq: record.seq,
       });
@@ -302,7 +345,6 @@ export function applySessionEvent(
           : [...current.approvals, ev.approval];
         items[idx] = { ...current, approvals };
       }
-      status = "waiting_approval";
       break;
     }
     case "approval_resolved": {
@@ -320,15 +362,13 @@ export function applySessionEvent(
                     : "resolved",
                 decision: ev.decision,
                 resolved_by: ev.resolved_by,
+                auto_rule: ev.auto_rule,
                 resolved_at: record.ts,
               }
             : a
         );
         items[i] = { ...item, approvals };
         break;
-      }
-      if (status === "waiting_approval") {
-        status = "running";
       }
       break;
     }
@@ -348,11 +388,6 @@ export function applySessionEvent(
           turnError: ev.error,
         };
       }
-      if (ev.stop_reason === "failed") {
-        status = "failed";
-      } else if (status !== "closed") {
-        status = "idle";
-      }
       break;
     }
     case "error": {
@@ -363,8 +398,75 @@ export function applySessionEvent(
         ts: record.ts,
         seq: record.seq,
       });
-      status = "failed";
       break;
+    }
+    case "prompt_queued": {
+      const next = queue.filter((q) => q.id !== ev.queued.id);
+      const pos = Math.max(0, Math.min(ev.position, next.length));
+      next.splice(pos, 0, ev.queued);
+      queue = next;
+      break;
+    }
+    case "queue_item_removed": {
+      queue = queue.filter((q) => q.id !== ev.queued_id);
+      break;
+    }
+    case "queue_reordered": {
+      const byId = new Map(queue.map((q) => [q.id, q]));
+      const ordered: QueuedPrompt[] = [];
+      for (const id of ev.order) {
+        const found = byId.get(id);
+        if (found) {
+          ordered.push(found);
+          byId.delete(id);
+        }
+      }
+      for (const leftover of byId.values()) {
+        ordered.push(leftover);
+      }
+      queue = ordered;
+      break;
+    }
+    case "queue_paused": {
+      queuePaused = ev.paused;
+      break;
+    }
+    case "goal_updated": {
+      goal = ev.goal;
+      items.push({
+        kind: "goal",
+        id: `goal:${ev.goal.id}:${record.seq}`,
+        goal: ev.goal,
+        ts: record.ts,
+        seq: record.seq,
+      });
+      break;
+    }
+    case "dispatch_sent": {
+      items.push({
+        kind: "dispatch",
+        id: `dispatch_sent:${ev.dispatch.id}:${record.seq}`,
+        direction: "sent",
+        dispatch: ev.dispatch,
+        ts: record.ts,
+        seq: record.seq,
+      });
+      break;
+    }
+    case "dispatch_received": {
+      items.push({
+        kind: "dispatch",
+        id: `dispatch_received:${ev.dispatch.id}:${record.seq}`,
+        direction: "received",
+        dispatch: ev.dispatch,
+        ts: record.ts,
+        seq: record.seq,
+      });
+      break;
+    }
+    default: {
+      const _exhaustive: never = ev;
+      void _exhaustive;
     }
   }
 
@@ -381,6 +483,9 @@ export function applySessionEvent(
     lastSeq: record.seq,
     dedupedCount: state.dedupedCount,
     gapDetectedCount: state.gapDetectedCount + (hasGap ? 1 : 0),
+    queue,
+    queuePaused,
+    goal,
     items,
     rawEvents: nextRaw,
   };

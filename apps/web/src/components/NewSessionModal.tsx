@@ -1,14 +1,17 @@
 import { X } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
+  describeHarness,
   KNOWN_HARNESSES,
   type CreateSessionRequest,
+  type HarnessDescriptor,
   type SandboxMode,
 } from "../protocol/types";
 
 interface NewSessionModalProps {
   open: boolean;
   creating: boolean;
+  harnesses: HarnessDescriptor[];
   onClose: () => void;
   onCreate: (req: CreateSessionRequest) => Promise<void>;
 }
@@ -16,17 +19,32 @@ interface NewSessionModalProps {
 export function NewSessionModal({
   open,
   creating,
+  harnesses,
   onClose,
   onCreate,
 }: NewSessionModalProps) {
+  const catalog = useMemo(
+    () =>
+      harnesses.length > 0
+        ? harnesses.map(describeHarness)
+        : [...KNOWN_HARNESSES],
+    [harnesses]
+  );
+
   const [title, setTitle] = useState("");
-  const [harnessId, setHarnessId] = useState("opencode");
+  const [harnessId, setHarnessId] = useState(() => catalog[0]?.id ?? "mock");
   const [cwd, setCwd] = useState("/srv/workspaces/openmirasim");
   const [sandbox, setSandbox] = useState<SandboxMode>("direct");
 
+  useEffect(() => {
+    if (!catalog.some((h) => h.id === harnessId) && catalog.length > 0) {
+      setHarnessId(catalog[0].id);
+    }
+  }, [catalog, harnessId]);
+
   if (!open) return null;
 
-  const selectedHarness = KNOWN_HARNESSES.find((h) => h.id === harnessId);
+  const selectedHarness = catalog.find((h) => h.id === harnessId);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -85,7 +103,7 @@ export function NewSessionModal({
               value={harnessId}
               onChange={(e) => setHarnessId(e.target.value)}
             >
-              {KNOWN_HARNESSES.map((h) => (
+              {catalog.map((h) => (
                 <option key={h.id} value={h.id}>
                   {h.label}
                 </option>
@@ -115,8 +133,8 @@ export function NewSessionModal({
               value={sandbox}
               onChange={(e) => setSandbox(e.target.value as SandboxMode)}
             >
-              <option value="direct">direct（Phase 0 单人开发模式）</option>
-              <option value="bwrap">bwrap（Phase 1 Linux bubblewrap 沙箱）</option>
+              <option value="direct">direct（单人回环开发模式）</option>
+              <option value="bwrap">bwrap（Linux bubblewrap 沙箱）</option>
             </select>
           </div>
 

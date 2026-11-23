@@ -1,12 +1,16 @@
 import {
   AlertTriangle,
+  ArrowDownLeft,
+  ArrowUpRight,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Circle,
   Clock,
+  Compass,
   ListChecks,
   ShieldAlert,
+  Target,
   Wrench,
   XCircle,
 } from "lucide-react";
@@ -183,6 +187,7 @@ function ApprovalCard({
         <span className="approval-title">
           <ShieldAlert size={15} />
           <span>工具执行审批</span>
+          {approval.tool_kind && <span className="chip">{approval.tool_kind}</span>}
         </span>
         <span
           className={`chip ${
@@ -195,9 +200,16 @@ function ApprovalCard({
 
       <p className="approval-summary">{approval.title}</p>
 
+      {approval.locations && approval.locations.length > 0 && (
+        <pre className="tool-pre" style={{ marginBottom: 8 }}>
+          {approval.locations.join("\n")}
+        </pre>
+      )}
+
       {resolved ? (
         <div className="approval-resolved-note">
           决策：{selectedOpt ? selectedOpt.name : approval.decision?.outcome ?? approval.status}
+          {approval.auto_rule ? ` · 策略规则：${approval.auto_rule}` : ""}
           {approval.resolved_by ? ` · 处理人：${approval.resolved_by}` : ""}
           {approval.resolved_at ? ` · ${formatTime(approval.resolved_at)}` : ""}
         </div>
@@ -295,13 +307,70 @@ export function SessionStream({
             return (
               <article key={item.id} className="turn-user" data-turn-kind="user">
                 <div className="turn-user-meta">
-                  <span>{item.author}</span>
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    {item.steered && <Compass size={12} />}
+                    <span>{item.author}</span>
+                    {item.steered && <span className="chip warn">Steer</span>}
+                  </span>
                   <span>
                     seq #{item.seq} · {formatTime(item.ts)}
                   </span>
                 </div>
                 <p className="turn-user-text">{item.text}</p>
               </article>
+            );
+          }
+
+          if (item.kind === "goal") {
+            const g = item.goal;
+            const statusClass =
+              g.status === "achieved"
+                ? "ok"
+                : g.status === "active"
+                  ? "warn"
+                  : "err";
+            return (
+              <div key={item.id} className="plan-card" data-goal-id={g.id}>
+                <div className="plan-head">
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Target size={13} />
+                    <span>目标驱动循环</span>
+                  </span>
+                  <span className={`chip ${statusClass}`}>
+                    {g.status} · {g.turns_used}/{g.max_turns} 轮
+                  </span>
+                </div>
+                <p style={{ margin: "6px 0 0", fontSize: 13 }}>
+                  {g.objective}
+                  {g.ended_reason ? `（${g.ended_reason}）` : ""}
+                </p>
+              </div>
+            );
+          }
+
+          if (item.kind === "dispatch") {
+            const d = item.dispatch;
+            const isSent = item.direction === "sent";
+            return (
+              <div key={item.id} className="plan-card" data-dispatch-id={d.id}>
+                <div className="plan-head">
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    {isSent ? <ArrowUpRight size={13} /> : <ArrowDownLeft size={13} />}
+                    <span>
+                      {isSent
+                        ? `会话派发 -> ${d.to_session}`
+                        : `收到会话派发 <- ${d.from_session}`}
+                    </span>
+                  </span>
+                  <span className="chip">
+                    depth {d.depth} · {d.submit.outcome}
+                  </span>
+                </div>
+                <p style={{ margin: "6px 0 0", fontSize: 12.5, opacity: 0.85 }}>
+                  执行身份：{d.member_id}
+                  {d.created_session ? " · 自动新建目标会话" : ""}
+                </p>
+              </div>
             );
           }
 

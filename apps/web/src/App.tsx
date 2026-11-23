@@ -90,6 +90,9 @@ export function App() {
   const [connectError, setConnectError] = useState<string | null>(null);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [harnesses, setHarnesses] = useState<
+    import("./protocol/types").HarnessDescriptor[]
+  >([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
     () => {
       try {
@@ -137,7 +140,10 @@ export function App() {
       setConnectError(null);
       try {
         const info = await nextClient.connect();
-        const sessionList = await nextClient.listSessions();
+        const [sessionList, harnessList] = await Promise.all([
+          nextClient.listSessions(),
+          nextClient.listHarnesses().catch(() => []),
+        ]);
         try {
           window.localStorage.setItem(
             AUTH_STORAGE_KEY,
@@ -148,6 +154,7 @@ export function App() {
         }
         setClient(nextClient);
         setServerInfo(info);
+        setHarnesses(harnessList);
         setSessions(sessionList);
         setSelectedSessionId((prev) => {
           if (prev && sessionList.some((s) => s.id === prev)) return prev;
@@ -260,15 +267,8 @@ export function App() {
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== record.session_id) return s;
-          let status = s.status;
           const ev = record.payload;
-          if (ev.type === "status_changed") status = ev.to;
-          if (ev.type === "approval_requested") status = "waiting_approval";
-          if (ev.type === "approval_resolved") status = "running";
-          if (ev.type === "turn_ended") {
-            status = ev.stop_reason === "failed" ? "failed" : "idle";
-          }
-          if (ev.type === "error") status = "failed";
+          const status = ev.type === "status_changed" ? ev.to : s.status;
           return {
             ...s,
             status,
@@ -354,6 +354,16 @@ export function App() {
       await client.resumeSession(selectedSessionId);
     } catch (err) {
       setStreamError(err instanceof Error ? err.message : "恢复会话失败");
+    }
+  }, [client, selectedSessionId]);
+
+  const handleCloseSession = useCallback(async () => {
+    if (!client || !selectedSessionId) return;
+    setStreamError(null);
+    try {
+      await client.closeSession(selectedSessionId);
+    } catch (err) {
+      setStreamError(err instanceof Error ? err.message : "关闭会话失败");
     }
   }, [client, selectedSessionId]);
 
@@ -452,6 +462,19 @@ export function App() {
           </div>
 
           <div className="stage-header-right">
+            {projection && projection.queue.length > 0 && (
+              <span className="chip warn" id="queue-count-chip">
+                队列 {projection.queue.length}
+                {projection.queuePaused ? "（已暂停）" : ""}
+              </span>
+            )}
+
+            {projection?.goal && projection.goal.status === "active" && (
+              <span className="chip warn" id="active-goal-chip">
+                目标 {projection.goal.turns_used}/{projection.goal.max_turns}
+              </span>
+            )}
+
             {selectedSession && (
               <span className={`chip ${badge.cls}`} id="sync-status-chip">
                 {connectionState === "connected" ? (
@@ -471,6 +494,18 @@ export function App() {
                 onClick={() => void handleResume()}
               >
                 恢复会话
+              </button>
+            )}
+
+            {selectedSession && activeStatus !== "closed" && (
+              <button
+                type="button"
+                id="close-session-btn"
+                className="btn btn-sm"
+                onClick={() => void handleCloseSession()}
+                title="永久关闭此会话并释放 Agent 进程"
+              >
+                关闭会话
               </button>
             )}
 
@@ -559,6 +594,7 @@ export function App() {
       <NewSessionModal
         open={newModalOpen}
         creating={creatingSession}
+        harnesses={harnesses}
         onClose={() => setNewModalOpen(false)}
         onCreate={handleCreateSession}
       />
