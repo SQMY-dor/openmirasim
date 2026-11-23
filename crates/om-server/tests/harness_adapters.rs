@@ -198,11 +198,19 @@ async fn opencode_config_and_probe_work() {
     };
     let spec = cfg.command_spec();
     assert_eq!(spec.program, "/usr/bin/opencode");
+    assert!(spec.clear_env);
+    assert!(!spec.env.contains_key("OM_TOKEN"));
     assert_eq!(spec.args, vec!["acp", "--log-level", "error"]);
     assert_eq!(
         spec.env.get("OPENAI_API_KEY").map(String::as_str),
         Some("test-placeholder")
     );
+
+    let proxy_cfg = OpenCodeConfig::from_env_for_proxy();
+    let proxy_spec = proxy_cfg.command_spec();
+    assert!(proxy_spec.clear_env);
+    assert!(!proxy_spec.env.contains_key("OPENAI_API_KEY"));
+    assert!(!proxy_spec.env.contains_key("ANTHROPIC_API_KEY"));
 
     let harness = opencode_harness(cfg);
     assert_eq!(harness.id(), "opencode");

@@ -10,6 +10,7 @@ import {
   type ApprovalRecord,
   type CreateSessionRequest,
   type EventPayload,
+  type HarnessDescriptor,
   type ServerInfo,
   type SessionEvent,
   type SessionId,
@@ -256,13 +257,8 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     this.store.eventsBySession[sessionId] = [...existing, record];
     this.store.sessions = this.store.sessions.map((s) => {
       if (s.id !== sessionId) return s;
-      let status = s.status;
-      if (payload.type === "status_changed") status = payload.to;
-      if (payload.type === "approval_requested") status = "waiting_approval";
-      if (payload.type === "approval_resolved") status = "running";
-      if (payload.type === "turn_ended") {
-        status = payload.stop_reason === "failed" ? "failed" : "idle";
-      }
+      const status =
+        payload.type === "status_changed" ? payload.to : s.status;
       return {
         ...s,
         status,
@@ -289,6 +285,13 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     };
   }
 
+  async listHarnesses(): Promise<HarnessDescriptor[]> {
+    return KNOWN_HARNESSES.map((h) => ({
+      id: h.id,
+      capabilities: h.capabilities,
+    }));
+  }
+
   async listSessions(): Promise<SessionSummary[]> {
     this.store = this.loadStore();
     return [...this.store.sessions].sort((a, b) => b.updated_at - a.updated_at);
@@ -311,7 +314,7 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       id: sessionId,
       space_id: "space_default",
       config,
-      status: "idle",
+      status: "starting",
       head_seq: 0,
       created_at: ts,
       updated_at: ts,
@@ -331,10 +334,26 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       capabilities: info.capabilities,
       native_session_id: makeId("acp"),
     });
+    this.appendEvent(sessionId, {
+      type: "status_changed",
+      from: "starting",
+      to: "idle",
+    });
 
     return (
       this.store.sessions.find((s) => s.id === sessionId) ?? session
     );
+  }
+
+  async closeSession(sessionId: SessionId): Promise<void> {
+    const found = this.store.sessions.find((s) => s.id === sessionId);
+    if (!found || found.status === "closed") return;
+    await this.cancelSession(sessionId);
+    this.appendEvent(sessionId, {
+      type: "status_changed",
+      from: found.status,
+      to: "closed",
+    });
   }
 
   async fetchEvents(
@@ -438,6 +457,8 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
         id: approvalId,
         session_id: sessionId,
         tool_call_id: callId,
+        tool_kind: "execute",
+        locations: ["/etc/systemd/system"],
         title: "执行宿主机命令 `systemctl reload openmirasim-server`",
         options: [
           { option_id: "allow_once", name: "允许一次", kind: "allow_once" },
@@ -452,6 +473,11 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
         type: "approval_requested",
         turn_id: turnId,
         approval: approvalRecord,
+      });
+      this.appendEvent(sessionId, {
+        type: "status_changed",
+        from: "running",
+        to: "waiting_approval",
       });
 
       const decision = await new Promise<ApprovalDecision>((resolve) => {
@@ -575,15 +601,29 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       turn_id: turnId,
       stop_reason: "end_turn",
     });
+    this.appendEvent(sessionId, {
+      type: "status_changed",
+      from: "running",
+      to: "idle",
+    });
     this.activeRuns.delete(sessionId);
   }
 
   private finishCancelled(sessionId: SessionId, turnId: string): void {
+    const current =
+      this.store.sessions.find((s) => s.id === sessionId)?.status ?? "running";
     this.appendEvent(sessionId, {
       type: "turn_ended",
       turn_id: turnId,
       stop_reason: "cancelled",
     });
+    if (current !== "closed" && current !== "idle") {
+      this.appendEvent(sessionId, {
+        type: "status_changed",
+        from: current,
+        to: "idle",
+      });
+    }
     this.activeRuns.delete(sessionId);
   }
 
@@ -620,6 +660,11 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       approval_id: approvalId,
       decision,
       resolved_by: "member_dev",
+    });
+    this.appendEvent(gate.sessionId, {
+      type: "status_changed",
+      from: "waiting_approval",
+      to: "running",
     });
     gate.resolve(decision);
   }

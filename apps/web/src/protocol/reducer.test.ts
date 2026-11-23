@@ -25,7 +25,7 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
         type: "harness_ready",
         capabilities: {
           native_approval: true,
-          steer: true,
+          steer: false,
           resume: true,
           structured_tools: true,
           pty_attach: false,
@@ -86,9 +86,10 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
         content: { type: "text", text: "there!" },
       }),
       ev(11, { type: "turn_ended", turn_id: "t1", stop_reason: "end_turn" }),
+      ev(12, { type: "status_changed", from: "running", to: "idle" }),
     ]);
 
-    expect(next.lastSeq).toBe(11);
+    expect(next.lastSeq).toBe(12);
     expect(next.status).toBe("idle");
     expect(next.nativeSessionId).toBe("acp_123");
     expect(next.capabilities?.native_approval).toBe(true);
@@ -146,10 +147,9 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
     }
   });
 
-  it("tracks ACP approval options and resolution transitions", () => {
+  it("tracks ACP approvals, auto_rule attribution, and authoritative status_changed", () => {
     let state = createEmptyProjection("s1", "running");
-    state = applySessionEvent(
-      state,
+    state = applySessionEvents(state, [
       ev(1, {
         type: "approval_requested",
         turn_id: "t1",
@@ -157,7 +157,9 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
           id: "a1",
           session_id: "s1",
           tool_call_id: "c1",
-          title: "Run deploy",
+          tool_kind: "read",
+          locations: ["/ws/README.md"],
+          title: "Read README.md",
           options: [
             { option_id: "allow_once", name: "允许一次", kind: "allow_once" },
             { option_id: "reject_once", name: "拒绝", kind: "reject_once" },
@@ -165,30 +167,123 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
           status: "pending",
           created_at: TS,
         },
-      })
-    );
-
-    expect(state.status).toBe("waiting_approval");
-
-    state = applySessionEvent(
-      state,
+      }),
+      // Auto-resolved approval never transitions to waiting_approval
       ev(2, {
         type: "approval_resolved",
         approval_id: "a1",
         decision: { outcome: "selected", option_id: "allow_once" },
-        resolved_by: "alice",
-      })
-    );
+        auto_rule: "read_in_worktree",
+      }),
+    ]);
 
     expect(state.status).toBe("running");
     const assistant = state.items[0];
     if (assistant.kind === "assistant") {
       expect(assistant.approvals[0].status).toBe("resolved");
-      expect(assistant.approvals[0].decision).toEqual({
-        outcome: "selected",
-        option_id: "allow_once",
-      });
-      expect(assistant.approvals[0].resolved_by).toBe("alice");
+      expect(assistant.approvals[0].auto_rule).toBe("read_in_worktree");
+      expect(assistant.approvals[0].tool_kind).toBe("read");
+      expect(assistant.approvals[0].locations).toEqual(["/ws/README.md"]);
+    }
+  });
+
+  it("projects W2-3 queue/steer and W4-1 goal/dispatch events", () => {
+    const state = applySessionEvents(createEmptyProjection("s1", "running"), [
+      ev(1, {
+        type: "prompt_queued",
+        position: 0,
+        queued: {
+          id: "q1",
+          member_id: "alice",
+          prompt: { content: [{ type: "text", text: "first queued" }] },
+          mode: "queue",
+          created_at: TS,
+        },
+      }),
+      ev(2, {
+        type: "prompt_queued",
+        position: 1,
+        queued: {
+          id: "q2",
+          member_id: "bob",
+          prompt: { content: [{ type: "text", text: "second queued" }] },
+          mode: "queue",
+          created_at: TS + 1,
+        },
+      }),
+      ev(3, { type: "queue_reordered", order: ["q2", "q1"] }),
+      ev(4, { type: "queue_paused", paused: true }),
+      ev(5, {
+        type: "queue_item_removed",
+        queued_id: "q1",
+        reason: { reason: "withdrawn" },
+      }),
+      ev(6, {
+        type: "prompt_steered",
+        turn_id: "t1",
+        member_id: "alice",
+        prompt: { content: [{ type: "text", text: "switch to rust" }] },
+      }),
+      ev(7, {
+        type: "goal_updated",
+        goal: {
+          id: "g1",
+          space_id: "sp1",
+          session_id: "s1",
+          created_by: "alice",
+          objective: "Make all tests pass",
+          done_marker: "[[goal:done]]",
+          max_turns: 5,
+          turns_used: 1,
+          status: "active",
+          created_at: TS,
+          updated_at: TS + 2,
+        },
+      }),
+      ev(8, {
+        type: "dispatch_sent",
+        dispatch: {
+          id: "d1",
+          space_id: "sp1",
+          from_session: "s1",
+          to_session: "s2",
+          depth: 1,
+          created_session: false,
+          member_id: "alice",
+          submit: { outcome: "started", turn_id: "t2" },
+          created_at: TS + 3,
+        },
+      }),
+      ev(9, {
+        type: "dispatch_received",
+        dispatch: {
+          id: "d2",
+          space_id: "sp1",
+          from_session: "s0",
+          to_session: "s1",
+          depth: 1,
+          created_session: true,
+          member_id: "bob",
+          submit: { outcome: "queued", queued_id: "q3", position: 0 },
+          created_at: TS + 4,
+        },
+      }),
+    ]);
+
+    expect(state.queue.map((q) => q.id)).toEqual(["q2"]);
+    expect(state.queuePaused).toBe(true);
+    expect(state.goal?.status).toBe("active");
+    expect(state.goal?.turns_used).toBe(1);
+    expect(state.items.map((i) => i.kind)).toEqual([
+      "user",
+      "goal",
+      "dispatch",
+      "dispatch",
+    ]);
+    const steerItem = state.items[0];
+    if (steerItem.kind === "user") {
+      expect(steerItem.steered).toBe(true);
+      expect(steerItem.text).toBe("switch to rust");
     }
   });
 
