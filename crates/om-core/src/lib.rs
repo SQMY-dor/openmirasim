@@ -18,6 +18,7 @@
 
 pub mod api;
 pub mod approval;
+pub mod auth;
 pub mod content;
 pub mod error;
 pub mod event;
