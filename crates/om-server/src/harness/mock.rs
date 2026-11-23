@@ -272,6 +272,8 @@ async fn run_mock_turn(state: Arc<MockSessionState>, prompt_text: String) {
             request_id: req_id.clone(),
             tool_call_id: Some(call_id.clone()),
             title: "执行受控命令 `systemctl reload openmirasim-server`".into(),
+            kind: Some(ToolKind::Execute),
+            locations: Vec::new(),
             options: vec![
                 ApprovalOption {
                     option_id: "allow_once".into(),

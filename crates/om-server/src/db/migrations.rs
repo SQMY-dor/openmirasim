@@ -91,4 +91,22 @@ pub(super) const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX worktrees_workspace ON worktrees(workspace_id);
     "#,
+    // v3 (W1-3): approval policy metadata, remembered "always" rules and audit index.
+    r#"
+    ALTER TABLE approvals ADD COLUMN tool_kind TEXT;
+    ALTER TABLE approvals ADD COLUMN locations TEXT;
+    ALTER TABLE approvals ADD COLUMN auto_rule TEXT;
+
+    CREATE TABLE approval_rules (
+        session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        rule_key    TEXT NOT NULL,
+        allow       INTEGER NOT NULL,
+        option_kind TEXT NOT NULL,
+        created_by  TEXT,
+        created_at  INTEGER NOT NULL,
+        PRIMARY KEY (session_id, rule_key)
+    ) WITHOUT ROWID;
+
+    CREATE INDEX audit_logs_target ON audit_logs(target, ts);
+    "#,
 ];

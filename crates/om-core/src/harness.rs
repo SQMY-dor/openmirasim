@@ -22,7 +22,7 @@
 use crate::approval::{ApprovalDecision, ApprovalOption};
 use crate::content::{ContentBlock, Prompt};
 use crate::error::{CoreError, CoreResult};
-use crate::event::{PlanEntry, ToolCallInfo, ToolCallUpdate};
+use crate::event::{PlanEntry, ToolCallInfo, ToolCallUpdate, ToolKind};
 use crate::ids::SessionId;
 use crate::sandbox::Sandbox;
 use crate::session::{SessionConfig, StopReason};
@@ -67,6 +67,11 @@ pub enum HarnessEvent {
         request_id: String,
         tool_call_id: Option<String>,
         title: String,
+        /// Kind of the gated call, when the request itself carries it. The
+        /// orchestrator falls back to the kind of the earlier `ToolCall` event.
+        kind: Option<ToolKind>,
+        /// Paths the gated call touches, when the request itself carries them.
+        locations: Vec<String>,
         options: Vec<ApprovalOption>,
     },
     /// The current turn finished.

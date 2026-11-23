@@ -93,6 +93,10 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         resolved_by: Option<MemberId>,
+        /// Policy rule that resolved the request automatically, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        auto_rule: Option<String>,
     },
     TurnEnded {
         turn_id: TurnId,

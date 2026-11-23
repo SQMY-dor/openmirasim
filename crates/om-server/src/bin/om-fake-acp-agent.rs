@@ -45,10 +45,20 @@ impl Agent {
         );
     }
 
-    fn ask_permission(&self, session: &str) -> Value {
+    fn ask_permission(&self, session: &str, always: bool) -> Value {
         let id = format!("perm-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
         let (tx, rx) = channel();
         self.waiters.lock().unwrap().insert(id.clone(), tx);
+        let mut options = vec![
+            json!({"optionId": "allow", "name": "Allow once", "kind": "allow_once"}),
+            json!({"optionId": "reject", "name": "Reject", "kind": "reject_once"}),
+        ];
+        if always {
+            options.push(
+                json!({"optionId": "allow_always", "name": "Always allow", "kind": "allow_always"}),
+            );
+            options.push(json!({"optionId": "reject_always", "name": "Always reject", "kind": "reject_always"}));
+        }
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -56,10 +66,7 @@ impl Agent {
             "params": {
                 "sessionId": session,
                 "toolCall": {"toolCallId": "call-1"},
-                "options": [
-                    {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
-                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
-                ]
+                "options": options
             }
         }));
         rx.recv().unwrap_or(Value::Null)
@@ -80,9 +87,19 @@ impl Agent {
                 std::thread::sleep(Duration::from_millis(50));
             }
             stop
-        } else if text.contains("tool") {
-            self.update(
-                &session,
+        } else if text.contains("tool") || text.contains("read") {
+            // "tool": an `execute` call; "read": a `read` of README.md in the cwd.
+            // "always" adds allow_always / reject_always options.
+            let call = if text.contains("read") {
+                json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "Read README.md",
+                    "kind": "read",
+                    "status": "pending",
+                    "locations": [{"path": "README.md"}]
+                })
+            } else {
                 json!({
                     "sessionUpdate": "tool_call",
                     "toolCallId": "call-1",
@@ -90,13 +107,13 @@ impl Agent {
                     "kind": "execute",
                     "status": "pending",
                     "rawInput": {"command": "rm -rf build"}
-                }),
-            );
-            let answer = self.ask_permission(&session);
+                })
+            };
+            self.update(&session, call);
+            let answer = self.ask_permission(&session, text.contains("always"));
+            let option = answer.pointer("/outcome/optionId").and_then(Value::as_str);
             match answer.pointer("/outcome/outcome").and_then(Value::as_str) {
-                Some("selected")
-                    if answer.pointer("/outcome/optionId") == Some(&json!("allow")) =>
-                {
+                Some("selected") if matches!(option, Some("allow" | "allow_always")) => {
                     self.update(
                         &session,
                         json!({

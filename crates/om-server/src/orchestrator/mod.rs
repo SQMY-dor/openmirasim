@@ -17,6 +17,7 @@ mod hub;
 
 pub use hub::Subscription;
 
+use crate::approval::ApprovalPolicy;
 use crate::db::Db;
 pub use crate::harness::HarnessRegistry;
 use crate::sandbox::ScopedSandbox;
@@ -69,6 +70,7 @@ pub struct Orchestrator {
     live: Live,
     bwrap: Option<Arc<dyn Sandbox>>,
     workspaces: Option<WorkspaceManager>,
+    approval_policy: ApprovalPolicy,
 }
 
 impl Orchestrator {
@@ -81,6 +83,7 @@ impl Orchestrator {
             live: Live::default(),
             bwrap: None,
             workspaces: None,
+            approval_policy: ApprovalPolicy::default(),
         }
     }
 
@@ -89,6 +92,17 @@ impl Orchestrator {
     pub fn with_workspaces(mut self, manager: WorkspaceManager) -> Self {
         self.workspaces = Some(manager);
         self
+    }
+
+    /// Replaces the approval policy (default: [`ApprovalPolicy::default`]). Applies to
+    /// sessions started or resumed afterwards.
+    pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
+        self.approval_policy = policy;
+        self
+    }
+
+    pub fn approval_policy(&self) -> &ApprovalPolicy {
+        &self.approval_policy
     }
 
     pub fn workspaces(&self) -> Option<&WorkspaceManager> {
@@ -289,6 +303,7 @@ impl Orchestrator {
             resume_native_session_id: None,
             harness,
             sandbox,
+            policy: self.approval_policy.clone(),
         });
         Ok(summary)
     }
@@ -317,6 +332,7 @@ impl Orchestrator {
             resume_native_session_id: resume,
             harness,
             sandbox,
+            policy: self.approval_policy.clone(),
         });
         Ok(summary)
     }
