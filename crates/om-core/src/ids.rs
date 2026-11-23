@@ -76,6 +76,10 @@ define_id!(
     /// One prompt/response cycle inside a session.
     TurnId
 );
+define_id!(
+    /// A device token issued to a member.
+    TokenId
+);
 
 #[cfg(test)]
 mod tests {

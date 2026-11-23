@@ -133,9 +133,11 @@ impl From<&CoreError> for ApiError {
     fn from(err: &CoreError) -> Self {
         let code = match err {
             CoreError::NotFound(_) => ApiErrorCode::NotFound,
-            CoreError::InvalidTransition { .. } | CoreError::ApprovalAlreadyResolved(_) => {
-                ApiErrorCode::Conflict
-            }
+            CoreError::Unauthenticated(_) => ApiErrorCode::Unauthorized,
+            CoreError::Forbidden(_) => ApiErrorCode::Forbidden,
+            CoreError::InvalidTransition { .. }
+            | CoreError::ApprovalAlreadyResolved(_)
+            | CoreError::LimitExceeded(_) => ApiErrorCode::Conflict,
             CoreError::Unsupported { .. } => ApiErrorCode::Unsupported,
             CoreError::InvalidInput(_) => ApiErrorCode::InvalidInput,
             CoreError::Harness(_)

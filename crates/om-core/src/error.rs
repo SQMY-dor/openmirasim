@@ -31,6 +31,12 @@ pub enum CoreError {
     Sandbox(String),
     #[error("workspace error: {0}")]
     Workspace(String),
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("i/o error: {0}")]
