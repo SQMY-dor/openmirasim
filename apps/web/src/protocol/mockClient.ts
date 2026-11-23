@@ -596,6 +596,19 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     }
   }
 
+  async resumeSession(sessionId: SessionId): Promise<SessionSummary> {
+    const found = this.store.sessions.find((s) => s.id === sessionId);
+    if (!found) {
+      throw new Error(`session '${sessionId}' not found`);
+    }
+    this.appendEvent(sessionId, {
+      type: "status_changed",
+      from: found.status,
+      to: "idle",
+    });
+    return this.store.sessions.find((s) => s.id === sessionId) ?? found;
+  }
+
   async resolveApproval(
     approvalId: ApprovalId,
     decision: ApprovalDecision

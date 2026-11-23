@@ -5,7 +5,8 @@
 //! - Antigravity: `api`, `harness`, `pty`
 
 pub mod acp;
+pub mod api;
 pub mod db;
+pub mod harness;
 pub mod orchestrator;
 pub mod stream;
-pub mod harness;

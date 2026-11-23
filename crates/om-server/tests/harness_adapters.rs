@@ -9,7 +9,8 @@ use om_core::ids::SessionId;
 use om_core::sandbox::{DirectSandbox, SandboxMode};
 use om_core::session::{SessionConfig, StopReason};
 use om_server::harness::{
-    HarnessRegistry, MockHarness, OpenCodeConfig, opencode_harness, probe_opencode,
+    MockHarness, OpenCodeConfig, default_phase0_registry, describe_harnesses, opencode_harness,
+    probe_opencode,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,16 +40,13 @@ async fn next_ev(stream: &mut HarnessEventStream) -> HarnessEvent {
 
 #[tokio::test]
 async fn registry_registers_phase0_defaults() {
-    let reg = HarnessRegistry::with_phase0_defaults();
-    let list = reg.list();
+    let reg = default_phase0_registry();
+    let list = describe_harnesses(&reg);
     let ids: Vec<&str> = list.iter().map(|d| d.id.as_str()).collect();
     assert_eq!(ids, vec!["mock", "opencode"]);
-    assert!(reg.require("mock").is_ok());
-    assert!(reg.require("opencode").is_ok());
-    assert!(matches!(
-        reg.require("unknown"),
-        Err(CoreError::NotFound(_))
-    ));
+    assert!(reg.get("mock").is_some());
+    assert!(reg.get("opencode").is_some());
+    assert!(reg.get("unknown").is_none());
 }
 
 #[tokio::test]

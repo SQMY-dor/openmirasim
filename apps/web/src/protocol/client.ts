@@ -47,6 +47,9 @@ export interface OpenMirasimClient {
   /** Cancel an in-flight turn (`POST /api/v1/sessions/:id/cancel`). */
   cancelSession(sessionId: SessionId): Promise<void>;
 
+  /** Resume a failed session (`POST /api/v1/sessions/:id/resume`). */
+  resumeSession(sessionId: SessionId): Promise<SessionSummary>;
+
   /** Resolve a pending approval (`POST /api/v1/approvals/:id/resolve`). */
   resolveApproval(
     approvalId: ApprovalId,

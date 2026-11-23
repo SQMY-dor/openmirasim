@@ -13,11 +13,11 @@
 
 ### Phase 0：纵向切片 MVP（核心闭环）
 **可复现 Demo 验收标准**：
-- [ ] 启动单台 Linux `om-server`（静态 Token 鉴权、单 Space、`rusqlite` WAL 数据库）
-- [ ] 在 Web 页面登录后创建会话，分别通过 `MockHarness` 与原生 **`opencode acp`** 发送 Prompt 并实时看到流式文本与工具调用事件
-- [ ] 对话进行中**刷新浏览器或断开网络后恢复**，前端携带 `last_seq` 自动补齐缺失事件，零上下文丢失
-- [ ] 重启 `om-server` 进程后，Web 页面仍可列出历史会话并回放完整历史事件
-- [ ] 自动化 E2E 测试（Playwright + `MockHarness`）在 CI 中稳定通过
+- [x] 启动单台 Linux `om-server`（静态 Token 鉴权、单 Space、`rusqlite` WAL 数据库）
+- [x] 在 Web 页面登录后创建会话，支持 `MockHarness`、`om-fake-acp-agent` 与原生 **`opencode acp`**（已实测 `opencode 1.19.6` `protocolVersion=1` & `loadSession=true`）发送 Prompt 并实时看到流式文本与工具调用事件
+- [x] 对话进行中**刷新浏览器或断开网络后恢复**，前端携带 `last_seq` 自动补齐缺失事件，零上下文丢失
+- [x] 重启 `om-server` 进程后，Web 页面仍可列出历史会话、回放完整历史事件并支持一键恢复会话继续对话
+- [x] 自动化 E2E 测试（Playwright + 真实 `om-server` 二进制 + SQLite WAL 重启恢复）在 CI 中稳定通过
 
 ### Phase 1：Linux 裸金属隔离 + 审批闭环 + 多 CLI Agent + `om-cli ctl`
 **可复现 Demo 验收标准**：

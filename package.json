@@ -11,6 +11,7 @@
     "build": "pnpm --filter @openmirasim/web build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm --filter @openmirasim/web test",
-    "test:e2e": "pnpm --filter @openmirasim/e2e test"
+    "test:e2e": "pnpm --filter @openmirasim/e2e test",
+    "test:e2e:fullstack": "pnpm --filter @openmirasim/e2e test:fullstack"
   }
 }

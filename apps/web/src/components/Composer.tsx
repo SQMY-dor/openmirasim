@@ -15,6 +15,12 @@ export function Composer({ status, disabled, onSend, onCancel }: ComposerProps) 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isActive = status === "running" || status === "waiting_approval";
+  const cannotSend =
+    disabled ||
+    isActive ||
+    status === "starting" ||
+    status === "failed" ||
+    status === "closed";
 
   const adjustHeight = () => {
     const el = textareaRef.current;
@@ -25,7 +31,7 @@ export function Composer({ status, disabled, onSend, onCancel }: ComposerProps) 
 
   const submit = async () => {
     const trimmed = text.trim();
-    if (!trimmed || sending || disabled || isActive) return;
+    if (!trimmed || sending || cannotSend) return;
     setSending(true);
     try {
       setText("");
@@ -50,6 +56,19 @@ export function Composer({ status, disabled, onSend, onCancel }: ComposerProps) 
     }
   };
 
+  const placeholder =
+    status === "starting"
+      ? "Agent 正在启动中，请稍候…"
+      : status === "failed"
+        ? "会话已中断，请点击顶部「恢复会话」重新启动 Agent…"
+        : status === "closed"
+          ? "会话已关闭"
+          : status === "waiting_approval"
+            ? "当前回合等待审批，请在上方审批卡片中选择放行或拒绝…"
+            : isActive
+              ? "Agent 正在执行中…"
+              : "输入给 Agent 的指令（Ctrl/Cmd + Enter 发送）…";
+
   return (
     <div className="composer-wrap">
       <form className="composer-box" onSubmit={handleSubmit}>
@@ -59,14 +78,8 @@ export function Composer({ status, disabled, onSend, onCancel }: ComposerProps) 
           className="composer-textarea"
           rows={2}
           value={text}
-          disabled={disabled || isActive}
-          placeholder={
-            status === "waiting_approval"
-              ? "当前回合等待审批，请在上方审批卡片中选择放行或拒绝…"
-              : isActive
-                ? "Agent 正在执行中…"
-                : "输入给 Agent 的指令（Ctrl/Cmd + Enter 发送）…"
-          }
+          disabled={cannotSend}
+          placeholder={placeholder}
           onChange={(e) => {
             setText(e.target.value);
             adjustHeight();
