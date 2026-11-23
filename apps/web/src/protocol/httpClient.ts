@@ -131,6 +131,13 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     );
   }
 
+  async resumeSession(sessionId: SessionId): Promise<SessionSummary> {
+    return this.request<SessionSummary>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/resume`,
+      { method: "POST" }
+    );
+  }
+
   async resolveApproval(
     approvalId: ApprovalId,
     decision: ApprovalDecision

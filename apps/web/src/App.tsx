@@ -268,6 +268,7 @@ export function App() {
           if (ev.type === "turn_ended") {
             status = ev.stop_reason === "failed" ? "failed" : "idle";
           }
+          if (ev.type === "error") status = "failed";
           return {
             ...s,
             status,
@@ -343,6 +344,16 @@ export function App() {
       await client.cancelSession(selectedSessionId);
     } catch (err) {
       setStreamError(err instanceof Error ? err.message : "中断回合失败");
+    }
+  }, [client, selectedSessionId]);
+
+  const handleResume = useCallback(async () => {
+    if (!client || !selectedSessionId) return;
+    setStreamError(null);
+    try {
+      await client.resumeSession(selectedSessionId);
+    } catch (err) {
+      setStreamError(err instanceof Error ? err.message : "恢复会话失败");
     }
   }, [client, selectedSessionId]);
 
@@ -450,6 +461,17 @@ export function App() {
                 )}
                 <span>{badge.label}</span>
               </span>
+            )}
+
+            {selectedSession && activeStatus === "failed" && (
+              <button
+                type="button"
+                id="resume-session-btn"
+                className="btn btn-primary btn-sm"
+                onClick={() => void handleResume()}
+              >
+                恢复会话
+              </button>
             )}
 
             {client.mode === "mock" && selectedSession && (

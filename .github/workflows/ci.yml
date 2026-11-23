@@ -77,5 +77,39 @@ jobs:
       - name: Production build
         run: pnpm build
 
-      - name: Playwright E2E
+      - name: Playwright E2E (Mock Workbench)
         run: pnpm test:e2e
+
+  fullstack-e2e:
+    name: Full-Stack E2E (om-server + Web + SQLite restart)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld pkg-config libssl-dev libsqlite3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build om-server
+        run: cargo build --bin om-server
+
+      - name: Install & build Web frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Run full-stack Playwright E2E
+        run: pnpm test:e2e:fullstack

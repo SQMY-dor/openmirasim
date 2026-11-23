@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "playwright test"
+    "test": "playwright test",
+    "test:fullstack": "playwright test --config playwright.fullstack.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.52.0",
