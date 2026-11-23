@@ -199,6 +199,14 @@ fn unsafe_paths_are_rejected() {
         "a%2fb",
         "a\\b",
         "./x",
+        ".%09.",
+        "v1/.%0a./x",
+        "v1/a%3fb",
+        "v1/a%23b",
+        "v1/a b",
+        "v1/a\tb",
+        "v1/%zz",
+        "v1/%2",
     ] {
         assert!(!safe_rest(bad), "{bad}");
     }
@@ -317,6 +325,31 @@ async fn bad_tokens_unknown_providers_and_escapes_are_refused() {
         .await
         .unwrap();
     assert_eq!(status(r), 400);
+    // The router decodes `%64` to `d`; the raw path no longer starts with the
+    // provider, so the request is refused instead of using the decoded rest.
+    for path in [
+        "/p/%64eepseek/.%09./admin",
+        "/p/deepseek/.%09./admin",
+        "/p/deepseek/v1%3fx=1",
+        "/p/deepseek/v1%23frag",
+    ] {
+        let r = fx
+            .http
+            .get(fx.url(path))
+            .bearer_auth(&g.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status(r), 400, "{path}");
+    }
+    let r = fx
+        .http
+        .request(reqwest::Method::TRACE, fx.url("/p/deepseek/x"))
+        .bearer_auth(&g.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status(r), 405);
     let r = fx.http.get(fx.url("/elsewhere")).send().await.unwrap();
     assert_eq!(status(r), 404);
     assert!(
@@ -449,4 +482,90 @@ fn proxy_env_sandbox_sets_env_and_network() {
     assert_eq!(out.env["ANTHROPIC_API_KEY"], "ost_x");
     assert_eq!(out.args, ["network=true"]);
     assert_eq!(sb.mode(), SandboxMode::Bwrap);
+}
+
+#[test]
+fn upstream_url_stays_under_the_base_path() {
+    let base = reqwest::Url::parse("https://api.example.com/v1").unwrap();
+    let u = upstream_url(&base, "chat/completions", Some("a=1")).unwrap();
+    assert_eq!(u.as_str(), "https://api.example.com/v1/chat/completions?a=1");
+    assert!(upstream_url(&base, "", None).is_some());
+    assert!(upstream_url(&base, "../x", None).is_none());
+    assert!(upstream_url(&base, "x", Some("a#b")).is_none());
+    let other = reqwest::Url::parse("https://api.example.com/v1x").unwrap();
+    assert!(upstream_url(&base, "", None).unwrap().path().starts_with(base.path()));
+    let _ = other;
+}
+
+#[tokio::test]
+async fn config_rejects_bad_upstreams_and_keys() {
+    for (up, key) in [
+        ("https://u:p@api.example.com", "k"),
+        ("https://api.example.com/#x", "k"),
+        ("https://api.example.com", "bad\nkey"),
+    ] {
+        let config = ProxyConfig {
+            providers: vec![ProviderConfig::new("x", ProviderKind::OpenAi, up, key)],
+            ..ProxyConfig::default()
+        };
+        let r = KeyProxy::start(config, "127.0.0.1:0".parse().unwrap()).await;
+        assert!(matches!(r, Err(CoreError::InvalidInput(_))), "{up}");
+    }
+}
+
+#[tokio::test]
+async fn concurrent_grant_revoke_and_stats_do_not_deadlock() {
+    let fx = setup().await;
+    let p = fx.proxy.clone();
+    let sessions: Vec<SessionId> = (0..8).map(|_| SessionId::new()).collect();
+    let done = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || {
+            std::thread::scope(|sc| {
+                for i in 0..4 {
+                    let p = p.clone();
+                    let sessions = sessions.clone();
+                    sc.spawn(move || {
+                        for n in 0..2000 {
+                            let s = &sessions[(n + i) % sessions.len()];
+                            match (n + i) % 3 {
+                                0 => {
+                                    p.grant(s).unwrap();
+                                }
+                                1 => p.revoke_session(s),
+                                _ => {
+                                    let _ = p.stats(s);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }),
+    )
+    .await;
+    assert!(done.is_ok(), "grant/revoke/stats deadlocked");
+}
+
+#[tokio::test]
+async fn revoke_grant_only_revokes_the_current_token() {
+    let fx = setup().await;
+    let s = SessionId::new();
+    let old = fx.proxy.grant(&s).unwrap();
+    let new = fx.proxy.grant(&s).unwrap();
+    fx.proxy.revoke_grant(&s, &old);
+    assert!(fx.proxy.stats(&s).is_some(), "the newer token survives");
+    fx.proxy.revoke_grant(&s, &new);
+    assert!(fx.proxy.stats(&s).is_none());
+}
+
+#[tokio::test]
+async fn expired_tokens_leave_no_session_entry() {
+    let fx = setup_with(Duration::from_millis(20), 1024).await;
+    let a = SessionId::new();
+    fx.proxy.grant(&a).unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    fx.proxy.grant(&SessionId::new()).unwrap();
+    assert!(fx.proxy.stats(&a).is_none());
+    assert!(!fx.proxy.store().by_session.contains_key(&a));
 }

@@ -24,7 +24,7 @@ mod tests;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use om_core::ids::SessionId;
@@ -116,6 +116,14 @@ pub struct ProxyConfig {
     /// Honor `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` for upstream calls (needed where
     /// providers are only reachable through an outbound proxy).
     pub use_system_proxy: bool,
+    /// Longest gap between two reads of an upstream response (streams included).
+    pub read_timeout: Duration,
+    /// Longest time to receive a client's request body.
+    pub body_timeout: Duration,
+    /// Requests forwarded at once across all sessions; more get `503`.
+    pub max_concurrent: usize,
+    /// Requests forwarded at once for one session; more get `429`.
+    pub max_concurrent_per_session: u64,
 }
 
 impl Default for ProxyConfig {
@@ -126,6 +134,10 @@ impl Default for ProxyConfig {
             max_body_bytes: 32 * 1024 * 1024,
             connect_timeout: Duration::from_secs(10),
             use_system_proxy: true,
+            read_timeout: Duration::from_secs(300),
+            body_timeout: Duration::from_secs(60),
+            max_concurrent: 256,
+            max_concurrent_per_session: 16,
         }
     }
 }
@@ -157,16 +169,50 @@ struct Grant {
     expires_at: Instant,
     requests: AtomicU64,
     upstream_errors: AtomicU64,
+    in_flight: AtomicU64,
+}
+
+/// Tokens and their sessions, kept under one lock so the two maps never disagree and
+/// no two locks are ever taken in different orders.
+#[derive(Default)]
+struct GrantStore {
+    /// sha256(token) -> grant
+    grants: HashMap<String, Arc<Grant>>,
+    /// session -> sha256(token), so a session holds at most one live token.
+    by_session: HashMap<SessionId, String>,
+}
+
+impl GrantStore {
+    fn purge_expired(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|(_, g)| g.expires_at <= now)
+            .map(|(h, _)| h.clone())
+            .collect();
+        for h in expired {
+            if let Some(g) = self.grants.remove(&h)
+                && self.by_session.get(&g.session_id) == Some(&h)
+            {
+                self.by_session.remove(&g.session_id);
+            }
+        }
+    }
+}
+
+/// A validated provider: its config plus the parsed base URL and the auth header value.
+struct Provider {
+    config: ProviderConfig,
+    base: reqwest::Url,
+    key_header: HeaderValue,
 }
 
 struct Inner {
     addr: SocketAddr,
     config: ProxyConfig,
-    providers: HashMap<String, ProviderConfig>,
-    /// sha256(token) -> grant
-    grants: Mutex<HashMap<String, Arc<Grant>>>,
-    /// session -> sha256(token), so a session holds at most one live token.
-    by_session: Mutex<HashMap<SessionId, String>>,
+    providers: HashMap<String, Provider>,
+    store: Mutex<GrantStore>,
+    in_flight: Arc<tokio::sync::Semaphore>,
     client: reqwest::Client,
 }
 
@@ -199,7 +245,12 @@ fn new_token() -> CoreResult<String> {
         }))
 }
 
-fn validate(config: &ProxyConfig) -> CoreResult<HashMap<String, ProviderConfig>> {
+fn validate(config: &ProxyConfig) -> CoreResult<HashMap<String, Provider>> {
+    if config.max_concurrent == 0 || config.max_concurrent_per_session == 0 {
+        return Err(CoreError::InvalidInput(
+            "proxy concurrency limits must be at least 1".into(),
+        ));
+    }
     let mut providers = HashMap::new();
     let mut env_names = std::collections::HashSet::new();
     for p in &config.providers {
@@ -216,9 +267,15 @@ fn validate(config: &ProxyConfig) -> CoreResult<HashMap<String, ProviderConfig>>
         }
         let url = reqwest::Url::parse(&p.upstream)
             .map_err(|e| CoreError::InvalidInput(format!("provider `{}` upstream: {e}", p.id)))?;
-        if !matches!(url.scheme(), "https" | "http") || url.query().is_some() {
+        if !matches!(url.scheme(), "https" | "http")
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+        {
             return Err(CoreError::InvalidInput(format!(
-                "provider `{}` upstream must be an http(s) URL without a query",
+                "provider `{}` upstream must be an http(s) URL with a host and no query, fragment or credentials",
                 p.id
             )));
         }
@@ -228,6 +285,20 @@ fn validate(config: &ProxyConfig) -> CoreResult<HashMap<String, ProviderConfig>>
                 p.id
             )));
         }
+        let mut key_header = HeaderValue::from_str(&match p.kind {
+            ProviderKind::Anthropic => p.api_key.clone(),
+            ProviderKind::OpenAi => format!("Bearer {}", p.api_key),
+        })
+        .map_err(|_| {
+            CoreError::InvalidInput(format!(
+                "provider `{}` API key is not a valid header value",
+                p.id
+            ))
+        })?;
+        key_header.set_sensitive(true);
+        let mut base = url;
+        let trimmed = base.path().trim_end_matches('/').to_owned();
+        base.set_path(&trimmed);
         let (b, k) = p.env_names();
         for name in [b, k] {
             if !env_names.insert(name.clone()) {
@@ -236,7 +307,12 @@ fn validate(config: &ProxyConfig) -> CoreResult<HashMap<String, ProviderConfig>>
                 )));
             }
         }
-        if providers.insert(p.id.clone(), p.clone()).is_some() {
+        let provider = Provider {
+            config: p.clone(),
+            base,
+            key_header,
+        };
+        if providers.insert(p.id.clone(), provider).is_some() {
             return Err(CoreError::InvalidInput(format!(
                 "duplicate provider id `{}`",
                 p.id
@@ -261,6 +337,7 @@ impl KeyProxy {
         let providers = validate(&config)?;
         let mut builder = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
+            .read_timeout(config.read_timeout)
             .redirect(reqwest::redirect::Policy::none());
         if !config.use_system_proxy {
             builder = builder.no_proxy();
@@ -270,13 +347,14 @@ impl KeyProxy {
             .map_err(|e| CoreError::InvalidInput(format!("http client: {e}")))?;
         let listener = TcpListener::bind(bind).await?;
         let addr = listener.local_addr()?;
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
         let proxy = Self {
             inner: Arc::new(Inner {
+                in_flight,
                 addr,
                 config,
                 providers,
-                grants: Mutex::default(),
-                by_session: Mutex::default(),
+                store: Mutex::default(),
                 client,
             }),
         };
@@ -305,8 +383,8 @@ impl KeyProxy {
             .providers
             .values()
             .map(|p| ProviderInfo {
-                id: p.id.clone(),
-                kind: p.kind,
+                id: p.config.id.clone(),
+                kind: p.config.kind,
             })
             .collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
@@ -323,19 +401,18 @@ impl KeyProxy {
             expires_at: Instant::now() + self.inner.config.token_ttl,
             requests: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
         });
         {
-            let mut grants = self.inner.grants.lock().expect("grants poisoned");
-            let mut by_session = self.inner.by_session.lock().expect("by_session poisoned");
-            if let Some(old) = by_session.insert(session_id.clone(), h.clone()) {
-                grants.remove(&old);
+            let mut store = self.store();
+            store.purge_expired(Instant::now());
+            if let Some(old) = store.by_session.insert(session_id.clone(), h.clone()) {
+                store.grants.remove(&old);
             }
-            let now = Instant::now();
-            grants.retain(|_, g| g.expires_at > now);
-            grants.insert(h, grant);
+            store.grants.insert(h, grant);
         }
         let mut env = BTreeMap::new();
-        for p in self.inner.providers.values() {
+        for p in self.inner.providers.values().map(|p| &p.config) {
             let (base_env, key_env) = p.env_names();
             env.insert(base_env, format!("http://{}/p/{}", self.inner.addr, p.id));
             env.insert(key_env, token.clone());
@@ -345,19 +422,35 @@ impl KeyProxy {
 
     /// Revokes the session's token. Call when the session's agent stops.
     pub fn revoke_session(&self, session_id: &SessionId) {
-        let mut grants = self.inner.grants.lock().expect("grants poisoned");
-        let mut by_session = self.inner.by_session.lock().expect("by_session poisoned");
-        if let Some(h) = by_session.remove(session_id) {
-            grants.remove(&h);
+        let mut store = self.store();
+        if let Some(h) = store.by_session.remove(session_id) {
+            store.grants.remove(&h);
         }
+    }
+
+    /// Revokes `grant`'s token only if it is still the session's current one, so a
+    /// stale owner cannot revoke the token a newer agent of the same session holds.
+    pub fn revoke_grant(&self, session_id: &SessionId, grant: &SessionGrant) {
+        let h = hash(&grant.token);
+        let mut store = self.store();
+        if store.by_session.get(session_id) == Some(&h) {
+            store.by_session.remove(session_id);
+        }
+        store.grants.remove(&h);
+    }
+
+    fn store(&self) -> std::sync::MutexGuard<'_, GrantStore> {
+        self.inner
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Counters for the session's current token.
     pub fn stats(&self, session_id: &SessionId) -> Option<ProxyStats> {
-        let by_session = self.inner.by_session.lock().ok()?;
-        let h = by_session.get(session_id)?;
-        let grants = self.inner.grants.lock().ok()?;
-        grants.get(h).map(|g| ProxyStats {
+        let store = self.store();
+        let h = store.by_session.get(session_id)?;
+        store.grants.get(h).map(|g| ProxyStats {
             requests: g.requests.load(Ordering::Relaxed),
             upstream_errors: g.upstream_errors.load(Ordering::Relaxed),
         })
@@ -367,8 +460,9 @@ impl KeyProxy {
         if !token.starts_with(SESSION_TOKEN_PREFIX) {
             return None;
         }
-        let grants = self.inner.grants.lock().ok()?;
-        grants
+        let store = self.store();
+        store
+            .grants
             .get(&hash(token))
             .filter(|g| g.expires_at > Instant::now())
             .cloned()
@@ -447,15 +541,107 @@ fn drop_response_header(name: &HeaderName) -> bool {
     )
 }
 
-/// Rejects paths that could climb out of the provider's base URL once decoded.
+/// Value of a hex digit.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decodes one path segment; `None` on a malformed escape.
+fn decode_segment(seg: &str) -> Option<Vec<u8>> {
+    let b = seg.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hi = hex_val(*b.get(i + 1)?)?;
+            let lo = hex_val(*b.get(i + 2)?)?;
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Rejects paths that could climb out of the provider's base URL, change the query or
+/// fragment, or be rewritten by URL parsers (which strip tabs and newlines), whether
+/// written literally or percent-encoded.
 fn safe_rest(rest: &str) -> bool {
-    !rest.starts_with('/')
-        && !rest.contains('\\')
-        && rest.split('/').all(|seg| {
-            let lower = seg.to_ascii_lowercase();
-            let decoded = lower.replace("%2e", ".");
-            decoded != "." && decoded != ".." && !lower.contains("%2f") && !lower.contains("%5c")
-        })
+    if rest.starts_with('/') {
+        return false;
+    }
+    rest.split('/').all(|seg| {
+        let Some(decoded) = decode_segment(seg) else {
+            return false;
+        };
+        let bad_byte = decoded
+            .iter()
+            .chain(seg.as_bytes())
+            .any(|&c| c <= 0x20 || c == 0x7f || matches!(c, b'?' | b'#' | b'\\' | b'/'));
+        !bad_byte && decoded != b"." && decoded != b".."
+    })
+}
+
+/// The upstream URL for `raw_rest` under `base`, checked again after parsing so it keeps
+/// the base's scheme, host and port and stays under the base path.
+fn upstream_url(base: &reqwest::Url, raw_rest: &str, query: Option<&str>) -> Option<reqwest::Url> {
+    let mut s = base.as_str().trim_end_matches('/').to_owned();
+    if !raw_rest.is_empty() {
+        s.push('/');
+        s.push_str(raw_rest);
+    }
+    if let Some(q) = query {
+        if q.bytes().any(|c| c <= 0x20 || c == 0x7f || c == b'#') {
+            return None;
+        }
+        s.push('?');
+        s.push_str(q);
+    }
+    let url = reqwest::Url::parse(&s).ok()?;
+    let base_path = base.path().trim_end_matches('/');
+    let path_ok = url.path() == base_path
+        || url.path() == format!("{base_path}/")
+        || url.path().starts_with(&format!("{base_path}/"));
+    (url.scheme() == base.scheme()
+        && url.host_str() == base.host_str()
+        && url.port_or_known_default() == base.port_or_known_default()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && path_ok)
+        .then_some(url)
+}
+
+/// Header names a request's `Connection` header marks as hop-by-hop.
+fn connection_named(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Decrements a grant's in-flight count when the request (and its streamed response)
+/// is done.
+struct InFlight {
+    grant: Arc<Grant>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.grant.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn forward_root(
@@ -482,59 +668,76 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
     let Some(provider) = proxy.inner.providers.get(&provider_id) else {
         return error(StatusCode::NOT_FOUND, "unknown provider");
     };
+    let method = req.method().clone();
+    if !matches!(
+        method,
+        Method::GET | Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
     // Use the raw (still percent-encoded) path so the upstream sees exactly what the
-    // client sent, after checking it cannot escape the base path.
+    // client sent, after checking it cannot escape the base path. The router decoded
+    // `provider`, so a raw path that does not start with it literally is refused
+    // rather than falling back to the decoded rest.
+    let _ = &rest;
     let raw_path = req.uri().path();
     let prefix = format!("/p/{provider_id}");
-    let raw_rest = raw_path
-        .strip_prefix(&prefix)
-        .map(|r| r.strip_prefix('/').unwrap_or(r))
-        .unwrap_or(&rest);
+    let raw_rest = match raw_path.strip_prefix(&prefix) {
+        Some("") => "",
+        Some(r) if r.starts_with('/') => &r[1..],
+        _ => return error(StatusCode::BAD_REQUEST, "path not allowed"),
+    };
     if !safe_rest(raw_rest) {
         return error(StatusCode::BAD_REQUEST, "path not allowed");
     }
-    let mut url = provider.upstream.trim_end_matches('/').to_owned();
-    if !raw_rest.is_empty() {
-        url.push('/');
-        url.push_str(raw_rest);
-    }
-    if let Some(q) = req.uri().query() {
-        url.push('?');
-        url.push_str(q);
+    let Some(url) = upstream_url(&provider.base, raw_rest, req.uri().query()) else {
+        return error(StatusCode::BAD_REQUEST, "path not allowed");
+    };
+
+    // Concurrency: one slot per session, then a global slot.
+    let per_session = grant.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    let Ok(permit) = proxy.inner.in_flight.clone().try_acquire_owned() else {
+        grant.in_flight.fetch_sub(1, Ordering::Relaxed);
+        return error(StatusCode::SERVICE_UNAVAILABLE, "proxy is busy");
+    };
+    let guard = InFlight {
+        grant: grant.clone(),
+        _permit: permit,
+    };
+    if per_session > proxy.inner.config.max_concurrent_per_session {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent requests for this session",
+        );
     }
 
-    let method = req.method().clone();
+    let hop = connection_named(req.headers());
     let mut headers = HeaderMap::new();
     for (name, value) in req.headers() {
-        if !drop_request_header(name) {
+        if !drop_request_header(name) && !hop.iter().any(|h| h == name.as_str()) {
             headers.append(name.clone(), value.clone());
         }
     }
-    let key = match HeaderValue::from_str(&match provider.kind {
-        ProviderKind::Anthropic => provider.api_key.clone(),
-        ProviderKind::OpenAi => format!("Bearer {}", provider.api_key),
-    }) {
-        Ok(mut v) => {
-            v.set_sensitive(true);
-            v
-        }
-        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "invalid provider key"),
-    };
-    match provider.kind {
-        ProviderKind::Anthropic => headers.insert("x-api-key", key),
-        ProviderKind::OpenAi => headers.insert(header::AUTHORIZATION, key),
+    match provider.config.kind {
+        ProviderKind::Anthropic => headers.insert("x-api-key", provider.key_header.clone()),
+        ProviderKind::OpenAi => headers.insert(header::AUTHORIZATION, provider.key_header.clone()),
     };
 
-    let body = match axum::body::to_bytes(req.into_body(), proxy.inner.config.max_body_bytes).await
+    let body = match tokio::time::timeout(
+        proxy.inner.config.body_timeout,
+        axum::body::to_bytes(req.into_body(), proxy.inner.config.max_body_bytes),
+    )
+    .await
     {
-        Ok(b) => b,
-        Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Ok(Ok(b)) => b,
+        Ok(Err(_)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
+        Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "request body timed out"),
     };
 
     let upstream = proxy
         .inner
         .client
-        .request(method, &url)
+        .request(method, url)
         .headers(headers)
         .body(body)
         .send()
@@ -554,12 +757,17 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
     };
 
     let mut out = Response::builder().status(resp.status());
+    let hop = connection_named(resp.headers());
     for (name, value) in resp.headers() {
-        if !drop_response_header(name) {
+        if !drop_response_header(name) && !hop.iter().any(|h| h == name.as_str()) {
             out = out.header(name, value);
         }
     }
-    out.body(Body::from_stream(resp.bytes_stream()))
+    let stream = futures::StreamExt::map(resp.bytes_stream(), move |chunk| {
+        let _held = &guard;
+        chunk
+    });
+    out.body(Body::from_stream(stream))
         .unwrap_or_else(|_| error(StatusCode::BAD_GATEWAY, "bad upstream response"))
 }
 

@@ -107,7 +107,8 @@ impl Db {
             let n = conn
                 .execute(
                     "UPDATE schedules SET name = ?2, spec = ?3, target = ?4, enabled = ?5,
-                            missed = ?6, overlap = ?7, next_run_at = ?8, updated_at = ?9
+                            missed = ?6, overlap = ?7, next_run_at = ?8, updated_at = ?9,
+                            created_by = ?10
                      WHERE id = ?1",
                     params![
                         s.id.as_str(),
@@ -118,7 +119,8 @@ impl Db {
                         enum_str(&s.missed),
                         enum_str(&s.overlap),
                         s.next_run_at,
-                        s.updated_at
+                        s.updated_at,
+                        s.created_by.as_str()
                     ],
                 )
                 .map_err(|e| name_taken(e, &s.name))?;
