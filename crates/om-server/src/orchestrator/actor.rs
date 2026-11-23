@@ -540,6 +540,8 @@ impl Actor {
             .filter(|(_, d)| **d <= now)
             .map(|(id, _)| id.clone())
             .collect();
+        // A storage hiccup must not leave the approval waiting forever: retry shortly.
+        let retry_at = now + std::time::Duration::from_secs(1);
         for id in due {
             self.deadlines.remove(&id);
             let decision = match self.db.get_approval(&id).await {
@@ -547,8 +549,13 @@ impl Actor {
                     Some(option_id) => ApprovalDecision::Selected { option_id },
                     None => ApprovalDecision::Cancelled,
                 },
+                Err(CoreError::NotFound(_)) => {
+                    self.pending.remove(&id);
+                    continue;
+                }
                 Err(e) => {
                     tracing::error!(session = %self.id, error = %e, "failed to load approval");
+                    self.deadlines.insert(id, retry_at);
                     continue;
                 }
             };
@@ -564,7 +571,8 @@ impl Actor {
                     self.pending.remove(&id);
                 }
                 Err(e) => {
-                    tracing::error!(session = %self.id, error = %e, "failed to expire approval")
+                    tracing::error!(session = %self.id, error = %e, "failed to expire approval");
+                    self.deadlines.insert(id, retry_at);
                 }
             }
         }
@@ -713,7 +721,11 @@ impl Actor {
         let turn = self.turn.clone();
         let turn_payload = |f: &dyn Fn(TurnId) -> EventPayload| turn.clone().map(f);
         match ev {
-            HarnessEvent::NativeSessionId(_) => {}
+            HarnessEvent::NativeSessionId(native) => {
+                if let Err(e) = self.db.set_native_session_id(&self.id, native).await {
+                    tracing::warn!(session = %self.id, error = %e, "native session id not saved");
+                }
+            }
             HarnessEvent::MessageChunk(content) => {
                 if let Some(p) = turn_payload(&|turn_id| EventPayload::AgentMessageChunk {
                     turn_id,
@@ -844,16 +856,62 @@ pub(crate) async fn run(
         paused: false,
     };
 
-    let events = start_harness(&mut actor, &spec).await;
-    let Some(mut events) = events else {
-        // Fail queued commands so callers do not hang.
-        commands.close();
-        while let Some(cmd) = commands.recv().await {
-            reject(cmd, CoreError::Harness("harness failed to start".into()));
+    // Starting can take a while (handshake timeouts): keep answering `Close` meanwhile
+    // (review P2-5). Other commands wait until the agent is up.
+    let mut buffered = Vec::new();
+    let mut close_reply = None;
+    let started = {
+        let start = start_harness(&mut actor, &spec);
+        tokio::pin!(start);
+        loop {
+            tokio::select! {
+                r = &mut start => break Some(r),
+                cmd = commands.recv() => match cmd {
+                    Some(Command::Close { reply }) => {
+                        close_reply = Some(reply);
+                        break None;
+                    }
+                    Some(other) => buffered.push(other),
+                    None => break None,
+                },
+            }
         }
-        on_exit();
-        return;
     };
+    let mut events = match started {
+        Some(Some(events)) => events,
+        Some(None) | None => {
+            if let Some(reply) = close_reply {
+                // The start was abandoned (dropping it stops the agent).
+                let _ = reply.send(actor.on_close().await);
+            }
+            // Fail queued commands so callers do not hang.
+            commands.close();
+            for cmd in buffered {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            while let Some(cmd) = commands.recv().await {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            on_exit();
+            return;
+        }
+    };
+    for cmd in buffered {
+        if handle_command(&mut actor, cmd).await {
+            if let Some(s) = actor.session.take() {
+                let _ = s.shutdown().await;
+            }
+            commands.close();
+            while let Ok(cmd) = commands.try_recv() {
+                reject(
+                    cmd,
+                    CoreError::InvalidInput("session is no longer running".into()),
+                );
+            }
+            on_exit();
+            return;
+        }
+    }
 
     loop {
         let deadline = actor.next_deadline();

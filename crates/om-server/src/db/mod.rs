@@ -390,9 +390,14 @@ impl Db {
     ) -> CoreResult<EventPage> {
         let session_id = session_id.clone();
         let limit = limit.max(1);
+        // SQLite integers are signed; a larger cursor is past every event.
+        let after_seq = i64::try_from(after_seq).unwrap_or(i64::MAX);
         self.read(move |conn| {
-            let head_seq = head_seq(conn, &session_id)?;
-            let mut stmt = conn
+            // One read transaction, so `head_seq` and the page come from the same
+            // snapshot (review P2-6).
+            let tx = conn.unchecked_transaction().map_err(storage)?;
+            let head_seq = head_seq(&tx, &session_id)?;
+            let mut stmt = tx
                 .prepare(
                     "SELECT seq, ts, payload FROM events
                      WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
@@ -400,7 +405,7 @@ impl Db {
                 .map_err(storage)?;
             let rows = stmt
                 .query_map(
-                    params![session_id.as_str(), after_seq as i64, limit as i64 + 1],
+                    params![session_id.as_str(), after_seq, limit as i64 + 1],
                     |r| {
                         let seq: i64 = r.get(0)?;
                         let ts: i64 = r.get(1)?;
@@ -415,6 +420,8 @@ impl Db {
                 )
                 .map_err(storage)?;
             let mut events = rows.collect::<Result<Vec<_>, _>>().map_err(storage)?;
+            drop(stmt);
+            tx.finish().map_err(storage)?;
             let has_more = events.len() > limit as usize;
             events.truncate(limit as usize);
             Ok(EventPage {
@@ -575,6 +582,8 @@ impl Db {
     ) -> CoreResult<Vec<StoredApproval>> {
         let session_id = session_id.clone();
         self.read(move |conn| {
+            // An unknown session is NotFound, not an empty list (review P2-6).
+            head_seq(conn, &session_id)?;
             let sql = if pending_only {
                 format!(
                     "{APPROVAL_COLUMNS} WHERE session_id = ?1 AND status = 'pending' ORDER BY created_at, id"
@@ -587,6 +596,21 @@ impl Db {
                 .query_map([session_id.as_str()], row_to_approval)
                 .map_err(storage)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+        })
+        .await
+    }
+
+    /// Records a native session id the harness learned after start (e.g. after the
+    /// first turn), so the session can be resumed later (review P2-5).
+    pub async fn set_native_session_id(&self, id: &SessionId, native: String) -> CoreResult<()> {
+        let id = id.clone();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE sessions SET native_session_id = ?2 WHERE id = ?1",
+                params![id.as_str(), native],
+            )
+            .map_err(storage)?;
+            Ok(())
         })
         .await
     }
