@@ -21,7 +21,7 @@
 
 ### Phase 1：Linux 裸金属隔离 + 审批闭环 + 多 CLI Agent + `om-cli ctl`
 **可复现 Demo 验收标准**：
-- [ ] 为会话自动创建隔离 Git Worktree，Agent 在 **`bubblewrap` (`bwrap`) + `systemd-run`/cgroups v2** 沙箱内执行（主入口已接线；待合入 `docs/code-review.md` 中 `git_common_dir` 只读/代理挂载等 P0 加固后完成越界对抗验收）
+- [x] 为会话自动创建隔离 Git Worktree，Agent 在 **`bubblewrap` (`bwrap`) + `systemd-run`/cgroups v2** 沙箱内执行（含 PR #29 每会话独立仓库与只读 `.git` 隔离加固，CI `OM_REQUIRE_BWRAP=1` 验收通过）
 - [x] Agent 发起高危工具调用时触发 `ApprovalRequest`，Web 页面弹出审批卡片，审批通过后会话继续执行；并发重复审批被原子拒绝，并支持记住/清空会话级审批规则
 - [x] 在 Web 页面注册 Git 仓库并查看当前会话 Worktree 的文件树、源码预览与实时 Git Diff
 - [x] 完整接入 4 个无头 CLI Agent：**`opencode`**、**`dsh`**（DeepSeek Harness）、**`cc`**（Claude Code）、**`codexcli`**（Codex CLI），支持启动前版本与能力探测（`/api/v1/harnesses/probe`）
@@ -29,11 +29,11 @@
 
 ### Phase 2：30 人团队协作 + 密钥隔离 + PWA 推送 + Antigravity GUI 桥接
 **可复现 Demo 验收标准**：
-- [ ] 支持 30 人以内团队成员管理、`Owner/Admin/Member/Viewer` 角色权限校验、设备 Token 签发/吊销与操作审计日志
-- [ ] 宿主机本地鉴权代理生效：沙箱内执行 `env` 看不到真实上游模型 API Key，且 BYOK 调用正常完成
-- [ ] 多成员同时打开同一会话可实时同步输出，支持 `Queue & Steer`（排队、插队、撤回；不支持原生 Steer 的 Harness 自动降级）
-- [ ] 移动端浏览器以 **PWA** 安装后收到 **Web Push** 审批提醒并可直接点击放行/拒绝
-- [ ] **Antigravity GUI 独立桥接原型（`om-gui-bridge`）**：以独立外部进程接入（Linux `Xvfb` + 1 成员 1 独立用户 Profile 隔离 + 单机并发上限与空闲回收），支持消息转发与一键切入 noVNC 画面人工接管
+- [x] 支持 30 人以内团队成员管理、`Owner/Admin/Member/Viewer` 角色权限校验、设备 Token（`omt_...`）签发/吊销与操作审计日志（服务端 RBAC + Web 团队控制台 + `om-cli ctl members/tokens`）
+- [x] 宿主机本地鉴权代理生效：沙箱内执行 `env` 看不到真实上游模型 API Key，仅持有短期 `ost_...` 会话令牌且 BYOK 调用与统计接口正常完成
+- [x] 多成员同时打开同一会话可实时同步输出，支持 `Queue & Steer`（排队、插队、撤回、成员归属；不支持原生 Steer 的 Harness 自动降级）
+- [x] 移动端浏览器以 **PWA**（`manifest.webmanifest` + `sw.js`）安装后支持 **Web Push / Service Worker 审批提醒**并可直接点击放行/拒绝（含 SSRF 校验与订阅管理 API）
+- [x] **Antigravity GUI 独立桥接原型（`om-gui-bridge`）**：以独立外部进程接入（Linux `Xvfb` + 1 成员 1 独立 `0700` Profile 隔离 + 单机并发上限配额与空闲自动回收），支持消息转发与一键切入 noVNC 远程接管画面（不绕过登录/CAPTCHA，安全引导人工接管）
 
 ### Phase 3：桌面薄壳 + PTY 原生终端 + Ratatui TUI
 **可复现 Demo 验收标准**：

@@ -3,6 +3,7 @@ members = [
     "crates/om-core",
     "crates/om-server",
     "crates/om-cli",
+    "crates/om-gui-bridge",
 ]
 resolver = "3"
 

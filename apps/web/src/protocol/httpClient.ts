@@ -10,13 +10,35 @@ import {
   type ApprovalDecision,
   type ApprovalId,
   type ApprovalRuleView,
+  type AuditEntry,
+  type ClearApprovalRulesResponse,
   type ClientMessage,
   type CreateSessionRequest,
+  type DeviceTokenRecord,
   type HarnessDescriptor,
+  type IssuedToken,
+  type ListApprovalRulesResponse,
+  type ListAuditResponse,
   type ListEventsResponse,
+  type ListMembersResponse,
+  type ListProvidersResponse,
   type ListSessionsResponse,
+  type ListTokensResponse,
+  type ListWorkspacesResponse,
+  type ListWorktreeFilesResponse,
+  type MemberId,
+  type MemberRecord,
+  type Principal,
+  type ProviderInfo,
+  type ProxyStats,
+  type PushConfigResponse,
+  type PushSubscriptionRecord,
+  type PushTestResponse,
   type QueuedPromptId,
+  type RegisterPushSubscriptionRequest,
+  type RemoteScreenResponse,
   type ResolveApprovalRequest,
+  type Role,
   type ServerInfo,
   type ServerMessage,
   type SessionEvent,
@@ -25,6 +47,7 @@ import {
   type SubmitMode,
   type SubmitOutcome,
   type SubmitPromptResponse,
+  type TokenId,
   type WorkspaceSummary,
   type WorktreeDiff,
   type WorktreeEntry,
@@ -42,20 +65,8 @@ interface ListHarnessesResponse {
   harnesses: HarnessDescriptor[];
 }
 
-interface ListWorkspacesResponse {
-  workspaces: WorkspaceSummary[];
-}
-
-interface ListWorktreeFilesResponse {
-  entries: WorktreeEntry[];
-}
-
-interface ListApprovalRulesResponse {
-  rules: ApprovalRuleView[];
-}
-
-interface ClearApprovalRulesResponse {
-  cleared: number;
+interface ListPushSubscriptionsResponse {
+  subscriptions: PushSubscriptionRecord[];
 }
 
 export class HttpOpenMirasimClient implements OpenMirasimClient {
@@ -99,7 +110,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
   }
 
   async connect(): Promise<ServerInfo> {
-    await this.listHarnesses();
+    await this.getMe();
     let serverVersion = "0.1.0";
     try {
       const res = await fetch(`${this.serverUrl}/healthz`);
@@ -116,6 +127,134 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       serverVersion,
       spaceLabel: "OpenMirasim Space",
     };
+  }
+
+  async getMe(): Promise<Principal> {
+    return this.request<Principal>("/api/v1/me");
+  }
+
+  async listMembers(): Promise<MemberRecord[]> {
+    const res = await this.request<ListMembersResponse>("/api/v1/members");
+    return res.members;
+  }
+
+  async addMember(displayName: string, role: Role): Promise<MemberRecord> {
+    return this.request<MemberRecord>("/api/v1/members", {
+      method: "POST",
+      body: JSON.stringify({ display_name: displayName, role }),
+    });
+  }
+
+  async changeMemberRole(
+    memberId: MemberId,
+    role: Role
+  ): Promise<MemberRecord> {
+    return this.request<MemberRecord>(
+      `/api/v1/members/${encodeURIComponent(memberId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ role }),
+      }
+    );
+  }
+
+  async disableMember(memberId: MemberId): Promise<MemberRecord> {
+    return this.request<MemberRecord>(
+      `/api/v1/members/${encodeURIComponent(memberId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async listMemberTokens(memberId: MemberId): Promise<DeviceTokenRecord[]> {
+    const res = await this.request<ListTokensResponse>(
+      `/api/v1/members/${encodeURIComponent(memberId)}/tokens`
+    );
+    return res.tokens;
+  }
+
+  async issueMemberToken(
+    memberId: MemberId,
+    label: string,
+    ttlSecs?: number
+  ): Promise<IssuedToken> {
+    return this.request<IssuedToken>(
+      `/api/v1/members/${encodeURIComponent(memberId)}/tokens`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          label,
+          ...(ttlSecs !== undefined ? { ttl_secs: ttlSecs } : {}),
+        }),
+      }
+    );
+  }
+
+  async revokeToken(tokenId: TokenId): Promise<DeviceTokenRecord> {
+    return this.request<DeviceTokenRecord>(
+      `/api/v1/tokens/${encodeURIComponent(tokenId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async listAudit(target?: string, limit = 100): Promise<AuditEntry[]> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (target?.trim()) {
+      params.set("target", target.trim());
+    }
+    const res = await this.request<ListAuditResponse>(
+      `/api/v1/audit?${params.toString()}`
+    );
+    return res.entries;
+  }
+
+  async listProviders(): Promise<ProviderInfo[]> {
+    const res = await this.request<ListProvidersResponse>("/api/v1/providers");
+    return res.providers;
+  }
+
+  async getSessionProxyStats(sessionId: SessionId): Promise<ProxyStats> {
+    return this.request<ProxyStats>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/proxy/stats`
+    );
+  }
+
+  async getRemoteScreen(sessionId: SessionId): Promise<RemoteScreenResponse> {
+    return this.request<RemoteScreenResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/remote-screen`
+    );
+  }
+
+  async getPushConfig(): Promise<PushConfigResponse> {
+    return this.request<PushConfigResponse>("/api/v1/push/config");
+  }
+
+  async listPushSubscriptions(): Promise<PushSubscriptionRecord[]> {
+    const res = await this.request<ListPushSubscriptionsResponse>(
+      "/api/v1/push/subscriptions"
+    );
+    return res.subscriptions;
+  }
+
+  async registerPushSubscription(
+    req: RegisterPushSubscriptionRequest
+  ): Promise<PushSubscriptionRecord> {
+    return this.request<PushSubscriptionRecord>("/api/v1/push/subscriptions", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  async deletePushSubscription(subId: string): Promise<void> {
+    await this.request<void>(
+      `/api/v1/push/subscriptions/${encodeURIComponent(subId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async testPush(): Promise<PushTestResponse> {
+    return this.request<PushTestResponse>("/api/v1/push/test", {
+      method: "POST",
+    });
   }
 
   async listHarnesses(): Promise<HarnessDescriptor[]> {

@@ -2,11 +2,15 @@
 //!
 //! Environment variables:
 //! - `OM_BIND`: TCP listen address (default `127.0.0.1:4939`)
-//! - `OM_DATA_DIR`: directory holding `openmirasim.db`, worktrees, scratch dirs, and homes (default `./data`)
-//! - `OM_TOKEN`: static Bearer token (required on non-loopback; auto-generated on loopback if unset)
+//! - `OM_DATA_DIR`: directory holding `openmirasim.db`, worktrees, scratch dirs, push subscriptions, and homes (default `./data`)
+//! - `OM_TOKEN`: optional static Owner bootstrap Bearer token (omit on production deployments to use pure `omt_...` RBAC device tokens)
+//! - `OM_OWNER_NAME`: display name for the initial bootstrapped `Owner` member (default `Owner`)
 //! - `OM_ALLOW_DIRECT_SANDBOX`: `1`/`true` to permit `SandboxMode::Direct` (refused unless `OM_BIND` is loopback)
 //! - `OM_REQUIRE_BWRAP`: `1`/`true` to fail startup if `bubblewrap` probing fails (default: fail when direct is disabled)
 //! - `OM_ENABLE_KEY_PROXY`: `1`/`true` to enable loopback [`KeyProxy`] using host provider keys and suppress raw key forwarding
+//! - `OM_GUI_BRIDGE_URL`: optional external `om-gui-bridge` URL (e.g. `http://127.0.0.1:4941`) registering the `antigravity-gui` harness
+//! - `OM_GUI_BRIDGE_TOKEN`: optional Bearer token for authenticating to `om-gui-bridge`
+//! - `OM_VAPID_PUBLIC_KEY`: optional VAPID public key advertised to PWA clients for Web Push
 //! - `OM_STATIC_DIR`: optional compiled Web frontend directory (auto-detects `apps/web/dist` when present)
 //! - `OM_CORS_ORIGIN`: optional allowed CORS origin (e.g. `http://127.0.0.1:5173`)
 //! - `OM_SPACE_NAME`: default space name (default `default`)
@@ -15,9 +19,12 @@
 use om_core::proxy::ProviderKind;
 use om_core::sandbox::CommandSpec;
 use om_server::acp::AcpHarness;
-use om_server::api::{ApiConfig, AppState, build_router};
+use om_server::api::{ApiConfig, ApiExtensions, AppState, build_router_with_extensions};
+use om_server::auth::Auth;
 use om_server::db::Db;
-use om_server::harness::HarnessRegistry;
+use om_server::harness::{
+    GuiBridgeConfig, GuiBridgeHarness, HarnessRegistry, RemoteScreenRegistry,
+};
 use om_server::orchestrator::{Orchestrator, OrchestratorConfig};
 use om_server::proxy::{KeyProxy, ProviderConfig, ProxyConfig};
 use om_server::sandbox::BwrapSandbox;
@@ -145,24 +152,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let auth_token = match env_non_empty("OM_TOKEN") {
-        Some(tok) => tok,
-        None if bind_addr.ip().is_loopback() => {
-            let generated = uuid::Uuid::now_v7().to_string();
-            eprintln!("OM_TOKEN not set; generated ephemeral loopback token: {generated}");
-            generated
-        }
-        None => {
-            return Err("refusing to start: OM_TOKEN must be set when binding non-loopback".into());
-        }
-    };
-
     let data_dir = PathBuf::from(std::env::var("OM_DATA_DIR").unwrap_or_else(|_| "./data".into()));
     let db_path = data_dir.join("openmirasim.db");
     let db = Db::open(&db_path)?;
 
     let space_name = std::env::var("OM_SPACE_NAME").unwrap_or_else(|_| "default".into());
     let default_space_id = db.ensure_space(&space_name).await?;
+
+    // Bootstrap the first Owner member & device token on a brand-new database.
+    let auth_svc = Auth::new(db.clone());
+    let owner_name = env_non_empty("OM_OWNER_NAME").unwrap_or_else(|| "Owner".into());
+    if let Some((owner, issued)) = auth_svc
+        .bootstrap_owner(&default_space_id, &owner_name, "bootstrap-owner")
+        .await?
+    {
+        eprintln!(
+            "Bootstrapped initial Owner `{}` ({}). One-time device token (save now, never printed again):\n  {}",
+            owner.display_name, owner.id, issued.secret
+        );
+    }
+
+    // Static OM_TOKEN is optional: when omitted, pure RBAC device tokens (`omt_...`) are used.
+    let auth_token = env_non_empty("OM_TOKEN").unwrap_or_default();
 
     let workspaces = WorkspaceManager::new(db.clone(), WorkspaceConfig::new(&data_dir))?;
 
@@ -185,6 +196,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             CommandSpec::new(fake_bin),
         )));
     }
+
+    let remote_screens = RemoteScreenRegistry::new();
+    let gui_bridge_enabled = if let Some(gui_cfg) = GuiBridgeConfig::from_env() {
+        tracing::info!(url = %gui_cfg.base_url, "registering external antigravity-gui bridge harness");
+        registry.register(Arc::new(GuiBridgeHarness::new(
+            gui_cfg,
+            remote_screens.clone(),
+        )));
+        true
+    } else {
+        false
+    };
 
     let mut orchestrator = Orchestrator::new(
         db,
@@ -225,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let static_dir = resolve_static_dir();
     let allow_cors_origin = env_non_empty("OM_CORS_ORIGIN");
+    let vapid_public_key = env_non_empty("OM_VAPID_PUBLIC_KEY");
 
     let state = AppState {
         orchestrator,
@@ -235,8 +259,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_cors_origin,
         },
     };
+    let extensions = ApiExtensions {
+        remote_screens,
+        push_store_path: Some(data_dir.join("push-subscriptions.json")),
+        vapid_public_key,
+        allow_loopback_push: bind_addr.ip().is_loopback(),
+    };
 
-    let app = build_router(state);
+    let app = build_router_with_extensions(state, extensions);
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!(
@@ -246,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_direct_sandbox,
         bwrap_enabled,
         key_proxy = proxy_task.is_some(),
+        gui_bridge = gui_bridge_enabled,
         "om-server listening"
     );
 

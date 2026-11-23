@@ -9,10 +9,24 @@ import {
   type ApprovalId,
   type ApprovalRecord,
   type ApprovalRuleView,
+  type AuditEntry,
   type CreateSessionRequest,
+  type DeviceTokenRecord,
   type EventPayload,
   type HarnessDescriptor,
+  type IssuedToken,
+  type MemberId,
+  type MemberRecord,
+  type Principal,
+  type ProviderInfo,
+  type ProxyStats,
+  type PushConfigResponse,
+  type PushSubscriptionRecord,
+  type PushTestResponse,
   type QueuedPromptId,
+  type RegisterPushSubscriptionRequest,
+  type RemoteScreenResponse,
+  type Role,
   type ServerInfo,
   type SessionEvent,
   type SessionId,
@@ -20,6 +34,7 @@ import {
   type SubmitMode,
   type SubmitOutcome,
   type SubmitPromptResponse,
+  type TokenId,
   type WorkspaceSummary,
   type WorktreeDiff,
   type WorktreeEntry,
@@ -219,9 +234,186 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
   private listeners = new Set<ListenerEntry>();
   private activeRuns = new Map<string, ActiveRun>();
   private approvalLookup = new Map<ApprovalId, PendingApprovalGate>();
+  private mockMembers: MemberRecord[] = [
+    {
+      id: "member_dev",
+      space_id: "space_default",
+      display_name: "Demo Owner",
+      role: "owner",
+      created_at: nowMs() - 86_400_000,
+    },
+    {
+      id: "member_viewer",
+      space_id: "space_default",
+      display_name: "Demo Viewer",
+      role: "viewer",
+      created_at: nowMs() - 43_200_000,
+    },
+  ];
+  private mockTokens: DeviceTokenRecord[] = [
+    {
+      id: "tok_demo_owner",
+      member_id: "member_dev",
+      label: "Local Preview",
+      created_at: nowMs() - 86_400_000,
+    },
+  ];
+  private mockAudit: AuditEntry[] = [
+    {
+      id: 1,
+      ts: nowMs() - 3_600_000,
+      actor: "member_dev",
+      action: "member.created",
+      target: "member_viewer",
+      detail: { role: "viewer" },
+    },
+  ];
+  private mockPushSubs: PushSubscriptionRecord[] = [];
 
   constructor() {
     this.store = this.loadStore();
+  }
+
+  async getMe(): Promise<Principal> {
+    return {
+      member_id: "member_dev",
+      space_id: "space_default",
+      display_name: "Demo Owner",
+      role: "owner",
+      token_id: "tok_demo_owner",
+    };
+  }
+
+  async listMembers(): Promise<MemberRecord[]> {
+    return [...this.mockMembers];
+  }
+
+  async addMember(displayName: string, role: Role): Promise<MemberRecord> {
+    const rec: MemberRecord = {
+      id: makeId("mem"),
+      space_id: "space_default",
+      display_name: displayName,
+      role,
+      created_at: nowMs(),
+    };
+    this.mockMembers.push(rec);
+    this.mockAudit.unshift({
+      id: this.mockAudit.length + 1,
+      ts: nowMs(),
+      actor: "member_dev",
+      action: "member.created",
+      target: rec.id,
+      detail: { role },
+    });
+    return rec;
+  }
+
+  async changeMemberRole(
+    memberId: MemberId,
+    role: Role
+  ): Promise<MemberRecord> {
+    const found = this.mockMembers.find((m) => m.id === memberId);
+    if (!found) throw new Error(`member ${memberId} not found`);
+    found.role = role;
+    return { ...found };
+  }
+
+  async disableMember(memberId: MemberId): Promise<MemberRecord> {
+    const found = this.mockMembers.find((m) => m.id === memberId);
+    if (!found) throw new Error(`member ${memberId} not found`);
+    found.disabled_at = nowMs();
+    return { ...found };
+  }
+
+  async listMemberTokens(memberId: MemberId): Promise<DeviceTokenRecord[]> {
+    return this.mockTokens.filter((t) => t.member_id === memberId);
+  }
+
+  async issueMemberToken(
+    memberId: MemberId,
+    label: string,
+    ttlSecs?: number
+  ): Promise<IssuedToken> {
+    const now = nowMs();
+    const token: DeviceTokenRecord = {
+      id: makeId("tok"),
+      member_id: memberId,
+      label,
+      created_at: now,
+      ...(ttlSecs !== undefined ? { expires_at: now + ttlSecs * 1000 } : {}),
+    };
+    this.mockTokens.push(token);
+    return {
+      token,
+      secret: `omt_${"a1b2c3d4".repeat(8)}`,
+    };
+  }
+
+  async revokeToken(tokenId: TokenId): Promise<DeviceTokenRecord> {
+    const found = this.mockTokens.find((t) => t.id === tokenId);
+    if (!found) throw new Error(`token ${tokenId} not found`);
+    found.revoked_at = nowMs();
+    return { ...found };
+  }
+
+  async listAudit(target?: string, limit = 100): Promise<AuditEntry[]> {
+    const filtered = target?.trim()
+      ? this.mockAudit.filter((a) => a.target === target.trim())
+      : this.mockAudit;
+    return filtered.slice(0, limit);
+  }
+
+  async listProviders(): Promise<ProviderInfo[]> {
+    return [
+      { id: "anthropic", kind: "anthropic" },
+      { id: "deepseek", kind: "open_ai" },
+    ];
+  }
+
+  async getSessionProxyStats(): Promise<ProxyStats> {
+    return { requests: 0, upstream_errors: 0 };
+  }
+
+  async getRemoteScreen(): Promise<RemoteScreenResponse> {
+    return { available: false };
+  }
+
+  async getPushConfig(): Promise<PushConfigResponse> {
+    return {
+      enabled: true,
+      subscription_count: this.mockPushSubs.length,
+    };
+  }
+
+  async listPushSubscriptions(): Promise<PushSubscriptionRecord[]> {
+    return [...this.mockPushSubs];
+  }
+
+  async registerPushSubscription(
+    req: RegisterPushSubscriptionRequest
+  ): Promise<PushSubscriptionRecord> {
+    const rec: PushSubscriptionRecord = {
+      id: makeId("push"),
+      member_id: "member_dev",
+      endpoint: req.endpoint,
+      keys: req.keys,
+      user_agent: req.user_agent,
+      created_at: nowMs(),
+    };
+    this.mockPushSubs.push(rec);
+    return rec;
+  }
+
+  async deletePushSubscription(subId: string): Promise<void> {
+    this.mockPushSubs = this.mockPushSubs.filter((s) => s.id !== subId);
+  }
+
+  async testPush(): Promise<PushTestResponse> {
+    return {
+      delivered: this.mockPushSubs.length,
+      mode: "service_worker_local",
+      message: "本地演示模式：已就绪 Service Worker 审批通知",
+    };
   }
 
   private loadStore(): PersistedMockStore {

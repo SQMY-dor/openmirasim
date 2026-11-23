@@ -4,6 +4,7 @@
  */
 
 export type { Action } from "../generated/Action";
+export type { AddMemberRequest } from "../generated/AddMemberRequest";
 export type { ApiError } from "../generated/ApiError";
 export type { ApiErrorCode } from "../generated/ApiErrorCode";
 export type { ApprovalDecision } from "../generated/ApprovalDecision";
@@ -11,10 +12,15 @@ export type { ApprovalId } from "../generated/ApprovalId";
 export type { ApprovalOption } from "../generated/ApprovalOption";
 export type { ApprovalOptionKind } from "../generated/ApprovalOptionKind";
 export type { ApprovalRecord } from "../generated/ApprovalRecord";
+export type { ApprovalRule } from "../generated/ApprovalRule";
 export type { ApprovalStatus } from "../generated/ApprovalStatus";
+export type { AuditEntry } from "../generated/AuditEntry";
+export type { ChangeRoleRequest } from "../generated/ChangeRoleRequest";
+export type { ClearApprovalRulesResponse } from "../generated/ClearApprovalRulesResponse";
 export type { ClientMessage } from "../generated/ClientMessage";
 export type { ContentBlock } from "../generated/ContentBlock";
 export type { CreateSessionRequest } from "../generated/CreateSessionRequest";
+export type { DeviceTokenRecord } from "../generated/DeviceTokenRecord";
 export type { Dispatch } from "../generated/Dispatch";
 export type { DispatchId } from "../generated/DispatchId";
 export type { DispatchTarget } from "../generated/DispatchTarget";
@@ -25,12 +31,24 @@ export type { Goal } from "../generated/Goal";
 export type { GoalId } from "../generated/GoalId";
 export type { GoalStatus } from "../generated/GoalStatus";
 export type { HarnessCapabilities } from "../generated/HarnessCapabilities";
+export type { IssueTokenRequest } from "../generated/IssueTokenRequest";
+export type { IssuedToken } from "../generated/IssuedToken";
+export type { ListApprovalRulesResponse } from "../generated/ListApprovalRulesResponse";
 export type { ListApprovalsResponse } from "../generated/ListApprovalsResponse";
+export type { ListAuditResponse } from "../generated/ListAuditResponse";
 export type { ListEventsQuery } from "../generated/ListEventsQuery";
 export type { ListEventsResponse } from "../generated/ListEventsResponse";
+export type { ListMembersResponse } from "../generated/ListMembersResponse";
+export type { ListProvidersResponse } from "../generated/ListProvidersResponse";
+export type { ListQueueResponse } from "../generated/ListQueueResponse";
 export type { ListSessionsResponse } from "../generated/ListSessionsResponse";
+export type { ListTokensResponse } from "../generated/ListTokensResponse";
+export type { ListWorkspacesResponse } from "../generated/ListWorkspacesResponse";
+export type { ListWorktreeFilesResponse } from "../generated/ListWorktreeFilesResponse";
 export type { MemberId } from "../generated/MemberId";
+export type { MemberRecord } from "../generated/MemberRecord";
 export type { MissedRunPolicy } from "../generated/MissedRunPolicy";
+export type { MoveQueuedRequest } from "../generated/MoveQueuedRequest";
 export type { NewDispatch } from "../generated/NewDispatch";
 export type { NewGoal } from "../generated/NewGoal";
 export type { NewSchedule } from "../generated/NewSchedule";
@@ -41,9 +59,11 @@ export type { Principal } from "../generated/Principal";
 export type { Prompt } from "../generated/Prompt";
 export type { ProviderInfo } from "../generated/ProviderInfo";
 export type { ProviderKind } from "../generated/ProviderKind";
+export type { ProxyStats } from "../generated/ProxyStats";
 export type { QueueRemoval } from "../generated/QueueRemoval";
 export type { QueuedPrompt } from "../generated/QueuedPrompt";
 export type { QueuedPromptId } from "../generated/QueuedPromptId";
+export type { RegisterWorkspaceRequest } from "../generated/RegisterWorkspaceRequest";
 export type { ResolveApprovalRequest } from "../generated/ResolveApprovalRequest";
 export type { Role } from "../generated/Role";
 export type { RunOutcome } from "../generated/RunOutcome";
@@ -67,6 +87,7 @@ export type { SubmitMode } from "../generated/SubmitMode";
 export type { SubmitOutcome } from "../generated/SubmitOutcome";
 export type { SubmitPromptRequest } from "../generated/SubmitPromptRequest";
 export type { SubmitPromptResponse } from "../generated/SubmitPromptResponse";
+export type { TokenId } from "../generated/TokenId";
 export type { ToolCallInfo } from "../generated/ToolCallInfo";
 export type { ToolCallStatus } from "../generated/ToolCallStatus";
 export type { ToolCallUpdate } from "../generated/ToolCallUpdate";
@@ -79,10 +100,14 @@ export type { WorktreeDiff } from "../generated/WorktreeDiff";
 export type { WorktreeEntry } from "../generated/WorktreeEntry";
 export type { WorktreeInfo } from "../generated/WorktreeInfo";
 
+import type { Action } from "../generated/Action";
+import type { ApprovalRule } from "../generated/ApprovalRule";
 import type { ContentBlock } from "../generated/ContentBlock";
 import type { HarnessCapabilities } from "../generated/HarnessCapabilities";
+import type { Role } from "../generated/Role";
 
 export const WIRE_PROTOCOL_VERSION = 1;
+export const MAX_MEMBERS_PER_SPACE = 30;
 
 export type ConnectionState =
   | "disconnected"
@@ -114,14 +139,8 @@ export interface HarnessDescriptor {
   capabilities: HarnessCapabilities;
 }
 
-/** Matches `GET /api/v1/sessions/:id/approval-rules`. */
-export interface ApprovalRuleView {
-  rule_key: string;
-  allow: boolean;
-  option_kind: import("../generated/ApprovalOptionKind").ApprovalOptionKind;
-  created_by?: import("../generated/MemberId").MemberId;
-  created_at: number;
-}
+/** Alias to generated `ApprovalRule` for backward compatibility. */
+export type ApprovalRuleView = ApprovalRule;
 
 /** Matches `GET /api/v1/sessions/:id/file?path=...`. */
 export interface WorktreeFileContent {
@@ -129,6 +148,83 @@ export interface WorktreeFileContent {
   content: string;
   utf8: boolean;
   size: number;
+}
+
+/** Matches `GET /api/v1/sessions/:id/remote-screen`. */
+export interface RemoteScreenInfo {
+  available: boolean;
+  bridge_session_id: string;
+  takeover_url: string;
+  display: string;
+  driver: string;
+  profile_dir: string;
+  status: string;
+}
+
+export interface RemoteScreenResponse {
+  available: boolean;
+  screen?: RemoteScreenInfo;
+}
+
+/** Matches `/api/v1/push/*` (W2-4 PWA Web Push). */
+export interface PushConfigResponse {
+  enabled: boolean;
+  vapid_public_key?: string;
+  subscription_count: number;
+}
+
+export interface PushSubscriptionRecord {
+  id: string;
+  member_id: string;
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+  user_agent?: string;
+  created_at: number;
+}
+
+export interface RegisterPushSubscriptionRequest {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+  user_agent?: string;
+}
+
+export interface PushTestResponse {
+  delivered: number;
+  mode: string;
+  message: string;
+}
+
+const ROLE_RANK: Record<Role, number> = {
+  viewer: 0,
+  member: 1,
+  admin: 2,
+  owner: 3,
+};
+
+export function roleCan(role: Role, action: Action): boolean {
+  const rank = ROLE_RANK[role];
+  switch (action) {
+    case "view_sessions":
+      return true;
+    case "create_session":
+    case "prompt_session":
+    case "resolve_approval":
+    case "manage_approval_rules":
+      return rank >= ROLE_RANK.member;
+    case "manage_workspaces":
+    case "manage_members":
+    case "view_audit":
+      return rank >= ROLE_RANK.admin;
+    case "manage_space":
+      return role === "owner";
+  }
+}
+
+export function roleCanManage(actor: Role, target: Role): boolean {
+  return (
+    roleCan(actor, "manage_members") &&
+    (actor === "owner" || ROLE_RANK[target] < ROLE_RANK[actor])
+  );
 }
 
 export interface HarnessCatalogEntry {
@@ -146,6 +242,10 @@ const HARNESS_DISPLAY_META: Record<
   dsh: { label: "DeepSeek Harness (ACP)", protocol: "acp" },
   cc: { label: "Claude Code (stream-json)", protocol: "stream_json" },
   codexcli: { label: "Codex CLI (JSON)", protocol: "stream_json" },
+  "antigravity-gui": {
+    label: "Antigravity GUI (Xvfb / noVNC)",
+    protocol: "gui_bridge",
+  },
   mock: { label: "Mock Harness (内置验证)", protocol: "mock" },
   "fake-acp": { label: "Fake ACP Agent (测试)", protocol: "acp" },
 };
@@ -185,7 +285,7 @@ export function describeHarness(desc: HarnessDescriptor): HarnessCatalogEntry {
   return {
     id: desc.id,
     label: meta?.label ?? desc.id,
-    protocol: meta?.protocol ?? "acp",
+    protocol: meta?.protocol ?? (desc.capabilities.remote_screen ? "gui_bridge" : "acp"),
     capabilities: desc.capabilities,
   };
 }

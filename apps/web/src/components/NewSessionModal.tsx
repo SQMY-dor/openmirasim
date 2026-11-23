@@ -155,6 +155,9 @@ export function NewSessionModal({
                 {selectedHarness.capabilities.resume && (
                   <span className="chip">Resume</span>
                 )}
+                {selectedHarness.capabilities.remote_screen && (
+                  <span className="chip warn">noVNC 远程接管</span>
+                )}
               </div>
             )}
           </div>

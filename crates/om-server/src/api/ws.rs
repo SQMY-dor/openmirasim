@@ -1,26 +1,20 @@
 //! `/ws/events` resumable WebSocket handler backed directly by
 //! [`crate::orchestrator::Orchestrator::subscribe`] and [`crate::orchestrator::Subscription`].
 //!
-//! Protocol:
-//! 1. Client sends `Hello { protocol_version: 1 }` -> server replies `Welcome`.
-//! 2. Client sends `Subscribe { session_id, last_seq }`:
-//!    - Server opens a gapless [`crate::orchestrator::Subscription`] from `last_seq`.
-//!    - Sends `Subscribed { session_id, head_seq: sub.head_seq() }`.
-//!    - Streams every event with `seq > last_seq` via `sub.next().await` (backlog + live,
-//!      self-healing from SQLite on lag).
-//!    - Outbound frames are bounded; if a slow/stalled client fills the event queue, the
-//!      server emits `Resync { session_id }` and ends that subscription so the client can
-//!      re-subscribe from its last applied `seq` without unbounded server memory growth.
-//! 3. Client may send `Unsubscribe { session_id }` or `Ping { nonce }` at any time.
+//! Supports both W2-1 RBAC device tokens (`omt_...`) and static bootstrap tokens via
+//! `Authorization: Bearer <token>` or `?token=<token>`. Enforces `Action::ViewSessions`
+//! and space isolation on every `Subscribe` request.
 
 use super::AppState;
-use super::auth::verify_ws_auth;
+use super::auth::{authenticate_secret, extract_ws_token};
+use crate::auth::Auth;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use om_core::api::{ApiError, ApiErrorCode, ClientMessage, ServerMessage};
+use om_core::auth::{Action, Principal};
 use om_core::ids::SessionId;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -49,15 +43,40 @@ pub async fn ws_events_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !verify_ws_auth(&headers, query.token.as_deref(), &state.config.auth_token) {
+    let Some(token) = extract_ws_token(&headers, query.token.as_deref()) else {
         let err = ApiError {
             code: ApiErrorCode::Unauthorized,
             message: "invalid or missing access token".into(),
         };
         return (StatusCode::UNAUTHORIZED, axum::Json(err)).into_response();
+    };
+
+    let auth = Auth::new(state.orchestrator.db().clone());
+    let principal = match authenticate_secret(
+        &auth,
+        state.orchestrator.db(),
+        &state.config.default_space_id,
+        &state.config.auth_token,
+        token,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(err) => {
+            let api = ApiError::from(&err);
+            let status =
+                StatusCode::from_u16(api.code.http_status()).unwrap_or(StatusCode::UNAUTHORIZED);
+            return (status, axum::Json(api)).into_response();
+        }
+    };
+
+    if let Err(err) = auth.require(&principal, Action::ViewSessions) {
+        let api = ApiError::from(&err);
+        let status = StatusCode::from_u16(api.code.http_status()).unwrap_or(StatusCode::FORBIDDEN);
+        return (status, axum::Json(api)).into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, principal))
         .into_response()
 }
 
@@ -65,7 +84,7 @@ async fn send_control(tx: &mpsc::Sender<ServerMessage>, msg: ServerMessage) -> b
     tx.send(msg).await.is_ok()
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ServerMessage>(WS_CONTROL_QUEUE_CAPACITY);
     let (evt_tx, mut evt_rx) = mpsc::channel::<ServerMessage>(WS_EVENT_QUEUE_CAPACITY);
@@ -175,6 +194,42 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 break;
                             }
                             continue;
+                        }
+
+                        // Enforce space isolation: sessions from another space appear as NotFound.
+                        match state.orchestrator.db().get_session(&session_id).await {
+                            Ok(summary) if summary.space_id == principal.space_id => {}
+                            Ok(_) => {
+                                if !send_control(
+                                    &ctrl_tx,
+                                    ServerMessage::Error {
+                                        session_id: Some(session_id.clone()),
+                                        error: ApiError {
+                                            code: ApiErrorCode::NotFound,
+                                            message: format!("session {session_id} not found"),
+                                        },
+                                    },
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(err) => {
+                                if !send_control(
+                                    &ctrl_tx,
+                                    ServerMessage::Error {
+                                        session_id: Some(session_id),
+                                        error: ApiError::from(&err),
+                                    },
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
 
                         if let Some(prev) = subscriptions.remove(&session_id) {
