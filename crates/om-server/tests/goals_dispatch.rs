@@ -544,7 +544,7 @@ async fn goal_events(f: &Fx, id: &SessionId) -> Vec<om_core::goal::Goal> {
 
 async fn audit_actions(f: &Fx, target: &str) -> Vec<(Option<MemberId>, String)> {
     let mut v: Vec<_> =
-        f.db.list_audit(Some(target.to_owned()), 100)
+        f.db.list_audit(&f.space, Some(target.to_owned()), 100)
             .await
             .unwrap()
             .into_iter()

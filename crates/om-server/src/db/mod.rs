@@ -122,6 +122,15 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let known = migrations::MIGRATIONS.len() as i64;
+    if current > known {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(format!(
+                "database schema v{current} is newer than this server (v{known}); upgrade the server"
+            )),
+        ));
+    }
     for (idx, sql) in migrations::MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
         if version <= current {

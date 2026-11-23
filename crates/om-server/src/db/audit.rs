@@ -2,7 +2,7 @@
 
 use super::{Db, enum_str, parse_enum, storage};
 use om_core::approval::ApprovalOptionKind;
-use om_core::ids::{MemberId, SessionId};
+use om_core::ids::{MemberId, SessionId, SpaceId};
 use om_core::{CoreResult, now_ms};
 use rusqlite::{Connection, params};
 
@@ -29,6 +29,26 @@ pub struct ApprovalRule {
     pub created_at: i64,
 }
 
+/// SQL expression resolving the space an audit entry belongs to from its target (a
+/// session, member, token, goal, schedule, dispatch or workspace id) or, failing that,
+/// its actor. Entries resolving to no space are visible to no space.
+pub(super) fn space_of(target: &str, actor: &str) -> String {
+    format!(
+        "COALESCE(
+            (SELECT space_id FROM sessions WHERE id = {target}),
+            (SELECT s.space_id FROM approvals a JOIN sessions s ON s.id = a.session_id
+              WHERE a.id = {target}),
+            (SELECT space_id FROM members WHERE id = {target}),
+            (SELECT m.space_id FROM device_tokens t JOIN members m ON m.id = t.member_id
+              WHERE t.id = {target}),
+            (SELECT space_id FROM goals WHERE id = {target}),
+            (SELECT space_id FROM schedules WHERE id = {target}),
+            (SELECT space_id FROM dispatches WHERE id = {target}),
+            (SELECT space_id FROM workspaces WHERE id = {target}),
+            (SELECT space_id FROM members WHERE id = {actor}))"
+    )
+}
+
 pub(super) fn insert(
     conn: &Connection,
     actor: Option<&MemberId>,
@@ -37,7 +57,11 @@ pub(super) fn insert(
     detail: &serde_json::Value,
 ) -> CoreResult<()> {
     conn.execute(
-        "INSERT INTO audit_logs (ts, actor, action, target, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        &format!(
+            "INSERT INTO audit_logs (ts, actor, action, target, detail, space_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, {})",
+            space_of("?4", "?2")
+        ),
         params![
             now_ms(),
             actor.map(|m| m.as_str()),
@@ -64,22 +88,26 @@ impl Db {
             .await
     }
 
-    /// Newest-first audit entries, optionally only those about `target`.
+    /// Newest-first audit entries of one space, optionally only those about `target`.
     pub async fn list_audit(
         &self,
+        space_id: &SpaceId,
         target: Option<String>,
         limit: u32,
     ) -> CoreResult<Vec<AuditEntry>> {
+        let space_id = space_id.clone();
         self.read(move |conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, ts, actor, action, target, detail FROM audit_logs
-                     WHERE ?1 IS NULL OR target = ?1
-                     ORDER BY id DESC LIMIT ?2",
-                )
-                .map_err(storage)?;
+            // Two statements so each can use its own index.
+            let sql = if target.is_some() {
+                "SELECT id, ts, actor, action, target, detail FROM audit_logs
+                 WHERE space_id = ?1 AND target = ?2 ORDER BY id DESC LIMIT ?3"
+            } else {
+                "SELECT id, ts, actor, action, target, detail FROM audit_logs
+                 WHERE space_id = ?1 AND ?2 IS NULL ORDER BY id DESC LIMIT ?3"
+            };
+            let mut stmt = conn.prepare(sql).map_err(storage)?;
             let rows = stmt
-                .query_map(params![target, limit], |r| {
+                .query_map(params![space_id.as_str(), target, limit], |r| {
                     let detail: Option<String> = r.get(5)?;
                     Ok(AuditEntry {
                         id: r.get(0)?,

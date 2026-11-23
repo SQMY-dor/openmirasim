@@ -270,6 +270,8 @@ impl Auth {
         limit: u32,
     ) -> CoreResult<Vec<AuditEntry>> {
         self.require(p, Action::ViewAudit)?;
-        self.db.list_audit(target, limit.clamp(1, 1000)).await
+        self.db
+            .list_audit(&p.space_id, target, limit.clamp(1, 1000))
+            .await
     }
 }

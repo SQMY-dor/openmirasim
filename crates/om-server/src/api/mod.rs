@@ -644,7 +644,7 @@ async fn list_audit(
     let entries = state
         .orchestrator
         .db()
-        .list_audit(query.target, limit)
+        .list_audit(&state.config.default_space_id, query.target, limit)
         .await?
         .into_iter()
         .map(|e| AuditEntryView {

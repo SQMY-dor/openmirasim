@@ -278,6 +278,37 @@ async fn admins_manage_strictly_below_themselves() {
 }
 
 #[tokio::test]
+async fn audit_logs_are_scoped_to_the_space() {
+    let fx = setup().await;
+    let other = fx.db.ensure_space("other").await.unwrap();
+    let (_, issued) = fx
+        .auth
+        .bootstrap_owner(&other, "Bo", "second space")
+        .await
+        .unwrap()
+        .expect("first owner of the other space");
+    let other_owner = fx.auth.authenticate(&issued.secret).await.unwrap();
+    fx.auth
+        .add_member(&fx.owner, "carol", Role::Member)
+        .await
+        .unwrap();
+    let mine = fx.auth.audit_log(&fx.owner, None, 100).await.unwrap();
+    assert!(mine.iter().any(|e| e.action == "member.created"));
+    let theirs = fx.auth.audit_log(&other_owner, None, 100).await.unwrap();
+    assert!(
+        theirs.iter().all(|e| e.action != "member.created"),
+        "another space's owner sees none of this space's entries: {theirs:?}"
+    );
+    assert!(
+        fx.auth
+            .audit_log(&other_owner, Some(fx.owner.member_id.to_string()), 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn the_last_owner_is_protected() {
     let fx = setup().await;
     forbidden(

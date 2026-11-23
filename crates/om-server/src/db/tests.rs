@@ -421,7 +421,7 @@ async fn policy_resolution_records_rule_metadata_and_audit() {
         Err(CoreError::ApprovalAlreadyResolved(_))
     ));
 
-    let audit = db.list_audit(Some(id.to_string()), 10).await.unwrap();
+    let audit = db.list_audit(&s.space_id, Some(id.to_string()), 10).await.unwrap();
     let actions: Vec<_> = audit.iter().map(|a| a.action.as_str()).collect();
     assert_eq!(actions, ["approval.auto_resolved", "approval.requested"]);
 }
