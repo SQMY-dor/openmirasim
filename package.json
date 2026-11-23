@@ -7,6 +7,10 @@
     "pnpm": ">=10.0.0"
   },
   "scripts": {
-    "typecheck": "pnpm -r typecheck"
+    "dev:web": "pnpm --filter @openmirasim/web dev",
+    "build": "pnpm --filter @openmirasim/web build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @openmirasim/web test",
+    "test:e2e": "pnpm --filter @openmirasim/e2e test"
   }
 }

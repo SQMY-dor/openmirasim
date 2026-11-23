@@ -47,7 +47,7 @@ jobs:
           fi
 
   web:
-    name: Web (typecheck)
+    name: Web (typecheck / test / build / e2e)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,3 +64,12 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Production build
+        run: pnpm build
+
+      - name: Playwright E2E
+        run: pnpm test:e2e
