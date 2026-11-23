@@ -14,6 +14,7 @@ mod members;
 pub use audit::{ApprovalRule, AuditEntry};
 pub use members::{Authorize, TOKEN_TOUCH_INTERVAL_MS};
 mod goals;
+pub use goals::TurnContext;
 mod migrations;
 mod schedules;
 #[cfg(test)]

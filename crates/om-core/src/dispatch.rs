@@ -8,15 +8,17 @@
 //!
 //! - A member dispatching by hand acts as themself.
 //! - An agent dispatching from inside a session (through a tool the harness exposes)
-//!   acts as the member whose prompt started the source session's current turn. A
-//!   turn nobody started (no member on its `prompt_submitted` event) cannot dispatch.
+//!   acts as the member whose prompt started the source session's current turn, and only
+//!   while that turn runs. Every member who steered into the turn must be allowed too,
+//!   and a turn with an instruction no member sent cannot dispatch.
 //!
 //! That member must be active in the space and allowed to prompt the target (and to
 //! create sessions, for a new one). Chains are bounded: an agent's dispatch reaches depth
-//! (depth of its session) + 1, where a session's depth is that of the latest dispatch
-//! that reached it, and depth may not pass [`MAX_DISPATCH_DEPTH`], so agents cannot fan
-//! out deep or ping-pong without limit. A member dispatching by hand starts a new chain
-//! at depth 1. Every dispatch leaves one
+//! (depth of the turn it runs in) + 1, where a turn's depth is that of the dispatch that
+//! delivered it (0 for a member's own turn), and depth may not pass
+//! [`MAX_DISPATCH_DEPTH`]; one turn may dispatch at most [`MAX_DISPATCH_FANOUT`] times.
+//! So agents cannot fan out wide or deep, or ping-pong without limit. A member
+//! dispatching by hand starts a new chain at depth 1. Every dispatch leaves one
 //! [`Dispatch`] row.
 
 use crate::content::Prompt;
@@ -29,6 +31,9 @@ use ts_rs::TS;
 
 /// Longest dispatch chain: a member's session (depth 0) may reach depth 3.
 pub const MAX_DISPATCH_DEPTH: u32 = 3;
+
+/// Most dispatches an agent may send during one turn of its session.
+pub const MAX_DISPATCH_FANOUT: u32 = 8;
 
 /// Where a dispatch goes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

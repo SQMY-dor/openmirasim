@@ -459,42 +459,45 @@ async fn agent_dispatch_acts_as_the_turns_member_and_is_depth_limited() {
         }
         v
     };
+    // Delivered prompts hold their turn open, so each target can dispatch in turn.
     let hop = |from: &SessionId, to: &SessionId| NewDispatch {
         from_session: from.clone(),
         target: DispatchTarget::Session {
             session_id: to.clone(),
             mode: SubmitMode::Queue,
         },
-        prompt: Prompt::text("pass it on"),
+        prompt: Prompt::text("hold: pass it on"),
     };
 
-    // No member started a turn in s0 yet: an agent there cannot dispatch.
+    // No turn runs in s0: an agent there cannot dispatch.
     assert!(matches!(
         f.dispatcher.dispatch_from_agent(hop(&s[0], &s[1])).await,
-        Err(CoreError::Forbidden(_))
+        Err(CoreError::InvalidInput(_))
     ));
     // A turn nobody started does not count either.
     f.orch
-        .send_prompt(&s[0], None, Prompt::text("system"), SubmitMode::Queue)
+        .send_prompt(&s[0], None, Prompt::text("hold system"), SubmitMode::Queue)
         .await
         .unwrap();
+    wait_status(&f, &s[0], SessionStatus::Running).await;
     assert!(matches!(
         f.dispatcher.dispatch_from_agent(hop(&s[0], &s[1])).await,
         Err(CoreError::Forbidden(_))
     ));
-
+    f.orch.cancel_turn(&s[0]).await.unwrap();
     wait_status(&f, &s[0], SessionStatus::Idle).await;
+
     f.orch
         .send_prompt(
             &s[0],
             Some(f.member.clone()),
-            Prompt::text("go"),
+            Prompt::text("hold go"),
             SubmitMode::Queue,
         )
         .await
         .unwrap();
+    wait_status(&f, &s[0], SessionStatus::Running).await;
     for i in 0..MAX_DISPATCH_DEPTH as usize {
-        wait_status(&f, &s[i + 1], SessionStatus::Idle).await;
         let d = f
             .dispatcher
             .dispatch_from_agent(hop(&s[i], &s[i + 1]))
@@ -502,6 +505,7 @@ async fn agent_dispatch_acts_as_the_turns_member_and_is_depth_limited() {
             .unwrap();
         assert_eq!(d.member_id, f.member);
         assert_eq!(d.depth, i as u32 + 1);
+        wait_status(&f, &s[i + 1], SessionStatus::Running).await;
     }
     let last = MAX_DISPATCH_DEPTH as usize;
     assert!(matches!(
@@ -518,6 +522,30 @@ async fn agent_dispatch_acts_as_the_turns_member_and_is_depth_limited() {
         .unwrap();
     assert_eq!(d.depth, 1);
 
+    // A member's own new turn in a deep session starts again at depth 0.
+    f.orch.cancel_turn(&s[last]).await.unwrap();
+    wait_status(&f, &s[last], SessionStatus::Idle).await;
+    f.orch
+        .send_prompt(
+            &s[last],
+            Some(f.member.clone()),
+            Prompt::text("hold again"),
+            SubmitMode::Queue,
+        )
+        .await
+        .unwrap();
+    wait_status(&f, &s[last], SessionStatus::Running).await;
+    let fresh = idle_session(&f).await;
+    let d = f
+        .dispatcher
+        .dispatch_from_agent(hop(&s[last], &fresh))
+        .await
+        .unwrap();
+    assert_eq!(
+        d.depth, 1,
+        "a member's turn is not part of an earlier chain"
+    );
+
     // Permission is the turn member's, checked now.
     f.db.set_member_role(&f.member, Role::Viewer, None)
         .await
@@ -525,6 +553,38 @@ async fn agent_dispatch_acts_as_the_turns_member_and_is_depth_limited() {
     assert!(matches!(
         f.dispatcher.dispatch_from_agent(hop(&s[1], &s[0])).await,
         Err(CoreError::Forbidden(_))
+    ));
+}
+
+#[tokio::test]
+async fn one_turn_cannot_fan_out_without_limit() {
+    let f = fixture().await;
+    let src = idle_session(&f).await;
+    f.orch
+        .send_prompt(
+            &src,
+            Some(f.member.clone()),
+            Prompt::text("hold fan out"),
+            SubmitMode::Queue,
+        )
+        .await
+        .unwrap();
+    wait_status(&f, &src, SessionStatus::Running).await;
+    let target = idle_session(&f).await;
+    let hop = || NewDispatch {
+        from_session: src.clone(),
+        target: DispatchTarget::Session {
+            session_id: target.clone(),
+            mode: SubmitMode::Queue,
+        },
+        prompt: Prompt::text("work"),
+    };
+    for _ in 0..om_core::dispatch::MAX_DISPATCH_FANOUT {
+        f.dispatcher.dispatch_from_agent(hop()).await.unwrap();
+    }
+    assert!(matches!(
+        f.dispatcher.dispatch_from_agent(hop()).await,
+        Err(CoreError::LimitExceeded(_))
     ));
 }
 
@@ -692,4 +752,56 @@ async fn goals_and_dispatches_are_announced_and_audited() {
         .await
         .unwrap();
     assert_eq!(goal_events(&f, &other).await, vec![g]);
+}
+
+#[tokio::test]
+async fn goals_follow_only_their_own_turns_and_expire_mid_turn() {
+    let f = fixture().await;
+    // Another member's prompt runs first; it must not count as the goal's turn.
+    let sid = idle_session(&f).await;
+    f.orch
+        .send_prompt(
+            &sid,
+            Some(f.member.clone()),
+            Prompt::text("hold busy"),
+            SubmitMode::Queue,
+        )
+        .await
+        .unwrap();
+    wait_status(&f, &sid, SessionStatus::Running).await;
+    let g = f
+        .goals
+        .set_goal(&sid, &f.member, goal("ship done-on-3", 5))
+        .await
+        .unwrap();
+    // End the unrelated turn; the goal's queued opening prompt runs next.
+    f.orch.cancel_turn(&sid).await.unwrap();
+    f.orch.resume_queue(&sid).await.unwrap();
+    let g = wait_goal_end(&f, &g.id).await;
+    assert_eq!(g.status, GoalStatus::Achieved, "{g:?}");
+    assert_eq!(
+        g.turns_used, 2,
+        "the unrelated, cancelled turn is not counted"
+    );
+
+    // A deadline ends the goal even while its turn is still running.
+    let sid = idle_session(&f).await;
+    let g = f
+        .goals
+        .set_goal(
+            &sid,
+            &f.member,
+            NewGoal {
+                objective: "hold forever".into(),
+                max_turns: Some(5),
+                deadline_at: Some(now_ms() + 300),
+            },
+        )
+        .await
+        .unwrap();
+    let g = wait_goal_end(&f, &g.id).await;
+    assert_eq!(
+        (g.status, g.ended_reason.as_deref()),
+        (GoalStatus::Expired, Some("deadline"))
+    );
 }
