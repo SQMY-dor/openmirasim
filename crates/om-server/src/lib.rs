@@ -6,4 +6,5 @@
 
 pub mod acp;
 pub mod db;
+pub mod orchestrator;
 pub mod stream;

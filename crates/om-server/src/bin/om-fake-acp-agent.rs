@@ -66,7 +66,6 @@ impl Agent {
     }
 
     fn run_prompt(&self, id: Value, session: String, text: String) {
-        self.cancelled.store(false, Ordering::SeqCst);
         let stop = if text.contains("crash") {
             self.chunk(&session, "agent_message_chunk", "about to crash");
             std::process::exit(3);
@@ -187,6 +186,9 @@ fn main() {
                             .join("")
                     })
                     .unwrap_or_default();
+                // Reset before spawning so a cancel that arrives right after the prompt
+                // is not lost.
+                agent.cancelled.store(false, Ordering::SeqCst);
                 let agent = agent.clone();
                 let id = id.unwrap_or(Value::Null);
                 std::thread::spawn(move || agent.run_prompt(id, sid, text));
