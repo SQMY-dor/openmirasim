@@ -136,7 +136,7 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
         if version <= current {
             continue;
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
@@ -308,7 +308,7 @@ impl Db {
         created_by: Option<MemberId>,
     ) -> CoreResult<(SessionSummary, SessionEvent)> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(storage)?;
             let id = SessionId::new();
             let now = now_ms();
             tx.execute(
@@ -370,7 +370,9 @@ impl Db {
     ) -> CoreResult<Vec<SessionEvent>> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let events = append_in_tx(&tx, &session_id, payloads)?;
             tx.commit().map_err(storage)?;
             Ok(events)
@@ -432,7 +434,9 @@ impl Db {
         turn_id: Option<om_core::ids::TurnId>,
     ) -> CoreResult<SessionEvent> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let r = &approval.record;
             tx.execute(
                 "INSERT INTO approvals (id, session_id, harness_request_id, tool_call_id, title,
@@ -489,7 +493,9 @@ impl Db {
     ) -> CoreResult<ApprovalOutcome> {
         let approval_id = approval_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let outcome = resolve_in_tx(&tx, &approval_id, decision, resolved_by, None)?;
             tx.commit().map_err(storage)?;
             Ok(outcome)
@@ -507,7 +513,9 @@ impl Db {
     ) -> CoreResult<ApprovalOutcome> {
         let approval_id = approval_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let outcome = resolve_in_tx(&tx, &approval_id, decision, None, Some(rule))?;
             tx.commit().map_err(storage)?;
             Ok(outcome)
@@ -522,7 +530,9 @@ impl Db {
     ) -> CoreResult<Vec<ApprovalOutcome>> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let ids: Vec<String> = {
                 let mut stmt = tx
                     .prepare(
@@ -588,7 +598,9 @@ impl Db {
     /// recovered sessions.
     pub async fn recover_after_restart(&self) -> CoreResult<Vec<SessionId>> {
         self.write(|conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let live: Vec<(String, String)> = {
                 let mut stmt = tx
                     .prepare(

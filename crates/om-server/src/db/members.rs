@@ -195,7 +195,9 @@ impl Db {
         let (space_id, display_name, label) =
             (space_id.clone(), display_name.to_owned(), label.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let any: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM members WHERE space_id = ?1",
@@ -231,7 +233,9 @@ impl Db {
     ) -> CoreResult<MemberRecord> {
         let (space_id, display_name) = (space_id.clone(), display_name.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let member = insert_member(&tx, &space_id, &display_name, role)?;
             audit::insert(
                 &tx,
@@ -277,7 +281,9 @@ impl Db {
     ) -> CoreResult<MemberRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut member = get_member_in(&tx, &id)?;
             if !member.is_active() {
                 return Err(CoreError::Forbidden(format!("member {id} is disabled")));
@@ -316,7 +322,9 @@ impl Db {
     ) -> CoreResult<MemberRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut member = get_member_in(&tx, &id)?;
             if !member.is_active() {
                 return Ok(member);
@@ -360,7 +368,9 @@ impl Db {
     ) -> CoreResult<DeviceTokenRecord> {
         let (member_id, label) = (member_id.clone(), label.to_owned());
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let member = get_member_in(&tx, &member_id)?;
             let token = insert_token(&tx, &member, &token_hash, &label, expires_at)?;
             audit::insert(
@@ -407,7 +417,9 @@ impl Db {
     ) -> CoreResult<DeviceTokenRecord> {
         let id = id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let mut token = get_token_in(&tx, &id)?;
             if token.revoked_at.is_some() {
                 return Ok(token);

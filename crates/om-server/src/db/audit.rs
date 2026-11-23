@@ -136,7 +136,9 @@ impl Db {
     ) -> CoreResult<()> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             tx.execute(
                 "INSERT INTO approval_rules (session_id, rule_key, allow, option_kind, created_by,
                                              created_at)
@@ -204,7 +206,9 @@ impl Db {
     ) -> CoreResult<usize> {
         let session_id = session_id.clone();
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let n = tx
                 .execute(
                     "DELETE FROM approval_rules WHERE session_id = ?1",

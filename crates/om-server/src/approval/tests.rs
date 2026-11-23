@@ -202,23 +202,35 @@ fn remembered_file_allows_stay_in_the_sandboxed_worktree() {
     let git = vec![".git/config".to_string()];
     let outside = vec!["/home/x/.bashrc".to_string()];
     assert_eq!(
-        p.evaluate(&req(SandboxMode::Bwrap, Some(ToolKind::Edit), &inside, "t", &o), &mem),
+        p.evaluate(
+            &req(SandboxMode::Bwrap, Some(ToolKind::Edit), &inside, "t", &o),
+            &mem
+        ),
         auto("remembered:edit", "a1")
     );
     for locs in [&git, &outside, &vec![]] {
         assert_eq!(
-            p.evaluate(&req(SandboxMode::Bwrap, Some(ToolKind::Edit), locs, "t", &o), &mem),
+            p.evaluate(
+                &req(SandboxMode::Bwrap, Some(ToolKind::Edit), locs, "t", &o),
+                &mem
+            ),
             Verdict::Ask,
             "{locs:?}"
         );
     }
     assert_eq!(
-        p.evaluate(&req(SandboxMode::Direct, Some(ToolKind::Edit), &inside, "t", &o), &mem),
+        p.evaluate(
+            &req(SandboxMode::Direct, Some(ToolKind::Edit), &inside, "t", &o),
+            &mem
+        ),
         Verdict::Ask,
         "no remembered file allow outside the sandbox"
     );
     assert_eq!(
-        p.evaluate(&req(SandboxMode::Bwrap, Some(ToolKind::Delete), &git, "rm a", &o), &mem),
+        p.evaluate(
+            &req(SandboxMode::Bwrap, Some(ToolKind::Delete), &git, "rm a", &o),
+            &mem
+        ),
         Verdict::Ask
     );
 }

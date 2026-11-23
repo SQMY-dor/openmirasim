@@ -37,7 +37,9 @@ pub const PLACEHOLDER_TITLE: &str = "Permission requested";
 fn is_file_tool(kind: Option<ToolKind>) -> bool {
     matches!(
         kind,
-        Some(ToolKind::Read | ToolKind::Search | ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
+        Some(
+            ToolKind::Read | ToolKind::Search | ToolKind::Edit | ToolKind::Delete | ToolKind::Move
+        )
     )
 }
 

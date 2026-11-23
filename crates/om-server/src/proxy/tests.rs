@@ -488,12 +488,20 @@ fn proxy_env_sandbox_sets_env_and_network() {
 fn upstream_url_stays_under_the_base_path() {
     let base = reqwest::Url::parse("https://api.example.com/v1").unwrap();
     let u = upstream_url(&base, "chat/completions", Some("a=1")).unwrap();
-    assert_eq!(u.as_str(), "https://api.example.com/v1/chat/completions?a=1");
+    assert_eq!(
+        u.as_str(),
+        "https://api.example.com/v1/chat/completions?a=1"
+    );
     assert!(upstream_url(&base, "", None).is_some());
     assert!(upstream_url(&base, "../x", None).is_none());
     assert!(upstream_url(&base, "x", Some("a#b")).is_none());
     let other = reqwest::Url::parse("https://api.example.com/v1x").unwrap();
-    assert!(upstream_url(&base, "", None).unwrap().path().starts_with(base.path()));
+    assert!(
+        upstream_url(&base, "", None)
+            .unwrap()
+            .path()
+            .starts_with(base.path())
+    );
     let _ = other;
 }
 

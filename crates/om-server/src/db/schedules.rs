@@ -59,7 +59,9 @@ impl Db {
     /// [`MAX_SCHEDULES_PER_SPACE`] schedules.
     pub async fn create_schedule(&self, s: Schedule) -> CoreResult<Schedule> {
         self.write(move |conn| {
-            let tx = conn.transaction().map_err(storage)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
             let count: i64 = tx
                 .query_row(
                     "SELECT COUNT(*) FROM schedules WHERE space_id = ?1",

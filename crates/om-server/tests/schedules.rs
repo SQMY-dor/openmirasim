@@ -595,3 +595,44 @@ async fn background_loop_fires_on_time() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn editing_a_schedule_makes_the_editor_its_stored_owner() {
+    let f = fixture().await;
+    let bob =
+        f.db.create_member(&f.space, "bob", Role::Member, None)
+            .await
+            .unwrap()
+            .id;
+    let s = f
+        .sched
+        .create(
+            f.space.clone(),
+            &f.member,
+            new_schedule(
+                "edit-owner",
+                every_minute(0),
+                new_session_target("hold", "a"),
+            ),
+        )
+        .await
+        .unwrap();
+    f.sched
+        .update(
+            &s.id,
+            &bob,
+            new_schedule(
+                "edit-owner",
+                every_minute(0),
+                new_session_target("hold", "b"),
+            ),
+        )
+        .await
+        .unwrap();
+    // Read back from the database, not the returned value.
+    let stored = f.db.get_schedule(&s.id).await.unwrap();
+    assert_eq!(
+        stored.created_by, bob,
+        "fires run as the editor, not the old owner"
+    );
+}

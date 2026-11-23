@@ -1053,14 +1053,18 @@ mod agent_decision_tests {
 
     #[test]
     fn always_answers_reach_the_agent_as_one_offs() {
-        let opts: Vec<_> = [("a1", K::AllowOnce), ("aa", K::AllowAlways), ("ra", K::RejectAlways)]
-            .into_iter()
-            .map(|(id, kind)| ApprovalOption {
-                option_id: id.into(),
-                name: id.into(),
-                kind,
-            })
-            .collect();
+        let opts: Vec<_> = [
+            ("a1", K::AllowOnce),
+            ("aa", K::AllowAlways),
+            ("ra", K::RejectAlways),
+        ]
+        .into_iter()
+        .map(|(id, kind)| ApprovalOption {
+            option_id: id.into(),
+            name: id.into(),
+            kind,
+        })
+        .collect();
         let sel = |id: &str| ApprovalDecision::Selected {
             option_id: id.into(),
         };

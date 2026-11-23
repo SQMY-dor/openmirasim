@@ -462,9 +462,15 @@ mod tests {
             async move { conn.request("prompt", Value::Null, None).await }
         });
         // The notification arrives first; the caller is still waiting.
-        assert!(matches!(raw.recv().await.unwrap(), Incoming::Notification { .. }));
+        assert!(matches!(
+            raw.recv().await.unwrap(),
+            Incoming::Notification { .. }
+        ));
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!call.is_finished(), "response must not overtake the notification");
+        assert!(
+            !call.is_finished(),
+            "response must not overtake the notification"
+        );
         match raw.recv().await.unwrap() {
             Incoming::Settle(s) => s.complete(),
             other => panic!("expected a settlement, got {other:?}"),
@@ -500,7 +506,10 @@ mod tests {
         );
         assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), None);
         let mut r = BufReader::new(&b"tail"[..]);
-        assert_eq!(read_line_capped(&mut r, 10).await.unwrap(), Some(Some(b"tail".to_vec())));
+        assert_eq!(
+            read_line_capped(&mut r, 10).await.unwrap(),
+            Some(Some(b"tail".to_vec()))
+        );
     }
 
     #[tokio::test]
