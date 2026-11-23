@@ -11,3 +11,4 @@ pub mod harness;
 pub mod orchestrator;
 pub mod sandbox;
 pub mod stream;
+pub mod workspace;

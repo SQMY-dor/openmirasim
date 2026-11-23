@@ -10,7 +10,8 @@ use om_core::session::{SessionConfig, SessionStatus};
 use om_server::acp::AcpHarness;
 use om_server::db::Db;
 use om_server::orchestrator::{HarnessRegistry, Orchestrator, OrchestratorConfig};
-use om_server::sandbox::BwrapSandbox;
+use om_server::sandbox::{BwrapSandbox, ScopedSandbox};
+use om_server::workspace::{WorkspaceConfig, WorkspaceManager};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +35,7 @@ struct Out {
     stderr: String,
 }
 
-async fn run(sb: &BwrapSandbox, spec: &SandboxSpec, script: &str, cwd: Option<&Path>) -> Out {
+async fn run(sb: &dyn Sandbox, spec: &SandboxSpec, script: &str, cwd: Option<&Path>) -> Out {
     let mut cmd = CommandSpec::new("sh").arg("-c").arg(script);
     cmd.cwd = cwd.map(Path::to_path_buf);
     let w = sb.wrap(spec, cmd).expect("wrap");
@@ -162,8 +163,12 @@ async fn agent_runs_end_to_end_inside_bwrap() {
         CommandSpec::new(env!("CARGO_BIN_EXE_om-fake-acp-agent")),
     )));
     let sb: Arc<dyn Sandbox> = Arc::new(sb);
-    let orch =
-        Orchestrator::new(db, registry, OrchestratorConfig::default()).with_bwrap_sandbox(sb);
+    let mgr =
+        WorkspaceManager::new(db.clone(), WorkspaceConfig::new(data.path().join("ws"))).unwrap();
+    let scratch_root = mgr.root().join("scratch");
+    let orch = Orchestrator::new(db, registry, OrchestratorConfig::default())
+        .with_bwrap_sandbox(sb)
+        .with_workspaces(mgr);
 
     let config = SessionConfig {
         harness_id: "fake".into(),
@@ -174,6 +179,12 @@ async fn agent_runs_end_to_end_inside_bwrap() {
         title: None,
     };
     let s = orch.create_session(space, config, None).await.unwrap();
+    // A sandboxed session never runs in the caller-chosen directory.
+    assert!(
+        Path::new(&s.config.cwd).starts_with(&scratch_root),
+        "{}",
+        s.config.cwd
+    );
     let mut sub = orch.subscribe(&s.id, 0).await.unwrap();
     let mut text = String::new();
     let mut prompted = false;
@@ -212,4 +223,115 @@ async fn agent_runs_end_to_end_inside_bwrap() {
     }
     assert_eq!(text, "echo: sandboxed");
     orch.close_session(&s.id).await.unwrap();
+}
+
+fn host_git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn agent_commits_in_worktree_but_cannot_touch_git_config_or_repo() {
+    let Some(sb) = sandbox().await else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    host_git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "main checkout\n").unwrap();
+    host_git(&repo, &["add", "-A"]);
+    host_git(&repo, &["commit", "-q", "-m", "init"]);
+    let repo = repo.canonicalize().unwrap();
+
+    let db = Db::open(tmp.path().join("om.db")).unwrap();
+    let space = db.ensure_space("default").await.unwrap();
+    let mgr =
+        WorkspaceManager::new(db.clone(), WorkspaceConfig::new(tmp.path().join("data"))).unwrap();
+    let ws = mgr
+        .register(space.clone(), "app", &repo.to_string_lossy())
+        .await
+        .unwrap();
+    let cfg = SessionConfig {
+        harness_id: "x".into(),
+        cwd: "/".into(),
+        workspace_id: Some(ws.id.clone()),
+        model: None,
+        sandbox: SandboxMode::Bwrap,
+        title: None,
+    };
+    let sid = db.create_session(space, cfg, None).await.unwrap().0.id;
+    let member = om_core::ids::MemberId::from("alice");
+    let p = mgr
+        .prepare(Some(&ws.id), None, Some(&member))
+        .await
+        .unwrap();
+    let info = mgr.attach(&sid, p).await.unwrap();
+    let wt = mgr.worktree(&sid).await.unwrap();
+    let paths = mgr.sandbox_paths(&wt).await.unwrap();
+    let home = paths.home.clone().unwrap();
+    let scoped = ScopedSandbox::new(Arc::new(sb), paths.writable, paths.readonly, paths.home);
+
+    let common = repo.join(".git");
+    let admin = wt.git_dir.clone().unwrap();
+    let script = format!(
+        "set -u; echo \"HOME=$HOME\"; \
+         echo hi > note.txt && git add note.txt && git -c user.name=a -c user.email=a@a commit -qm agent && echo COMMITTED; \
+         git config --global user.name agent && echo GLOBAL-OK; \
+         for f in '{c}/config' '{c}/hooks/post-checkout' '{c}/info/attributes' '{a}/commondir' '{a}/gitdir' '{a}/config.worktree'; do \
+           if echo pwn >> \"$f\" 2>/dev/null; then echo LEAK-WRITE:$f; fi; done; \
+         if cat '{r}/README.md' 2>/dev/null; then echo LEAK-REPO; fi; \
+         true",
+        c = common.display(),
+        a = admin,
+        r = repo.display(),
+    );
+    let out = run(
+        &scoped,
+        &SandboxSpec::default(),
+        &script,
+        Some(Path::new(&info.path)),
+    )
+    .await;
+    assert!(out.ok, "stderr: {}", out.stderr);
+    assert!(
+        out.stdout.contains(&format!("HOME={}", home.display())),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("COMMITTED"),
+        "stdout: {}\nstderr: {}",
+        out.stdout,
+        out.stderr
+    );
+    assert!(out.stdout.contains("GLOBAL-OK"), "{}", out.stdout);
+    assert!(!out.stdout.contains("LEAK"), "{}", out.stdout);
+
+    // The commit landed on the session branch in the real repository.
+    let branch = info.branch.unwrap();
+    assert_eq!(
+        host_git(&repo, &["log", "-1", "--format=%s", &branch]),
+        "agent"
+    );
+    assert!(home.join(".gitconfig").exists());
+    assert!(!common.join("hooks/post-checkout").exists());
+    let d = mgr.diff(&sid).await.unwrap();
+    assert!(d.files.iter().any(|f| f.path == "note.txt"));
 }

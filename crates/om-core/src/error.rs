@@ -29,6 +29,8 @@ pub enum CoreError {
     Harness(String),
     #[error("sandbox error: {0}")]
     Sandbox(String),
+    #[error("workspace error: {0}")]
+    Workspace(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("i/o error: {0}")]

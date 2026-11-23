@@ -65,4 +65,30 @@ pub(super) const MIGRATIONS: &[&str] = &[
         detail  TEXT
     );
     "#,
+    // v2 (W1-2): registered repositories and per-session worktrees / scratch dirs.
+    r#"
+    CREATE TABLE workspaces (
+        id              TEXT PRIMARY KEY,
+        space_id        TEXT NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+        name            TEXT NOT NULL,
+        repo_path       TEXT NOT NULL,
+        git_common_dir  TEXT NOT NULL,
+        default_branch  TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        UNIQUE (space_id, name)
+    );
+
+    CREATE TABLE worktrees (
+        session_id    TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        workspace_id  TEXT REFERENCES workspaces(id) ON DELETE SET NULL,
+        path          TEXT NOT NULL UNIQUE,
+        branch        TEXT,
+        base_commit   TEXT,
+        git_dir       TEXT,
+        home_path     TEXT,
+        created_at    INTEGER NOT NULL,
+        removed_at    INTEGER
+    );
+    CREATE INDEX worktrees_workspace ON worktrees(workspace_id);
+    "#,
 ];

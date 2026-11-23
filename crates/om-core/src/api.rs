@@ -140,6 +140,7 @@ impl From<&CoreError> for ApiError {
             CoreError::InvalidInput(_) => ApiErrorCode::InvalidInput,
             CoreError::Harness(_)
             | CoreError::Sandbox(_)
+            | CoreError::Workspace(_)
             | CoreError::Storage(_)
             | CoreError::Io(_) => ApiErrorCode::Internal,
         };
