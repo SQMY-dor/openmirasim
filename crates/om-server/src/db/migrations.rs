@@ -109,4 +109,22 @@ pub(super) const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX audit_logs_target ON audit_logs(target, ts);
     "#,
+    // v4 (W2-1): member disabling and hashed device tokens.
+    r#"
+    ALTER TABLE members ADD COLUMN disabled_at INTEGER;
+
+    CREATE TABLE device_tokens (
+        id            TEXT PRIMARY KEY,
+        member_id     TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        token_hash    TEXT NOT NULL UNIQUE,
+        label         TEXT NOT NULL,
+        created_at    INTEGER NOT NULL,
+        expires_at    INTEGER,
+        last_used_at  INTEGER,
+        revoked_at    INTEGER
+    );
+    CREATE INDEX device_tokens_member ON device_tokens(member_id);
+
+    CREATE INDEX audit_logs_actor ON audit_logs(actor, ts);
+    "#,
 ];
