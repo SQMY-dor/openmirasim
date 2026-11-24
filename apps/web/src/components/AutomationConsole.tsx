@@ -46,7 +46,15 @@ function formatTs(ts: number): string {
   }
 }
 
-const WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+const WEEKDAY_LABELS: Record<string, string> = {
+  mon: "周一",
+  tue: "周二",
+  wed: "周三",
+  thu: "周四",
+  fri: "周五",
+  sat: "周六",
+  sun: "周日",
+};
 
 function describeSpec(s: Schedule): string {
   switch (s.spec.kind) {
@@ -57,14 +65,14 @@ function describeSpec(s: Schedule): string {
     case "daily": {
       const hh = String(Math.floor(s.spec.minute_of_day / 60)).padStart(2, "0");
       const mm = String(s.spec.minute_of_day % 60).padStart(2, "0");
-      const offsetMins = s.spec.tz_offset_mins ?? 0;
+      const offsetMins = s.spec.utc_offset_minutes ?? 0;
       const sign = offsetMins >= 0 ? "+" : "-";
       const absMins = Math.abs(offsetMins);
       const tzH = String(Math.floor(absMins / 60)).padStart(2, "0");
       const tzM = String(absMins % 60).padStart(2, "0");
       const days =
         s.spec.weekdays && s.spec.weekdays.length > 0 && s.spec.weekdays.length < 7
-          ? ` (${s.spec.weekdays.map((d) => WEEKDAY_LABELS[d] ?? String(d)).join("/")})`
+          ? ` (${s.spec.weekdays.map((d) => WEEKDAY_LABELS[d] ?? d).join("/")})`
           : "";
       return `每日 ${hh}:${mm} UTC${sign}${tzH}:${tzM}${days}`;
     }
