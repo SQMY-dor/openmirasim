@@ -79,7 +79,7 @@ export function Sidebar({
   onCloseMobile,
 }: SidebarProps) {
   const [query, setQuery] = useState("");
-  const canCreate = !principal || roleCan(principal.role, "create_session");
+  const canCreate = Boolean(principal && roleCan(principal.role, "create_session"));
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -149,7 +149,10 @@ export function Sidebar({
               type="button"
               id="open-team-console-btn"
               className="btn btn-sm"
-              onClick={onOpenTeamConsole}
+              onClick={() => {
+                onCloseMobile();
+                onOpenTeamConsole();
+              }}
               title="成员管理、设备 Token、KeyProxy 与审计日志"
             >
               <Shield size={12} />
@@ -163,7 +166,10 @@ export function Sidebar({
             type="button"
             id="open-automation-console-btn"
             className="btn btn-sm"
-            onClick={onOpenAutomationConsole}
+            onClick={() => {
+              onCloseMobile();
+              onOpenAutomationConsole();
+            }}
             title="Schedules 定时任务、Goals 目标循环与跨会话派发"
           >
             <CalendarClock size={12} />
@@ -173,7 +179,10 @@ export function Sidebar({
             type="button"
             id="open-hub-console-btn"
             className="btn btn-sm"
-            onClick={onOpenHubConsole}
+            onClick={() => {
+              onCloseMobile();
+              onOpenHubConsole();
+            }}
             title="Space / Workspace 两级 MCP Hub 与 Skills 生命周期"
           >
             <Plug size={12} />
@@ -187,7 +196,10 @@ export function Sidebar({
               type="button"
               id="new-session-btn"
               className="btn btn-primary"
-              onClick={onNewSession}
+              onClick={() => {
+                onCloseMobile();
+                onNewSession();
+              }}
             >
               <Plus size={15} />
               <span>新建会话</span>

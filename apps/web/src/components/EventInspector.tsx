@@ -1,4 +1,5 @@
 import { Activity, X } from "lucide-react";
+import { memo, useMemo } from "react";
 import type { SessionEvent, StreamDiagnostics } from "../protocol/types";
 
 interface EventInspectorProps {
@@ -15,6 +16,21 @@ function formatTs(tsMs: number): string {
     return "";
   }
 }
+
+const RawEventRow = memo(function RawEventRow({ ev }: { ev: SessionEvent }) {
+  const formatted = useMemo(() => JSON.stringify(ev.payload, null, 2), [ev.payload]);
+  return (
+    <div className="raw-event">
+      <div className="raw-event-head">
+        <span>
+          #{ev.seq} · {ev.payload.type}
+        </span>
+        <span style={{ color: "var(--text-muted)" }}>{formatTs(ev.ts)}</span>
+      </div>
+      <pre className="raw-event-body">{formatted}</pre>
+    </div>
+  );
+});
 
 export function EventInspector({
   open,
@@ -77,19 +93,7 @@ export function EventInspector({
           </div>
         ) : (
           recentFirst.map((ev) => (
-            <div key={`${ev.session_id}:${ev.seq}`} className="raw-event">
-              <div className="raw-event-head">
-                <span>
-                  #{ev.seq} · {ev.payload.type}
-                </span>
-                <span style={{ color: "var(--text-muted)" }}>
-                  {formatTs(ev.ts)}
-                </span>
-              </div>
-              <pre className="raw-event-body">
-                {JSON.stringify(ev.payload, null, 2)}
-              </pre>
-            </div>
+            <RawEventRow key={`${ev.session_id}:${ev.seq}`} ev={ev} />
           ))
         )}
       </div>

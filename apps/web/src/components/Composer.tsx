@@ -13,7 +13,7 @@ interface ComposerProps {
   disabled: boolean;
   queue: QueuedPrompt[];
   queuePaused: boolean;
-  onSend: (text: string, mode?: SubmitMode) => Promise<void>;
+  onSend: (text: string, mode?: SubmitMode) => Promise<boolean>;
   onCancel: () => Promise<void>;
   onWithdrawQueued: (queuedId: QueuedPromptId) => Promise<void>;
   onMoveQueued: (queuedId: QueuedPromptId, position: number) => Promise<void>;
@@ -34,9 +34,14 @@ export function Composer({
   const [text, setText] = useState("");
   const [mode, setMode] = useState<SubmitMode>("queue");
   const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isActive = status === "running" || status === "waiting_approval";
+  // When prompts are queued (even if status is idle with a paused queue), we must submit with
+  // an explicit queue mode so `om-server` routes through `Orchestrator::send_prompt` instead of
+  // rejecting with 400.
+  const useQueueMode = isActive || queue.length > 0;
   const cannotSend =
     disabled ||
     status === "starting" ||
@@ -52,15 +57,19 @@ export function Composer({
 
   const submit = async () => {
     const trimmed = text.trim();
-    if (!trimmed || sending || cannotSend) return;
+    if (!trimmed || sendingRef.current || cannotSend) return;
+    sendingRef.current = true;
     setSending(true);
     try {
-      setText("");
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "44px";
+      const ok = await onSend(trimmed, useQueueMode ? mode : undefined);
+      if (ok) {
+        setText("");
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "44px";
+        }
       }
-      await onSend(trimmed, isActive ? mode : undefined);
     } finally {
+      sendingRef.current = false;
       setSending(false);
     }
   };
@@ -160,7 +169,7 @@ export function Composer({
         <div className="composer-footer">
           <span className="composer-hint">Ctrl/Cmd + Enter 发送</span>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            {isActive && (
+            {useQueueMode && (
               <select
                 id="submit-mode-select"
                 className="select select-compact"
@@ -170,7 +179,7 @@ export function Composer({
               >
                 <option value="queue">排队 (Queue)</option>
                 <option value="next">插队 (Next)</option>
-                <option value="steer">转向 (Steer)</option>
+                {isActive && <option value="steer">转向 (Steer)</option>}
               </select>
             )}
 

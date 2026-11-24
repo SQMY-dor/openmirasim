@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { Fragment, useState, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 interface MarkdownContentProps {
   text: string;
@@ -11,14 +11,15 @@ type Block =
   | { type: "text"; content: string };
 
 function splitFencedBlocks(raw: string): Block[] {
+  const normalized = raw.replace(/\r\n?/g, "\n");
   const blocks: Block[] = [];
-  const regex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+  const regex = /```([^\s`]*)\n([\s\S]*?)```/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  while ((match = regex.exec(raw)) !== null) {
+  while ((match = regex.exec(normalized)) !== null) {
     if (match.index > lastIndex) {
-      blocks.push({ type: "text", content: raw.slice(lastIndex, match.index) });
+      blocks.push({ type: "text", content: normalized.slice(lastIndex, match.index) });
     }
     blocks.push({
       type: "code",
@@ -28,8 +29,8 @@ function splitFencedBlocks(raw: string): Block[] {
     lastIndex = match.index + match[0].length;
   }
 
-  if (lastIndex < raw.length) {
-    blocks.push({ type: "text", content: raw.slice(lastIndex) });
+  if (lastIndex < normalized.length) {
+    blocks.push({ type: "text", content: normalized.slice(lastIndex) });
   }
 
   return blocks;
@@ -71,12 +72,27 @@ function renderInline(line: string, keyPrefix: string): ReactNode[] {
 
 function CodeBlock({ lang, content }: { lang: string; content: string }) {
   const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+    };
+  }, []);
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(content);
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+      }
+      timerRef.current = window.setTimeout(() => {
+        setCopied(false);
+        timerRef.current = null;
+      }, 1500);
     } catch {
       // clipboard unavailable in restricted contexts
     }
@@ -155,8 +171,11 @@ function renderTextBlock(content: string, blockIdx: number): ReactNode[] {
   return elements;
 }
 
-export function MarkdownContent({ text, streaming }: MarkdownContentProps) {
-  const blocks = splitFencedBlocks(text);
+export const MarkdownContent = memo(function MarkdownContent({
+  text,
+  streaming,
+}: MarkdownContentProps) {
+  const blocks = useMemo(() => splitFencedBlocks(text), [text]);
 
   return (
     <div className="md-content">
@@ -170,4 +189,4 @@ export function MarkdownContent({ text, streaming }: MarkdownContentProps) {
       {streaming && <span className="streaming-cursor" aria-hidden="true" />}
     </div>
   );
-}
+});

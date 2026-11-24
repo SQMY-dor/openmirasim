@@ -28,18 +28,38 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+function asBoundedString(value, fallback, maxLen = 256) {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLen) : fallback;
+}
+
 self.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return;
   const url = new URL(req.url);
+  if (url.origin !== self.location.origin) {
+    return;
+  }
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/ws/")) {
     return;
   }
   if (req.mode === "navigate") {
     event.respondWith(
-      fetch(req).catch(() =>
-        caches.match("/").then((cached) => cached || Response.error())
-      )
+      fetch(req)
+        .then((res) => {
+          if (res.ok && res.type === "basic") {
+            const copy = res.clone();
+            caches
+              .open(CACHE_NAME)
+              .then((cache) => cache.put("/", copy))
+              .catch(() => undefined);
+          }
+          return res;
+        })
+        .catch(() =>
+          caches.match("/").then((cached) => cached || Response.error())
+        )
     );
   }
 });
@@ -56,9 +76,18 @@ self.addEventListener("push", (event) => {
   if (event.data) {
     try {
       const parsed = event.data.json();
-      data = { ...data, ...parsed };
+      if (parsed && typeof parsed === "object") {
+        data = {
+          title: asBoundedString(parsed.title, data.title, 120),
+          body: asBoundedString(parsed.body, data.body, 512),
+          approvalId: asBoundedString(parsed.approvalId, "", 128),
+          sessionId: asBoundedString(parsed.sessionId, "", 128),
+          allowOptionId: asBoundedString(parsed.allowOptionId, "allow_once", 64),
+          rejectOptionId: asBoundedString(parsed.rejectOptionId, "reject_once", 64),
+        };
+      }
     } catch {
-      data.body = event.data.text();
+      data.body = asBoundedString(event.data.text(), data.body, 512);
     }
   }
 
@@ -87,10 +116,12 @@ self.addEventListener("notificationclick", (event) => {
   const action = event.action || "";
   const optionId =
     action === "allow"
-      ? data.allowOptionId || "allow_once"
+      ? asBoundedString(data.allowOptionId, "allow_once", 64)
       : action === "reject"
-        ? data.rejectOptionId || "reject_once"
+        ? asBoundedString(data.rejectOptionId, "reject_once", 64)
         : "";
+  const approvalId = asBoundedString(data.approvalId, "", 128);
+  const sessionId = asBoundedString(data.sessionId, "", 128);
 
   event.waitUntil(
     self.clients
@@ -98,27 +129,26 @@ self.addEventListener("notificationclick", (event) => {
       .then((clients) => {
         if (clients.length > 0) {
           const target = clients[0];
-          if (optionId && data.approvalId) {
+          if (optionId && approvalId) {
             target.postMessage({
               type: "om_approval_action",
-              approvalId: data.approvalId,
-              sessionId: data.sessionId || "",
+              approvalId,
+              sessionId,
               optionId,
             });
-          } else if (data.sessionId) {
+          } else if (sessionId) {
             target.postMessage({
               type: "om_focus_session",
-              sessionId: data.sessionId,
+              sessionId,
             });
           }
           return target.focus();
         }
+        // Never trigger state-changing approvals via URL query parameters (CSRF/clickjacking risk);
+        // open the target session and highlight the approval card for explicit confirmation instead.
         const params = new URLSearchParams();
-        if (data.sessionId) params.set("session", data.sessionId);
-        if (data.approvalId && optionId) {
-          params.set("approve", data.approvalId);
-          params.set("option", optionId);
-        }
+        if (sessionId) params.set("session", sessionId);
+        if (approvalId) params.set("focusApproval", approvalId);
         const qs = params.toString();
         return self.clients.openWindow(qs ? `/?${qs}` : "/");
       })

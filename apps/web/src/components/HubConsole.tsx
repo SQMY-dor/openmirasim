@@ -10,7 +10,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { OpenMirasimClient } from "../protocol/client";
 import {
   roleCan,
@@ -38,6 +38,48 @@ type HubTab = "mcp" | "skills" | "effective";
 
 const LIFECYCLES: SkillLifecycle[] = ["draft", "active", "deprecated", "archived"];
 
+/** Splits a shell-like argument string while preserving single- or double-quoted tokens. */
+function parseShellArgs(input: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escape = false;
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (escape) {
+      current += ch;
+      escape = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escape = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        out.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) {
+    out.push(current);
+  }
+  return out;
+}
+
 export function HubConsole({
   open,
   client,
@@ -62,6 +104,7 @@ export function HubConsole({
   const [mcpUrl, setMcpUrl] = useState("");
   const [mcpEnvKeys, setMcpEnvKeys] = useState("");
   const [mcpDesc, setMcpDesc] = useState("");
+  const [mcpGlobalAvailable, setMcpGlobalAvailable] = useState(true);
 
   // Skills state
   const [skills, setSkills] = useState<SkillRecord[]>([]);
@@ -76,6 +119,7 @@ export function HubConsole({
 
   // Effective two-tier resolution view
   const [effectiveWorkspaceId, setEffectiveWorkspaceId] = useState("");
+  const effectiveInitRef = useRef(false);
   const [effective, setEffective] = useState<EffectiveHubResponse | null>(null);
   const [copiedJson, setCopiedJson] = useState(false);
 
@@ -92,11 +136,32 @@ export function HubConsole({
 
   useEffect(() => {
     if (workspaces.length > 0) {
-      if (!mcpWorkspaceId) setMcpWorkspaceId(workspaces[0].id);
-      if (!skillWorkspaceId) setSkillWorkspaceId(workspaces[0].id);
-      if (!effectiveWorkspaceId) setEffectiveWorkspaceId(workspaces[0].id);
+      if (!mcpWorkspaceId || !workspaces.some((w) => w.id === mcpWorkspaceId)) {
+        setMcpWorkspaceId(workspaces[0].id);
+      }
+      if (!skillWorkspaceId || !workspaces.some((w) => w.id === skillWorkspaceId)) {
+        setSkillWorkspaceId(workspaces[0].id);
+      }
+      if (!effectiveInitRef.current) {
+        effectiveInitRef.current = true;
+        setEffectiveWorkspaceId(workspaces[0].id);
+      } else if (
+        effectiveWorkspaceId &&
+        !workspaces.some((w) => w.id === effectiveWorkspaceId)
+      ) {
+        setEffectiveWorkspaceId("");
+      }
     }
   }, [workspaces, mcpWorkspaceId, skillWorkspaceId, effectiveWorkspaceId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   const loadEffective = useCallback(
     async (wsId: string) => {
@@ -145,6 +210,15 @@ export function HubConsole({
   const canWriteScope = (scope: HubScopeLevel) =>
     scope === "space" ? canManageSpaceHub : canManageWorkspaceHub;
 
+  const canWriteMcp = (s: McpServerRecord) => {
+    if (s.scope === "space") return canManageSpaceHub;
+    if (canManageSpaceHub) return true;
+    return (
+      canManageWorkspaceHub &&
+      (!s.owner_member_id || s.owner_member_id === principal?.member_id)
+    );
+  };
+
   const handleCreateMcp = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!mcpName.trim()) return;
@@ -154,10 +228,7 @@ export function HubConsole({
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean);
-    const args = mcpArgs
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
+    const args = parseShellArgs(mcpArgs.trim());
     try {
       const rec = await client.createMcpServer({
         name: mcpName.trim(),
@@ -170,6 +241,9 @@ export function HubConsole({
         env_keys: envKeys,
         description: mcpDesc.trim(),
         enabled: true,
+        ...(mcpScope === "space"
+          ? { global_available: mcpGlobalAvailable }
+          : {}),
       });
       setMcpName("");
       setMcpCommand("");
@@ -181,6 +255,21 @@ export function HubConsole({
       await loadAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : "注册 MCP 服务失败");
+    }
+  };
+
+  const handleToggleGlobalMcp = async (s: McpServerRecord) => {
+    if (s.scope !== "space" || !canManageSpaceHub) return;
+    setError(null);
+    try {
+      const nextGlobal = s.global_available === false;
+      await client.updateMcpServer(s.id, { global_available: nextGlobal });
+      setNotice(
+        `已将 Space MCP「${s.name}」设为${nextGlobal ? "全局可用" : "仅管理员可见"}`
+      );
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "更新 MCP 全局可用性失败");
     }
   };
 
@@ -511,6 +600,26 @@ export function HubConsole({
                       <span>注册 MCP</span>
                     </button>
                   </div>
+
+                  {mcpScope === "space" && canManageSpaceHub && (
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: 12,
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      <input
+                        id="mcp-global-available-toggle"
+                        type="checkbox"
+                        checked={mcpGlobalAvailable}
+                        onChange={(e) => setMcpGlobalAvailable(e.target.checked)}
+                      />
+                      <span>全局可用（允许 Space 内所有成员在生效视图与会话中使用）</span>
+                    </label>
+                  )}
                 </form>
               )}
 
@@ -520,7 +629,8 @@ export function HubConsole({
                 ) : (
                   servers.map((s) => {
                     const probe = probes[s.id];
-                    const writable = canWriteScope(s.scope);
+                    const writable = canWriteMcp(s);
+                    const isGlobal = s.scope === "space" && s.global_available !== false;
                     return (
                       <div key={s.id} className="team-row" data-mcp-id={s.id}>
                         <div className="team-row-main">
@@ -531,6 +641,15 @@ export function HubConsole({
                                 ? "SPACE"
                                 : `WS:${wsName(s.workspace_id)}`}
                             </span>
+                            {s.scope === "space" ? (
+                              <span className={`chip ${isGlobal ? "ok" : "warn"}`}>
+                                {isGlobal ? "全局可用" : "仅管理员"}
+                              </span>
+                            ) : (
+                              <span className="chip">
+                                成员私有{s.owner_member_id ? ` · ${s.owner_member_id.slice(0, 10)}` : ""}
+                              </span>
+                            )}
                             <span className="chip">{s.transport}</span>
                             <span className={`chip ${s.enabled ? "ok" : ""}`}>
                               {s.enabled ? "启用" : "停用"}
@@ -566,6 +685,17 @@ export function HubConsole({
                             <Activity size={12} />
                             <span>探测</span>
                           </button>
+                          {s.scope === "space" && canManageSpaceHub && (
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              data-toggle-global-mcp={s.id}
+                              onClick={() => void handleToggleGlobalMcp(s)}
+                              title="管理员控制该 Space MCP 是否对全员全局可用"
+                            >
+                              {isGlobal ? "收回全局" : "开放全局"}
+                            </button>
+                          )}
                           {writable && (
                             <>
                               <button
@@ -734,6 +864,9 @@ export function HubConsole({
                               }`}
                             >
                               {sk.lifecycle}
+                            </span>
+                            <span className={`chip ${sk.enabled ? "ok" : ""}`}>
+                              {sk.enabled ? "启用" : "停用"}
                             </span>
                           </div>
                           <div className="team-row-sub">

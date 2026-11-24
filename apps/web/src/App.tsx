@@ -24,10 +24,11 @@ import { TeamConsole } from "./components/TeamConsole";
 import { TerminalView } from "./components/TerminalView";
 import { WorktreeDrawer } from "./components/WorktreeDrawer";
 import {
+  isTauriDesktop,
   sendNativeDesktopNotification,
   updateTrayBadge,
 } from "./desktop/tauriBridge";
-import type { OpenMirasimClient } from "./protocol/client";
+import type { EventSubscription, OpenMirasimClient } from "./protocol/client";
 import { HttpOpenMirasimClient } from "./protocol/httpClient";
 import { MockOpenMirasimClient } from "./protocol/mockClient";
 import {
@@ -36,6 +37,7 @@ import {
   type SessionProjection,
 } from "./protocol/reducer";
 import {
+  isSafeHttpUrl,
   roleCan,
   type ApprovalDecision,
   type ApprovalId,
@@ -52,11 +54,11 @@ import {
   type WorkspaceSummary,
 } from "./protocol/types";
 import {
+  disableApprovalPush,
   enableApprovalPush,
   notifyPendingApproval,
   readPushPreference,
   registerServiceWorker,
-  savePushPreference,
   subscribeServiceWorkerActions,
 } from "./pwa/push";
 
@@ -155,12 +157,34 @@ export function App() {
   const [remoteScreen, setRemoteScreen] = useState<RemoteScreenInfo | null>(null);
   const [pushEnabled, setPushEnabled] = useState<boolean>(readPushPreference);
   const [stageView, setStageView] = useState<"chat" | "terminal">("chat");
+  const [highlightedApprovalId, setHighlightedApprovalId] = useState<string | null>(null);
 
   const lastSeqRef = useRef(0);
   const liveConnectedRef = useRef(false);
+  const bootstrapGenRef = useRef(0);
+  const remoteScreenGenRef = useRef(0);
+  const activeSubRef = useRef<EventSubscription | null>(null);
+  const canPromptRef = useRef(false);
+
+  const canManageSession = Boolean(
+    principal && roleCan(principal.role, "create_session")
+  );
+  const canPrompt = Boolean(
+    principal && roleCan(principal.role, "prompt_session")
+  );
+  const canResolveApproval = Boolean(
+    principal && roleCan(principal.role, "resolve_approval")
+  );
+  const canManageApprovalRules = Boolean(
+    principal && roleCan(principal.role, "manage_approval_rules")
+  );
+  const canManageWorkspaces = Boolean(
+    principal && roleCan(principal.role, "manage_workspaces")
+  );
+
   useEffect(() => {
-    lastSeqRef.current = projection?.lastSeq ?? 0;
-  }, [projection]);
+    canPromptRef.current = canPrompt;
+  }, [canPrompt]);
 
   useEffect(() => {
     liveConnectedRef.current = connectionState === "connected";
@@ -184,7 +208,8 @@ export function App() {
   }, []);
 
   const bootstrapClient = useCallback(
-    async (nextClient: OpenMirasimClient, authToPersist: SavedAuth) => {
+    async (nextClient: OpenMirasimClient, authToPersist: SavedAuth): Promise<boolean> => {
+      const gen = ++bootstrapGenRef.current;
       setConnecting(true);
       setConnectError(null);
       try {
@@ -195,10 +220,16 @@ export function App() {
           nextClient.listHarnesses().catch(() => []),
           nextClient.listWorkspaces().catch(() => []),
         ]);
+        if (gen !== bootstrapGenRef.current) return false;
         try {
+          // Inside Tauri desktop shell, bearer tokens live exclusively in the OS Keychain;
+          // never persist plaintext tokens in WebView `localStorage`.
+          const safePersist: SavedAuth = isTauriDesktop()
+            ? { ...authToPersist, token: "" }
+            : authToPersist;
           window.localStorage.setItem(
             AUTH_STORAGE_KEY,
-            JSON.stringify(authToPersist)
+            JSON.stringify(safePersist)
           );
         } catch {
           // ignore
@@ -213,12 +244,18 @@ export function App() {
           if (prev && sessionList.some((s) => s.id === prev)) return prev;
           return sessionList[0]?.id ?? null;
         });
+        return true;
       } catch (err) {
-        setConnectError(
-          err instanceof Error ? err.message : "无法连接到 OpenMirasim 中心服务器"
-        );
+        if (gen === bootstrapGenRef.current) {
+          setConnectError(
+            err instanceof Error ? err.message : "无法连接到 OpenMirasim 中心服务器"
+          );
+        }
+        return false;
       } finally {
-        setConnecting(false);
+        if (gen === bootstrapGenRef.current) {
+          setConnecting(false);
+        }
       }
     },
     []
@@ -230,7 +267,7 @@ export function App() {
     if (!saved) return;
     if (saved.mode === "mock") {
       void bootstrapClient(new MockOpenMirasimClient(), saved);
-    } else if (saved.serverUrl && saved.token) {
+    } else if (saved.serverUrl && saved.token && !isTauriDesktop()) {
       void bootstrapClient(
         new HttpOpenMirasimClient(saved.serverUrl, saved.token),
         saved
@@ -239,9 +276,9 @@ export function App() {
   }, [bootstrapClient]);
 
   const handleConnectServer = useCallback(
-    async (serverUrl: string, token: string) => {
+    async (serverUrl: string, token: string): Promise<boolean> => {
       const next = new HttpOpenMirasimClient(serverUrl, token);
-      await bootstrapClient(next, { mode: "http", serverUrl, token });
+      return await bootstrapClient(next, { mode: "http", serverUrl, token });
     },
     [bootstrapClient]
   );
@@ -256,8 +293,11 @@ export function App() {
   }, [bootstrapClient]);
 
   const handleDisconnect = useCallback(() => {
+    bootstrapGenRef.current += 1;
+    remoteScreenGenRef.current += 1;
     try {
       window.localStorage.removeItem(AUTH_STORAGE_KEY);
+      window.localStorage.removeItem(ACTIVE_SESSION_KEY);
     } catch {
       // ignore
     }
@@ -266,9 +306,15 @@ export function App() {
     setPrincipal(null);
     setSessions([]);
     setWorkspaces([]);
+    setSelectedSessionId(null);
     setWorktreeOpen(false);
     setInspectorOpen(false);
     setTeamConsoleOpen(false);
+    setAutomationConsoleOpen(false);
+    setHubConsoleOpen(false);
+    setNewModalOpen(false);
+    setStageView("chat");
+    setHighlightedApprovalId(null);
     setRemoteScreen(null);
     setProjection(null);
     setConnectionState("disconnected");
@@ -293,7 +339,9 @@ export function App() {
     }
   }, [selectedSessionId]);
 
-  // Handle PWA notification click actions via Service Worker postMessage or URL deep-link
+  // Handle PWA notification click actions via Service Worker postMessage or safe URL deep-link.
+  // Never auto-resolve approvals from URL query parameters (prevents CSRF / clickjacking);
+  // instead focus the target session and highlight the approval card for explicit user review.
   useEffect(() => {
     if (!client) return;
     const unsubscribe = subscribeServiceWorkerActions({
@@ -302,6 +350,10 @@ export function App() {
       },
       onApprovalAction: ({ approvalId, sessionId, optionId }) => {
         if (sessionId) setSelectedSessionId(sessionId);
+        if (!canResolveApproval) {
+          setHighlightedApprovalId(approvalId);
+          return;
+        }
         void client
           .resolveApproval(approvalId, {
             outcome: "selected",
@@ -317,17 +369,19 @@ export function App() {
 
     try {
       const params = new URLSearchParams(window.location.search);
-      const approveId = params.get("approve");
-      const optionId = params.get("option");
-      if (approveId && optionId) {
-        void client
-          .resolveApproval(approveId, {
-            outcome: "selected",
-            option_id: optionId,
-          })
-          .catch(() => {});
+      const focusApproval = params.get("focusApproval") ?? params.get("approve");
+      if (focusApproval) {
+        setHighlightedApprovalId(focusApproval);
+        setStageView("chat");
+      }
+      if (
+        params.has("approve") ||
+        params.has("option") ||
+        params.has("focusApproval")
+      ) {
         params.delete("approve");
         params.delete("option");
+        params.delete("focusApproval");
         const nextQs = params.toString();
         window.history.replaceState(
           null,
@@ -340,29 +394,44 @@ export function App() {
     }
 
     return unsubscribe;
-  }, [client]);
+  }, [client, canResolveApproval]);
 
-  // Fetch remote-screen takeover metadata when an `antigravity-gui` session is active
+  // Fetch remote-screen takeover metadata only for members permitted to control sessions.
   const refreshRemoteScreen = useCallback(
     async (sid: string) => {
-      if (!client) return;
+      if (!client || !canPromptRef.current) {
+        setRemoteScreen(null);
+        return;
+      }
+      const gen = ++remoteScreenGenRef.current;
       try {
         const res = await client.getRemoteScreen(sid);
-        setRemoteScreen(res.available && res.screen ? res.screen : null);
+        if (gen !== remoteScreenGenRef.current) return;
+        if (
+          res.available &&
+          res.screen &&
+          isSafeHttpUrl(res.screen.takeover_url)
+        ) {
+          setRemoteScreen(res.screen);
+        } else {
+          setRemoteScreen(null);
+        }
       } catch {
-        setRemoteScreen(null);
+        if (gen === remoteScreenGenRef.current) {
+          setRemoteScreen(null);
+        }
       }
     },
     [client]
   );
 
   useEffect(() => {
-    if (!client || !selectedSessionId) {
+    if (!client || !selectedSessionId || !canPrompt) {
       setRemoteScreen(null);
       return;
     }
     void refreshRemoteScreen(selectedSessionId);
-  }, [client, selectedSessionId, refreshRemoteScreen]);
+  }, [client, selectedSessionId, canPrompt, refreshRemoteScreen]);
 
   // Subscribe to selected session with `Hello -> Welcome -> Subscribe { last_seq }`
   useEffect(() => {
@@ -382,21 +451,40 @@ export function App() {
     setStreamError(null);
 
     const handleEvent = (record: SessionEvent) => {
+      if (record.session_id !== selectedSessionId) return;
+
+      const curLast = lastSeqRef.current;
+      const isDuplicate = record.seq <= curLast;
+      const isGap = curLast > 0 && record.seq > curLast + 1;
+
+      if (!isDuplicate && !isGap) {
+        // Update cursor synchronously (outside React 19 deferred state updater) so
+        // `getLastSeq()` immediately reflects applied contiguous events.
+        lastSeqRef.current = record.seq;
+      }
+
       setProjection((prev) => {
         const base =
           prev && prev.sessionId === selectedSessionId
             ? prev
             : createEmptyProjection(selectedSessionId);
-        const next = applySessionEvent(base, record);
-        lastSeqRef.current = next.lastSeq;
-        return next;
+        return applySessionEvent(base, record);
       });
+
+      if (isGap) {
+        activeSubRef.current?.resync?.();
+        return;
+      }
+      if (isDuplicate) {
+        return;
+      }
 
       setHeadSeq((prev) => Math.max(prev, record.seq));
 
       if (
         record.payload.type === "harness_ready" &&
-        record.payload.capabilities.remote_screen
+        record.payload.capabilities.remote_screen &&
+        canPromptRef.current
       ) {
         void refreshRemoteScreen(record.session_id);
       }
@@ -445,10 +533,17 @@ export function App() {
         onResync: () => {
           setResyncCount((c) => c + 1);
         },
+        onResetCursor: () => {
+          lastSeqRef.current = 0;
+          setHeadSeq(0);
+          setProjection(createEmptyProjection(selectedSessionId, initialStatus));
+        },
       }
     );
+    activeSubRef.current = sub;
 
     return () => {
+      activeSubRef.current = null;
       sub.close();
     };
     // Re-subscribe only when client or selectedSessionId changes
@@ -471,16 +566,18 @@ export function App() {
   );
 
   const handleCreateSession = useCallback(
-    async (req: CreateSessionRequest) => {
-      if (!client) return;
+    async (req: CreateSessionRequest): Promise<boolean> => {
+      if (!client) return false;
       setCreatingSession(true);
       setStreamError(null);
       try {
         const created = await client.createSession(req);
         setSessions((prev) => [created, ...prev]);
         setSelectedSessionId(created.id);
+        return true;
       } catch (err) {
         setStreamError(err instanceof Error ? err.message : "创建会话失败");
+        return false;
       } finally {
         setCreatingSession(false);
       }
@@ -489,13 +586,15 @@ export function App() {
   );
 
   const handleSendPrompt = useCallback(
-    async (text: string, mode?: SubmitMode) => {
-      if (!client || !selectedSessionId) return;
+    async (text: string, mode?: SubmitMode): Promise<boolean> => {
+      if (!client || !selectedSessionId) return false;
       setStreamError(null);
       try {
         await client.submitPrompt(selectedSessionId, text, mode);
+        return true;
       } catch (err) {
         setStreamError(err instanceof Error ? err.message : "发送指令失败");
+        return false;
       }
     },
     [client, selectedSessionId]
@@ -582,8 +681,11 @@ export function App() {
   const handleTogglePush = useCallback(async () => {
     if (!client) return;
     if (pushEnabled) {
-      savePushPreference(false);
+      const res = await disableApprovalPush(client);
       setPushEnabled(false);
+      if (!res.ok) {
+        setStreamError(res.detail);
+      }
       return;
     }
     const res = await enableApprovalPush(client);
@@ -605,14 +707,18 @@ export function App() {
     }
   }, [client, selectedSessionId, simulatingDrop]);
 
-  useEffect(() => {
-    const pending =
+  const pendingApprovalCount = useMemo(
+    () =>
       projection?.items.reduce((acc, it) => {
         if (it.kind !== "assistant") return acc;
         return acc + it.approvals.filter((a) => a.status === "pending").length;
-      }, 0) ?? 0;
-    void updateTrayBadge(pending);
-  }, [projection]);
+      }, 0) ?? 0,
+    [projection?.items]
+  );
+
+  useEffect(() => {
+    void updateTrayBadge(pendingApprovalCount);
+  }, [pendingApprovalCount]);
 
   if (!client || !serverInfo) {
     const saved = readSavedAuth();
@@ -626,7 +732,9 @@ export function App() {
     return (
       <ConnectView
         initialServerUrl={defaultUrl}
-        initialToken={saved?.mode === "http" ? saved.token : ""}
+        initialToken={
+          saved?.mode === "http" && !isTauriDesktop() ? saved.token : ""
+        }
         theme={theme}
         connecting={connecting}
         error={connectError}
@@ -640,9 +748,6 @@ export function App() {
   const activeSeq = projection?.lastSeq ?? selectedSession?.head_seq ?? 0;
   const activeStatus = projection?.status ?? selectedSession?.status ?? "idle";
   const badge = connectionBadge(connectionState, activeSeq);
-  const canManageSession =
-    !principal || roleCan(principal.role, "create_session");
-  const canPrompt = !principal || roleCan(principal.role, "prompt_session");
 
   return (
     <div className="workbench">
@@ -732,7 +837,10 @@ export function App() {
               </div>
             )}
 
-            {remoteScreen && remoteScreen.available && (
+            {canPrompt &&
+              remoteScreen &&
+              remoteScreen.available &&
+              isSafeHttpUrl(remoteScreen.takeover_url) && (
               <a
                 id="open-remote-screen-btn"
                 className="btn btn-primary btn-sm"
@@ -868,10 +976,13 @@ export function App() {
               <SessionStream
                 harnessId={selectedSession.config.harness_id}
                 items={projection?.items ?? []}
+                canResolveApproval={canResolveApproval}
+                highlightedApprovalId={highlightedApprovalId}
                 onResolveApproval={handleResolveApproval}
               />
               {canPrompt ? (
                 <Composer
+                  key={selectedSession.id}
                   status={activeStatus}
                   disabled={
                     connectionState === "disconnected" || activeStatus === "closed"
@@ -919,6 +1030,7 @@ export function App() {
         open={worktreeOpen}
         sessionId={selectedSessionId}
         client={client}
+        canManageRules={canManageApprovalRules}
         onClose={() => setWorktreeOpen(false)}
       />
 
@@ -943,6 +1055,7 @@ export function App() {
         creating={creatingSession}
         harnesses={harnesses}
         workspaces={workspaces}
+        canManageWorkspaces={canManageWorkspaces}
         onRegisterWorkspace={handleRegisterWorkspace}
         onClose={() => setNewModalOpen(false)}
         onCreate={handleCreateSession}
@@ -954,6 +1067,7 @@ export function App() {
         principal={principal}
         onClose={() => setTeamConsoleOpen(false)}
         onPushStateChanged={setPushEnabled}
+        onSelfTokenRevoked={handleDisconnect}
       />
 
       <AutomationConsole

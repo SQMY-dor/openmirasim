@@ -46,6 +46,8 @@ function formatTs(ts: number): string {
   }
 }
 
+const WEEKDAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+
 function describeSpec(s: Schedule): string {
   switch (s.spec.kind) {
     case "every":
@@ -55,7 +57,16 @@ function describeSpec(s: Schedule): string {
     case "daily": {
       const hh = String(Math.floor(s.spec.minute_of_day / 60)).padStart(2, "0");
       const mm = String(s.spec.minute_of_day % 60).padStart(2, "0");
-      return `每日 ${hh}:${mm}`;
+      const offsetMins = s.spec.tz_offset_mins ?? 0;
+      const sign = offsetMins >= 0 ? "+" : "-";
+      const absMins = Math.abs(offsetMins);
+      const tzH = String(Math.floor(absMins / 60)).padStart(2, "0");
+      const tzM = String(absMins % 60).padStart(2, "0");
+      const days =
+        s.spec.weekdays && s.spec.weekdays.length > 0 && s.spec.weekdays.length < 7
+          ? ` (${s.spec.weekdays.map((d) => WEEKDAY_LABELS[d] ?? String(d)).join("/")})`
+          : "";
+      return `每日 ${hh}:${mm} UTC${sign}${tzH}:${tzM}${days}`;
     }
   }
 }
@@ -108,21 +119,35 @@ export function AutomationConsole({
   const [dispatchMode, setDispatchMode] = useState<SubmitMode>("queue");
   const [dispatchPrompt, setDispatchPrompt] = useState("");
 
+  const [submitting, setSubmitting] = useState(false);
+
   const role: Role = principal?.role ?? "viewer";
   const canPrompt = roleCan(role, "prompt_session");
+  const canManageAllSchedules = roleCan(role, "manage_workspaces");
   const otherSessions = sessions.filter((s) => s.id !== activeSessionId);
 
   useEffect(() => {
-    if (!schedTargetSession && (activeSessionId || sessions[0]?.id)) {
+    const valid = sessions.some((s) => s.id === schedTargetSession);
+    if (!valid) {
       setSchedTargetSession(activeSessionId ?? sessions[0]?.id ?? "");
     }
   }, [activeSessionId, sessions, schedTargetSession]);
 
   useEffect(() => {
-    if (!dispatchTargetSession && otherSessions[0]?.id) {
-      setDispatchTargetSession(otherSessions[0].id);
+    const valid = otherSessions.some((s) => s.id === dispatchTargetSession);
+    if (!valid) {
+      setDispatchTargetSession(otherSessions[0]?.id ?? "");
     }
   }, [otherSessions, dispatchTargetSession]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   const loadRuns = useCallback(
     async (scheduleId: string) => {
@@ -185,17 +210,24 @@ export function AutomationConsole({
 
   const handleCreateSchedule = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!schedName.trim() || !schedTargetSession || !schedPrompt.trim()) return;
+    if (submitting || !schedName.trim() || !schedTargetSession || !schedPrompt.trim()) {
+      return;
+    }
     setError(null);
     setNotice(null);
-    const interval = Math.max(60, Number.parseInt(schedIntervalSecs, 10) || 3600);
+    const parsedInterval = Number.parseInt(schedIntervalSecs.trim(), 10);
+    if (!Number.isFinite(parsedInterval) || parsedInterval < 60 || parsedInterval > 31_536_000) {
+      setError("触发间隔必须是 60 到 31536000 之间的整数秒");
+      return;
+    }
+    setSubmitting(true);
     try {
       const created = await client.createSchedule({
         name: schedName.trim(),
         spec: {
           kind: "every",
-          interval_secs: interval,
-          start_at: Date.now() + interval * 1000,
+          interval_secs: parsedInterval,
+          start_at: Date.now() + parsedInterval * 1000,
         },
         target: {
           kind: "session",
@@ -214,6 +246,8 @@ export function AutomationConsole({
       await loadAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : "创建定时任务失败");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -459,7 +493,7 @@ export function AutomationConsole({
                       type="submit"
                       id="confirm-create-schedule-btn"
                       className="btn btn-primary btn-sm"
-                      disabled={sessions.length === 0}
+                      disabled={submitting || sessions.length === 0}
                     >
                       <CalendarClock size={13} />
                       <span>创建定时任务</span>
@@ -498,7 +532,9 @@ export function AutomationConsole({
                         </div>
                       </div>
                       <div className="team-row-actions">
-                        {canPrompt && (
+                        {(canManageAllSchedules ||
+                          (canPrompt &&
+                            (!s.created_by || s.created_by === principal?.member_id))) && (
                           <>
                             <button
                               type="button"

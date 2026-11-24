@@ -7,7 +7,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { OpenMirasimClient } from "../protocol/client";
 import type {
   ApprovalRuleView,
@@ -21,10 +21,14 @@ interface WorktreeDrawerProps {
   open: boolean;
   sessionId: SessionId | null;
   client: OpenMirasimClient;
+  canManageRules?: boolean;
   onClose: () => void;
 }
 
 type TabKey = "diff" | "files" | "rules";
+
+const MAX_DIFF_LINES = 2500;
+const MAX_VISIBLE_FILES = 500;
 
 function changeBadge(kind: string): { label: string; cls: "ok" | "warn" | "err" | "" } {
   switch (kind) {
@@ -48,7 +52,9 @@ function renderUnifiedDiff(patch: string) {
       </div>
     );
   }
-  const lines = patch.split("\n");
+  const allLines = patch.split("\n");
+  const clipped = allLines.length > MAX_DIFF_LINES;
+  const lines = clipped ? allLines.slice(0, MAX_DIFF_LINES) : allLines;
   return (
     <pre className="diff-pre">
       {lines.map((line, i) => {
@@ -68,6 +74,11 @@ function renderUnifiedDiff(patch: string) {
           </div>
         );
       })}
+      {clipped && (
+        <div className="diff-line meta">
+          {`… 已省略后续 ${allLines.length - MAX_DIFF_LINES} 行 diff（避免大补丁阻塞渲染）`}
+        </div>
+      )}
     </pre>
   );
 }
@@ -76,6 +87,7 @@ export function WorktreeDrawer({
   open,
   sessionId,
   client,
+  canManageRules = true,
   onClose,
 }: WorktreeDrawerProps) {
   const [tab, setTab] = useState<TabKey>("diff");
@@ -87,26 +99,34 @@ export function WorktreeDrawer({
   const [fileFilter, setFileFilter] = useState("");
   const [selectedFile, setSelectedFile] = useState<WorktreeFileContent | null>(null);
   const [rules, setRules] = useState<ApprovalRuleView[]>([]);
+  const reqIdRef = useRef(0);
 
   const loadActiveTab = useCallback(async () => {
     if (!open || !sessionId) return;
+    const reqId = ++reqIdRef.current;
     setLoading(true);
     setError(null);
     try {
       if (tab === "diff") {
         const res = await client.getWorktreeDiff(sessionId);
+        if (reqId !== reqIdRef.current) return;
         setDiff(res);
       } else if (tab === "files") {
         const list = await client.listWorktreeFiles(sessionId);
+        if (reqId !== reqIdRef.current) return;
         setEntries(list);
       } else {
         const list = await client.listApprovalRules(sessionId);
+        if (reqId !== reqIdRef.current) return;
         setRules(list);
       }
     } catch (err) {
+      if (reqId !== reqIdRef.current) return;
       setError(err instanceof Error ? err.message : "加载工作区信息失败");
     } finally {
-      setLoading(false);
+      if (reqId === reqIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [open, sessionId, tab, client]);
 
@@ -115,37 +135,49 @@ export function WorktreeDrawer({
   }, [loadActiveTab]);
 
   useEffect(() => {
+    reqIdRef.current += 1;
     setSelectedFile(null);
     setDiff(null);
     setEntries([]);
     setRules([]);
+    setError(null);
   }, [sessionId]);
 
   const handleOpenFile = async (relPath: string) => {
     if (!sessionId) return;
+    const reqId = ++reqIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const content = await client.readWorktreeFile(sessionId, relPath);
+      if (reqId !== reqIdRef.current) return;
       setSelectedFile(content);
     } catch (err) {
+      if (reqId !== reqIdRef.current) return;
       setError(err instanceof Error ? err.message : "读取文件失败");
     } finally {
-      setLoading(false);
+      if (reqId === reqIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
   const handleClearRules = async () => {
-    if (!sessionId) return;
+    if (!sessionId || !canManageRules) return;
+    const reqId = ++reqIdRef.current;
     setLoading(true);
     setError(null);
     try {
       await client.clearApprovalRules(sessionId);
+      if (reqId !== reqIdRef.current) return;
       setRules([]);
     } catch (err) {
+      if (reqId !== reqIdRef.current) return;
       setError(err instanceof Error ? err.message : "清空审批规则失败");
     } finally {
-      setLoading(false);
+      if (reqId === reqIdRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -283,7 +315,19 @@ export function WorktreeDrawer({
                     返回列表
                   </button>
                 </div>
-                <pre className="diff-pre">{selectedFile.content}</pre>
+                {selectedFile.utf8 === false ? (
+                  <div
+                    style={{
+                      color: "var(--text-muted)",
+                      fontSize: 12.5,
+                      padding: "12px 0",
+                    }}
+                  >
+                    二进制文件（{selectedFile.size} B），不支持纯文本预览。
+                  </div>
+                ) : (
+                  <pre className="diff-pre">{selectedFile.content}</pre>
+                )}
               </div>
             ) : (
               <ul className="worktree-file-list">
@@ -292,18 +336,31 @@ export function WorktreeDrawer({
                     暂无文件
                   </li>
                 ) : (
-                  filteredEntries.map((entry) => (
-                    <li key={entry.path}>
-                      <button
-                        type="button"
-                        className="worktree-file-btn"
-                        onClick={() => void handleOpenFile(entry.path)}
+                  <>
+                    {filteredEntries.slice(0, MAX_VISIBLE_FILES).map((entry) => (
+                      <li key={entry.path}>
+                        <button
+                          type="button"
+                          className="worktree-file-btn"
+                          onClick={() => void handleOpenFile(entry.path)}
+                        >
+                          <span className="worktree-file-path">{entry.path}</span>
+                          <span className="worktree-file-size">{entry.size} B</span>
+                        </button>
+                      </li>
+                    ))}
+                    {filteredEntries.length > MAX_VISIBLE_FILES && (
+                      <li
+                        style={{
+                          color: "var(--text-muted)",
+                          fontSize: 12,
+                          padding: "8px 4px",
+                        }}
                       >
-                        <span className="worktree-file-path">{entry.path}</span>
-                        <span className="worktree-file-size">{entry.size} B</span>
-                      </button>
-                    </li>
-                  ))
+                        仅展示前 {MAX_VISIBLE_FILES} / {filteredEntries.length} 个文件，请输入路径关键字过滤。
+                      </li>
+                    )}
+                  </>
                 )}
               </ul>
             )}
@@ -314,7 +371,7 @@ export function WorktreeDrawer({
           <div className="drawer-section">
             <div className="drawer-meta-row">
               <span className="chip">{rules.length} 条记忆规则</span>
-              {rules.length > 0 && (
+              {canManageRules && rules.length > 0 && (
                 <button
                   type="button"
                   id="clear-approval-rules-btn"

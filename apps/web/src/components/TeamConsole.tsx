@@ -11,7 +11,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import type { OpenMirasimClient } from "../protocol/client";
 import {
   MAX_MEMBERS_PER_SPACE,
@@ -27,7 +27,11 @@ import {
   type PushConfigResponse,
   type Role,
 } from "../protocol/types";
-import { enableApprovalPush, readPushPreference, savePushPreference } from "../pwa/push";
+import {
+  disableApprovalPush,
+  enableApprovalPush,
+  readPushPreference,
+} from "../pwa/push";
 
 interface TeamConsoleProps {
   open: boolean;
@@ -35,6 +39,7 @@ interface TeamConsoleProps {
   principal: Principal | null;
   onClose: () => void;
   onPushStateChanged?: (enabled: boolean) => void;
+  onSelfTokenRevoked?: () => void;
 }
 
 type TeamTab = "members" | "tokens" | "security";
@@ -62,6 +67,7 @@ export function TeamConsole({
   principal,
   onClose,
   onPushStateChanged,
+  onSelfTokenRevoked,
 }: TeamConsoleProps) {
   const [tab, setTab] = useState<TeamTab>("members");
   const [loading, setLoading] = useState(false);
@@ -81,9 +87,32 @@ export function TeamConsole({
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditFilter, setAuditFilter] = useState("");
+  const [debouncedAuditFilter, setDebouncedAuditFilter] = useState("");
   const [pushCfg, setPushCfg] = useState<PushConfigResponse | null>(null);
   const [pushEnabled, setPushEnabled] = useState(readPushPreference);
   const [pushNote, setPushNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedAuditFilter(auditFilter), 250);
+    return () => window.clearTimeout(t);
+  }, [auditFilter]);
+
+  // Clear one-time plaintext secret whenever modal closes or switches tabs.
+  useEffect(() => {
+    if (!open || tab !== "tokens") {
+      setFreshToken(null);
+      setCopiedSecret(false);
+    }
+  }, [open, tab]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   const myRole: Role = principal?.role ?? "viewer";
   const canManageMembers = roleCan(myRole, "manage_members");
@@ -125,12 +154,12 @@ export function TeamConsole({
     setProviders(provs);
     setPushCfg(push);
     if (canViewAudit) {
-      const entries = await client.listAudit(auditFilter || undefined, 80);
+      const entries = await client.listAudit(debouncedAuditFilter || undefined, 80);
       setAuditEntries(entries);
     } else {
       setAuditEntries([]);
     }
-  }, [client, canViewAudit, auditFilter]);
+  }, [client, canViewAudit, debouncedAuditFilter]);
 
   const refreshActiveTab = useCallback(async () => {
     if (!open) return;
@@ -180,7 +209,8 @@ export function TeamConsole({
 
   if (!open) return null;
 
-  const handleAddMember = async () => {
+  const handleAddMember = async (e?: FormEvent) => {
+    e?.preventDefault();
     if (!newName.trim()) return;
     setLoading(true);
     setError(null);
@@ -222,17 +252,25 @@ export function TeamConsole({
     }
   };
 
-  const handleIssueToken = async () => {
+  const handleIssueToken = async (e?: FormEvent) => {
+    e?.preventDefault();
     const target = selectedMemberId || principal?.member_id;
     if (!target || !tokenLabel.trim()) return;
+    const ttlRaw = tokenTtlDays.trim();
+    let ttlSecs: number | undefined;
+    if (ttlRaw !== "" && ttlRaw !== "0") {
+      const days = Number(ttlRaw);
+      if (!Number.isFinite(days) || days < 0) {
+        setError("有效期天数必须为非负数字（留空或 0 表示长期有效）");
+        return;
+      }
+      ttlSecs = Math.round(days * 86_400);
+    }
     setLoading(true);
     setError(null);
     setFreshToken(null);
     setCopiedSecret(false);
     try {
-      const days = Number(tokenTtlDays);
-      const ttlSecs =
-        Number.isFinite(days) && days > 0 ? Math.round(days * 86_400) : undefined;
       const issued = await client.issueMemberToken(
         target,
         tokenLabel.trim(),
@@ -253,6 +291,15 @@ export function TeamConsole({
     setError(null);
     try {
       await client.revokeToken(tokenId);
+      if (freshToken?.token.id === tokenId) {
+        setFreshToken(null);
+        setCopiedSecret(false);
+      }
+      if (principal?.token_id && tokenId === principal.token_id) {
+        onClose();
+        onSelfTokenRevoked?.();
+        return;
+      }
       if (selectedMemberId) {
         await loadTokens(selectedMemberId);
       }
@@ -276,10 +323,11 @@ export function TeamConsole({
   const handleTogglePush = async () => {
     setPushNote(null);
     if (pushEnabled) {
-      savePushPreference(false);
+      const res = await disableApprovalPush(client);
       setPushEnabled(false);
       onPushStateChanged?.(false);
-      setPushNote("已关闭本地 PWA 审批通知");
+      setPushNote(res.detail);
+      await loadSecurity().catch(() => {});
       return;
     }
     const res = await enableApprovalPush(client);
@@ -291,8 +339,9 @@ export function TeamConsole({
 
   const manageableMembers = members.filter(
     (m) =>
-      m.id === principal?.member_id ||
-      (canManageMembers && roleCanManage(myRole, m.role))
+      !m.disabled_at &&
+      (m.id === principal?.member_id ||
+        (canManageMembers && roleCanManage(myRole, m.role)))
   );
 
   return (
@@ -394,7 +443,10 @@ export function TeamConsole({
                     <UserPlus size={14} />
                     <span>添加团队成员（单空间上限 {MAX_MEMBERS_PER_SPACE} 人）</span>
                   </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <form
+                    style={{ display: "flex", gap: 8, flexWrap: "wrap" }}
+                    onSubmit={(e) => void handleAddMember(e)}
+                  >
                     <input
                       id="add-member-name"
                       className="input"
@@ -418,15 +470,14 @@ export function TeamConsole({
                       ))}
                     </select>
                     <button
-                      type="button"
+                      type="submit"
                       id="confirm-add-member-btn"
                       className="btn btn-primary btn-sm"
                       disabled={loading || !newName.trim()}
-                      onClick={() => void handleAddMember()}
                     >
                       添加成员
                     </button>
-                  </div>
+                  </form>
                 </div>
               )}
 
@@ -512,7 +563,10 @@ export function TeamConsole({
           {tab === "tokens" && (
             <div className="drawer-section">
               <div className="inline-register-box" style={{ marginBottom: 12 }}>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <form
+                  style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}
+                  onSubmit={(e) => void handleIssueToken(e)}
+                >
                   <select
                     id="token-member-select"
                     className="select"
@@ -550,15 +604,14 @@ export function TeamConsole({
                     onChange={(e) => setTokenTtlDays(e.target.value)}
                   />
                   <button
-                    type="button"
+                    type="submit"
                     id="confirm-issue-token-btn"
                     className="btn btn-primary btn-sm"
                     disabled={loading || !selectedMemberId || !tokenLabel.trim()}
-                    onClick={() => void handleIssueToken()}
                   >
                     签发设备 Token
                   </button>
-                </div>
+                </form>
 
                 {freshToken && (
                   <div className="token-secret-banner" id="issued-token-banner">

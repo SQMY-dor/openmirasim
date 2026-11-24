@@ -975,7 +975,14 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     if (!run) return;
     run.cancelled = true;
     if (run.approvalGate) {
-      run.approvalGate.resolve({ outcome: "cancelled" });
+      const gate = run.approvalGate;
+      this.appendEvent(gate.sessionId, {
+        type: "approval_resolved",
+        approval_id: gate.approvalId,
+        decision: { outcome: "cancelled" },
+        resolved_by: "member_dev",
+      });
+      gate.resolve({ outcome: "cancelled" });
     }
   }
 
@@ -1054,6 +1061,7 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       id: "mcp_demo_github",
       space_id: "space_default",
       scope: "space",
+      global_available: true,
       name: "github",
       transport: "streamable_http",
       args: [],
@@ -1231,6 +1239,9 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       space_id: "space_default",
       scope: req.scope,
       workspace_id: req.workspace_id,
+      owner_member_id: req.scope === "workspace" ? "member_dev" : undefined,
+      global_available:
+        req.scope === "space" ? (req.global_available ?? true) : false,
       name: req.name,
       transport: req.transport,
       command: req.command,
@@ -1254,6 +1265,9 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     const rec = this.mockMcpServers.find((s) => s.id === id);
     if (!rec) throw new Error("mcp server not found");
     if (req.enabled !== undefined) rec.enabled = req.enabled;
+    if (req.global_available !== undefined && rec.scope === "space") {
+      rec.global_available = req.global_available;
+    }
     if (req.description !== undefined) rec.description = req.description;
     rec.updated_at = nowMs();
     return { ...rec };
@@ -1325,7 +1339,7 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
   async getEffectiveHub(workspaceId?: WorkspaceId): Promise<EffectiveHubResponse> {
     const mcpMap = new Map<string, EffectiveHubResponse["mcp_servers"][number]>();
     for (const s of this.mockMcpServers) {
-      if (s.scope === "space" && s.enabled) {
+      if (s.scope === "space" && s.enabled && s.global_available !== false) {
         mcpMap.set(s.name.toLowerCase(), { ...s, overridden_space_default: false });
       }
     }
@@ -1341,7 +1355,7 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     }
     const mcp_servers = [...mcpMap.values()];
     const skills = this.mockSkills
-      .filter((sk) => sk.enabled && sk.lifecycle !== "archived")
+      .filter((sk) => sk.enabled && sk.lifecycle !== "archived" && sk.lifecycle !== "draft")
       .map((sk) => ({ ...sk, overridden_space_default: false }));
     return {
       space_id: "space_default",

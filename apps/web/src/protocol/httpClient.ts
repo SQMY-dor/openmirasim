@@ -78,6 +78,8 @@ import {
 } from "./types";
 
 const WS_PING_INTERVAL_MS = 25_000;
+const WS_PONG_TIMEOUT_MS = 10_000;
+const MAX_FETCH_EVENT_PAGES = 500;
 
 interface HealthResponse {
   status: string;
@@ -103,12 +105,17 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+    };
+    if (init?.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
     const res = await fetch(`${this.serverUrl}${path}`, {
       ...init,
       headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-        ...(init?.headers ?? {}),
+        ...headers,
+        ...(init?.headers as Record<string, string> | undefined),
       },
     });
 
@@ -326,17 +333,23 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     const collected: SessionEvent[] = [];
     let cursor = afterSeq;
     let hasMore = true;
+    let pages = 0;
 
-    while (hasMore) {
+    while (hasMore && pages < MAX_FETCH_EVENT_PAGES) {
+      pages += 1;
       const params = new URLSearchParams({ after_seq: String(cursor) });
       const page = await this.request<ListEventsResponse>(
         `/api/v1/sessions/${encodeURIComponent(sessionId)}/events?${params.toString()}`
       );
-      collected.push(...page.events);
       if (page.events.length === 0) {
         break;
       }
-      cursor = page.events[page.events.length - 1].seq;
+      const nextCursor = page.events[page.events.length - 1].seq;
+      if (nextCursor <= cursor) {
+        break;
+      }
+      collected.push(...page.events);
+      cursor = nextCursor;
       hasMore = page.has_more;
     }
 
@@ -483,7 +496,16 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       }
     );
     if (!res.ok) {
-      throw new Error(`获取终端录制失败 (HTTP ${res.status})`);
+      let detail = `获取终端录制失败 (HTTP ${res.status})`;
+      try {
+        const body = (await res.json()) as Partial<ApiError>;
+        if (body.message) {
+          detail = body.code ? `[${body.code}] ${body.message}` : body.message;
+        }
+      } catch {
+        // ignore non-JSON body
+      }
+      throw new Error(detail);
     }
     return await res.text();
   }
@@ -693,14 +715,26 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     let ws: WebSocket | null = null;
     let retryTimer: number | null = null;
     let pingTimer: number | null = null;
+    let pongTimer: number | null = null;
     let pingNonce = 1;
     let attempt = 0;
+    let expectedHeadSeq = 0;
+    let caughtUp = false;
+    let didResetCursor = false;
+
+    const clearPong = () => {
+      if (pongTimer !== null) {
+        window.clearTimeout(pongTimer);
+        pongTimer = null;
+      }
+    };
 
     const clearPing = () => {
       if (pingTimer !== null) {
         window.clearInterval(pingTimer);
         pingTimer = null;
       }
+      clearPong();
     };
 
     const sendFrame = (socket: WebSocket, msg: ClientMessage) => {
@@ -722,22 +756,33 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       handlers.onStateChange("reconnecting", reason);
       const delay = computeBackoffMs(attempt);
       retryTimer = window.setTimeout(() => {
+        retryTimer = null;
         openSocket();
       }, delay);
     };
 
     const openSocket = () => {
       if (closed || fatalError) return;
+      caughtUp = false;
+      didResetCursor = false;
       handlers.onStateChange(
         attempt === 0 ? "connecting" : "reconnecting",
         null
       );
 
-      const socket = new WebSocket(buildWsUrl());
+      let socket: WebSocket;
+      try {
+        socket = new WebSocket(buildWsUrl());
+      } catch (err) {
+        scheduleReconnect(
+          err instanceof Error ? `WebSocket 初始化失败: ${err.message}` : "WebSocket 初始化失败"
+        );
+        return;
+      }
       ws = socket;
 
       socket.onopen = () => {
-        if (closed) {
+        if (closed || ws !== socket) {
           socket.close();
           return;
         }
@@ -748,12 +793,20 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
         });
         clearPing();
         pingTimer = window.setInterval(() => {
+          if (closed || ws !== socket || socket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          clearPong();
           sendFrame(socket, { type: "ping", nonce: pingNonce++ });
+          pongTimer = window.setTimeout(() => {
+            if (closed || ws !== socket) return;
+            socket.close(4000, "ping timeout");
+          }, WS_PONG_TIMEOUT_MS);
         }, WS_PING_INTERVAL_MS);
       };
 
       socket.onmessage = (raw) => {
-        if (closed || typeof raw.data !== "string") return;
+        if (closed || ws !== socket || typeof raw.data !== "string") return;
         let msg: ServerMessage;
         try {
           msg = JSON.parse(raw.data) as ServerMessage;
@@ -773,16 +826,29 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
           case "subscribed": {
             if (msg.session_id !== sessionId) return;
             attempt = 0;
+            expectedHeadSeq = msg.head_seq;
             handlers.onHeadSeq?.(msg.head_seq);
-            handlers.onStateChange("connected", null);
+            if (getLastSeq() >= msg.head_seq) {
+              caughtUp = true;
+              handlers.onStateChange("connected", null);
+            } else {
+              caughtUp = false;
+              handlers.onStateChange("catching_up", null);
+            }
             break;
           }
           case "event": {
+            if (msg.event.session_id !== sessionId) return;
             handlers.onEvent(msg.event);
+            if (!caughtUp && getLastSeq() >= expectedHeadSeq) {
+              caughtUp = true;
+              handlers.onStateChange("connected", null);
+            }
             break;
           }
           case "resync": {
             if (msg.session_id !== sessionId) return;
+            caughtUp = false;
             handlers.onResync?.();
             handlers.onStateChange("catching_up", null);
             sendFrame(socket, {
@@ -793,6 +859,20 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
             break;
           }
           case "error": {
+            if (msg.error.code === "invalid_input" && !didResetCursor && getLastSeq() > 0) {
+              // Recover cleanly when client `last_seq` exceeds server `head_seq` (e.g., DB reset).
+              didResetCursor = true;
+              caughtUp = false;
+              handlers.onResetCursor?.();
+              handlers.onResync?.();
+              handlers.onStateChange("catching_up", null);
+              sendFrame(socket, {
+                type: "subscribe",
+                session_id: sessionId,
+                last_seq: 0,
+              });
+              break;
+            }
             const isFatal =
               msg.error.code === "not_found" ||
               msg.error.code === "unauthorized" ||
@@ -801,6 +881,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
             if (isFatal) {
               fatalError = true;
               clearPing();
+              socket.close();
             }
             handlers.onStateChange(
               "error",
@@ -808,17 +889,20 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
             );
             break;
           }
-          case "pong":
+          case "pong": {
+            clearPong();
             break;
+          }
         }
       };
 
       socket.onerror = () => {
-        if (closed || fatalError) return;
+        if (closed || fatalError || ws !== socket) return;
         handlers.onStateChange("reconnecting", "WebSocket 连接异常，正在重连");
       };
 
       socket.onclose = () => {
+        if (ws !== socket) return;
         clearPing();
         if (closed || fatalError) return;
         scheduleReconnect("连接已断开，等待自动重连");
@@ -833,6 +917,7 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
         clearPing();
         if (retryTimer !== null) {
           window.clearTimeout(retryTimer);
+          retryTimer = null;
         }
         if (ws) {
           sendFrame(ws, { type: "unsubscribe", session_id: sessionId });
@@ -841,8 +926,22 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
           ws.onerror = null;
           ws.onclose = null;
           ws.close();
+          ws = null;
         }
         handlers.onStateChange("disconnected", null);
+      },
+      resync: () => {
+        if (closed || fatalError || !ws || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        caughtUp = false;
+        handlers.onResync?.();
+        handlers.onStateChange("catching_up", null);
+        sendFrame(ws, {
+          type: "subscribe",
+          session_id: sessionId,
+          last_seq: getLastSeq(),
+        });
       },
     };
   }
