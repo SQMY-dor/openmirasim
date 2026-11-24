@@ -78,13 +78,14 @@ impl HarnessSession for ScriptSession {
         }
         let n = st.prompts.len();
         let reply = if st.done_on.is_some_and(|k| n >= k) {
-            // Extract the per-goal done marker instructed by the goal prompt.
+            // Extract the per-goal done marker instructed by the latest goal prompt.
             let marker = st
                 .prompts
-                .first()
-                .and_then(|first| {
-                    let start = first.find("[[goal:done")?;
-                    let rest = &first[start..];
+                .iter()
+                .rev()
+                .find_map(|p| {
+                    let start = p.find("[[goal:done")?;
+                    let rest = &p[start..];
                     let end = rest.find("]]")? + 2;
                     Some(rest[..end].to_string())
                 })
