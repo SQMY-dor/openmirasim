@@ -499,4 +499,142 @@ test.describe("OpenMirasim Full-Stack Phase 0 E2E (real om-server + SQLite + Web
       fs.rmSync(rootTmp, { recursive: true, force: true });
     }
   });
+
+  test("Phase 3: multi-server profiles, xterm.js binary /ws/pty, asciicast v2 recording & replay, and non-blocking /ws/events", async ({
+    page,
+  }) => {
+    expect(fs.existsSync(SERVER_BIN)).toBe(true);
+    expect(fs.existsSync(path.join(STATIC_DIR, "index.html"))).toBe(true);
+
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "om-phase3-e2e-"));
+    const port = await findFreePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const server = startServer(port, dataDir);
+
+    const consoleErrors: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      consoleErrors.push(err.message);
+    });
+
+    try {
+      await waitForHealthz(baseUrl);
+      await page.goto(baseUrl);
+
+      // 1. Save a named server profile, reload, and switch via the profile chip
+      await page.locator("#server-url-input").fill(baseUrl);
+      await page.locator("#profile-name-input").fill("Team Linux Bare-Metal");
+      await page.locator("#save-profile-btn").click();
+      await expect(page.locator("#server-profiles-bar")).toContainText(
+        "Team Linux Bare-Metal"
+      );
+
+      await page.reload();
+      await expect(page.locator("#server-profiles-bar")).toContainText(
+        "Team Linux Bare-Metal"
+      );
+      await page
+        .locator("#server-profiles-bar .profile-chip-select")
+        .first()
+        .click();
+      await expect(page.locator("#server-url-input")).toHaveValue(baseUrl);
+
+      // 2. Connect & create a real session
+      await page.locator("#access-token-input").fill(TOKEN);
+      await page.locator("#connect-submit-btn").click();
+      await expect(page.locator("#new-session-btn")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      await page.locator("#new-session-btn").click();
+      await page.locator("#new-session-title").fill("Phase 3 PTY 终端验收");
+      await page.locator("#new-session-harness").selectOption("mock");
+      await page.locator("#new-session-cwd").fill(dataDir);
+      await page.locator("#confirm-create-session-btn").click();
+
+      await expect(page.locator("#active-session-title")).toHaveText(
+        "Phase 3 PTY 终端验收",
+        { timeout: 10_000 }
+      );
+      await expect(page.locator("#prompt-textarea")).toBeEnabled({
+        timeout: 10_000,
+      });
+
+      const sessionsRes = await fetch(`${baseUrl}/api/v1/sessions`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      const sessionsBody = (await sessionsRes.json()) as {
+        sessions: Array<{ id: string }>;
+      };
+      const sid = sessionsBody.sessions[0].id;
+
+      // 3. Switch to xterm.js PTY view and send a real shell command over /ws/pty
+      await page.locator("#view-mode-terminal").click();
+      await expect(page.locator("#pty-terminal-view")).toBeVisible();
+      await expect(page.locator("#pty-status-chip")).toContainText("PTY 已连接", {
+        timeout: 10_000,
+      });
+
+      const xtermInput = page.locator("#pty-terminal-view .xterm-helper-textarea");
+      await xtermInput.focus();
+      await page.keyboard.type("echo phase3-xterm-ok");
+      await page.keyboard.press("Enter");
+
+      // Poll .cast recording endpoint until the shell echoed our marker
+      let castBody = "";
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const castRes = await fetch(
+          `${baseUrl}/api/v1/sessions/${sid}/pty/recording`,
+          { headers: { Authorization: `Bearer ${TOKEN}` } }
+        );
+        if (castRes.ok) {
+          expect(castRes.headers.get("content-type")).toContain(
+            "application/x-asciicast"
+          );
+          castBody = await castRes.text();
+          if (castBody.includes("phase3-xterm-ok")) break;
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(castBody).toContain("phase3-xterm-ok");
+      const firstLine = JSON.parse(castBody.split("\n")[0]) as {
+        version: number;
+      };
+      expect(firstLine.version).toBe(2);
+
+      // 4. Replay the asciicast v2 recording inside xterm.js
+      await page.locator("#replay-cast-btn").click();
+      await expect(page.locator("#pty-status-note")).toContainText(
+        "asciicast v2 回放完成",
+        { timeout: 10_000 }
+      );
+
+      // 5. Switch back to Chat view -> /ws/events remains live and unblocked
+      await page.locator("#view-mode-chat").click();
+      await expect(page.locator("#prompt-textarea")).toBeEnabled({
+        timeout: 10_000,
+      });
+      await page
+        .locator("#prompt-textarea")
+        .fill("PTY切换后事件流保持畅通");
+      await page.locator("#send-prompt-btn").click();
+
+      const assistant = page.locator('[data-turn-kind="assistant"]').first();
+      await expect(assistant).toHaveAttribute("data-completed", "true", {
+        timeout: 10_000,
+      });
+      await expect(assistant).toContainText(
+        "mock echo: PTY切换后事件流保持畅通"
+      );
+
+      expect(consoleErrors).toEqual([]);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
+

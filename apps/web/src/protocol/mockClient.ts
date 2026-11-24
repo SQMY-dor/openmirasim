@@ -416,6 +416,38 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
     };
   }
 
+  async getPtyStatus(): Promise<import("./types").PtyStatus> {
+    return {
+      active: true,
+      cols: 100,
+      rows: 30,
+      has_recording: true,
+      recording_bytes: 256,
+      clients: 1,
+    };
+  }
+
+  async killPty(): Promise<void> {
+    // no-op in mock preview
+  }
+
+  async fetchPtyRecording(): Promise<string> {
+    const header = JSON.stringify({
+      version: 2,
+      width: 100,
+      height: 30,
+      timestamp: Math.floor(Date.now() / 1000),
+      env: { TERM: "xterm-256color", SHELL: "/bin/bash" },
+    });
+    const ev1 = JSON.stringify([0.05, "o", "openmirasim$ cargo test --workspace\r\n"]);
+    const ev2 = JSON.stringify([0.35, "o", "\x1b[32mtest result: ok. all checks passed\x1b[0m\r\n"]);
+    return `${header}\n${ev1}\n${ev2}\n`;
+  }
+
+  buildPtyWsUrl(): string | null {
+    return null;
+  }
+
   private loadStore(): PersistedMockStore {
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);

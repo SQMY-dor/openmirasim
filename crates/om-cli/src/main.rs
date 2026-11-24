@@ -1,6 +1,7 @@
-//! OpenMirasim CLI / scriptable `ctl` control plane / TUI (Phase 3) entry point.
+//! OpenMirasim CLI / scriptable `ctl` control plane / Ratatui `tui` client.
 
 mod ctl;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -10,7 +11,7 @@ use std::process::ExitCode;
 #[command(
     name = "om-cli",
     version = om_core::crate_version(),
-    about = "OpenMirasim command-line control plane (`ctl`) and terminal client"
+    about = "OpenMirasim command-line control plane (`ctl`) and Ratatui terminal client (`tui`)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -21,6 +22,8 @@ struct Cli {
 enum TopCommand {
     /// Scriptable pure-JSON control plane for `om-server`.
     Ctl(ctl::CtlArgs),
+    /// Interactive Ratatui multi-session dashboard with direct `/ws/pty` terminal attach.
+    Tui(tui::TuiArgs),
 }
 
 #[tokio::main]
@@ -58,5 +61,12 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        TopCommand::Tui(args) => match tui::run(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("om-cli tui error: {err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }

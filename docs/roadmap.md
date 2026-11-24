@@ -37,9 +37,9 @@
 
 ### Phase 3：桌面薄壳 + PTY 原生终端 + Ratatui TUI
 **可复现 Demo 验收标准**：
-- [ ] 独立 `/ws/pty/:session_id` Binary 流 + `portable-pty` + 内存环形缓冲 + **asciicast v2（`.cast`）** 录制与回放，Web 前端内嵌 `xterm.js` 切换聊天/终端视图且不阻塞 `/ws/events`
-- [ ] **Tauri v2 桌面薄壳**（Linux / macOS / Windows）：连接中心服务器、系统托盘、原生通知、OS Keychain 保存 Token、多服务器 Profile 切换
-- [ ] `om-cli tui`（Ratatui）：无头 Linux 服务器终端内查看多会话并直连 PTY
+- [x] 独立 `/ws/pty/:session_id` Binary 流 + `portable-pty` + 内存环形缓冲 + **asciicast v2（`.cast`）** 录制与回放，Web 前端内嵌 `xterm.js` 切换聊天/终端视图且不阻塞 `/ws/events`
+- [x] **Tauri v2 桌面薄壳**（Linux / macOS / Windows）：连接中心服务器、系统托盘、原生通知、OS Keychain 保存 Token、多服务器 Profile 切换（`apps/tauri/` + `apps/web/src/desktop/tauriBridge.ts`）
+- [x] `om-cli tui`（Ratatui）：无头 Linux 服务器终端内查看多会话、实时 `/ws/events` 审批与直连 `/ws/pty`（`Ctrl+]` 断开）
 
 ### Phase 4：编排扩展与按需演进
 **可复现 Demo 验收标准**：

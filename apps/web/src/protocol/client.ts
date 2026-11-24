@@ -181,6 +181,18 @@ export interface OpenMirasimClient {
   /** Clear remembered approval rules on a session (`DELETE /api/v1/sessions/:id/approval-rules`). */
   clearApprovalRules(sessionId: SessionId): Promise<number>;
 
+  /** Fetch native PTY status and recording size (`GET /api/v1/sessions/:id/pty`). */
+  getPtyStatus(sessionId: SessionId): Promise<import("./types").PtyStatus>;
+
+  /** Terminate active PTY process (`DELETE /api/v1/sessions/:id/pty`). */
+  killPty(sessionId: SessionId): Promise<void>;
+
+  /** Download raw asciicast v2 (`.cast`) recording text (`GET /api/v1/sessions/:id/pty/recording`). */
+  fetchPtyRecording(sessionId: SessionId): Promise<string>;
+
+  /** Build authenticated `/ws/pty/:id` WebSocket URL (`null` in local mock mode). */
+  buildPtyWsUrl(sessionId: SessionId, cols: number, rows: number): string | null;
+
   /**
    * Subscribe to `/ws/events` using the `Hello -> Welcome -> Subscribe { last_seq }` handshake.
    */

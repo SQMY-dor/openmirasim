@@ -242,6 +242,10 @@ pub enum SessionCmd {
     ProxyStats { id: String },
     /// Get remote GUI takeover screen info (for `antigravity-gui` sessions).
     RemoteScreen { id: String },
+    /// Get native PTY status and `.cast` recording metadata for a session.
+    Pty { id: String },
+    /// Terminate a session's active native PTY (preserves `.cast` recording).
+    KillPty { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -669,6 +673,28 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .send(
                         Method::GET,
                         &format!("/api/v1/sessions/{id}/remote-screen"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            SessionCmd::Pty { id } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/sessions/{id}/pty"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            SessionCmd::KillPty { id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/sessions/{id}/pty"),
                         &[],
                         None,
                         true,
