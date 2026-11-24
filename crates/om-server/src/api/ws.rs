@@ -2,11 +2,12 @@
 //! [`crate::orchestrator::Orchestrator::subscribe`] and [`crate::orchestrator::Subscription`].
 //!
 //! Supports both W2-1 RBAC device tokens (`omt_...`) and static bootstrap tokens via
-//! `Authorization: Bearer <token>` or `?token=<token>`. Enforces `Action::ViewSessions`
-//! and space isolation on every `Subscribe` request.
+//! `Authorization: Bearer <token>` or `?token=<token>`. Enforces `Action::ViewSessions`,
+//! space isolation, and periodic re-validation on every connection and `Subscribe` request.
 
 use super::AppState;
 use super::auth::{authenticate_secret, extract_ws_token};
+use super::validate_ws_origin;
 use crate::auth::Auth;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -18,6 +19,7 @@ use om_core::auth::{Action, Principal};
 use om_core::ids::SessionId;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
@@ -32,6 +34,15 @@ const WS_EVENT_QUEUE_CAPACITY: usize = 256;
 /// `Resync`, `Error`, `Pong`).
 const WS_CONTROL_QUEUE_CAPACITY: usize = 64;
 
+/// Maximum inbound JSON control frame size accepted on `/ws/events` (64 KiB).
+const MAX_EVENTS_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Maximum simultaneous session subscriptions per WebSocket connection.
+const MAX_SUBSCRIPTIONS_PER_SOCKET: usize = 64;
+
+/// Periodic re-validation cadence for long-lived `/ws/events` WebSockets.
+const AUTH_REVALIDATE_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
@@ -43,6 +54,17 @@ pub async fn ws_events_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if let Err(msg) = validate_ws_origin(&headers, state.config.allow_cors_origin.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(ApiError {
+                code: ApiErrorCode::Forbidden,
+                message: msg,
+            }),
+        )
+            .into_response();
+    }
+
     let Some(token) = extract_ws_token(&headers, query.token.as_deref()) else {
         let err = ApiError {
             code: ApiErrorCode::Unauthorized,
@@ -76,18 +98,22 @@ pub async fn ws_events_handler(
         return (status, axum::Json(api)).into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, principal))
+    ws.max_message_size(MAX_EVENTS_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, auth, principal))
         .into_response()
 }
 
 async fn send_control(tx: &mpsc::Sender<ServerMessage>, msg: ServerMessage) -> bool {
-    tx.send(msg).await.is_ok()
+    tokio::time::timeout(Duration::from_secs(2), tx.send(msg))
+        .await
+        .is_ok_and(|r| r.is_ok())
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal) {
+async fn handle_socket(socket: WebSocket, state: AppState, auth: Auth, mut principal: Principal) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ServerMessage>(WS_CONTROL_QUEUE_CAPACITY);
     let (evt_tx, mut evt_rx) = mpsc::channel::<ServerMessage>(WS_EVENT_QUEUE_CAPACITY);
+    let (fatal_tx, mut fatal_rx) = mpsc::channel::<()>(1);
 
     let writer = tokio::spawn(async move {
         loop {
@@ -113,8 +139,37 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
 
     let mut welcomed = false;
     let mut subscriptions: HashMap<SessionId, JoinHandle<()>> = HashMap::new();
+    let mut revalidate_tick = tokio::time::interval(AUTH_REVALIDATE_INTERVAL);
+    revalidate_tick.tick().await;
 
-    while let Some(Ok(frame)) = ws_rx.next().await {
+    loop {
+        let frame = tokio::select! {
+            _ = fatal_rx.recv() => break,
+            _ = revalidate_tick.tick() => {
+                match auth.verify_principal(&principal).await {
+                    Ok(fresh) => {
+                        principal = fresh;
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = send_control(
+                            &ctrl_tx,
+                            ServerMessage::Error {
+                                session_id: None,
+                                error: ApiError::from(&err),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+            next = ws_rx.next() => match next {
+                Some(Ok(f)) => f,
+                _ => break,
+            }
+        };
+
         match frame {
             Message::Text(text) => {
                 let msg: ClientMessage = match serde_json::from_str(&text) {
@@ -196,6 +251,22 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
                             continue;
                         }
 
+                        // Re-verify principal liveness before granting new subscriptions.
+                        match auth.verify_principal(&principal).await {
+                            Ok(fresh) => principal = fresh,
+                            Err(err) => {
+                                let _ = send_control(
+                                    &ctrl_tx,
+                                    ServerMessage::Error {
+                                        session_id: Some(session_id),
+                                        error: ApiError::from(&err),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+
                         // Enforce space isolation: sessions from another space appear as NotFound.
                         match state.orchestrator.db().get_session(&session_id).await {
                             Ok(summary) if summary.space_id == principal.space_id => {}
@@ -232,6 +303,28 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
                             }
                         }
 
+                        if !subscriptions.contains_key(&session_id)
+                            && subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_SOCKET
+                        {
+                            if !send_control(
+                                &ctrl_tx,
+                                ServerMessage::Error {
+                                    session_id: Some(session_id),
+                                    error: ApiError {
+                                        code: ApiErrorCode::LimitExceeded,
+                                        message: format!(
+                                            "too many concurrent subscriptions (max {MAX_SUBSCRIPTIONS_PER_SOCKET})"
+                                        ),
+                                    },
+                                },
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+
                         if let Some(prev) = subscriptions.remove(&session_id) {
                             prev.abort();
                         }
@@ -253,6 +346,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
 
                                 let ev_tx = evt_tx.clone();
                                 let ct_tx = ctrl_tx.clone();
+                                let ft_tx = fatal_tx.clone();
                                 let sid = session_id.clone();
                                 let handle = tokio::spawn(async move {
                                     loop {
@@ -267,10 +361,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
                                                             session = %sid,
                                                             "slow WS subscriber queue full; requesting resync"
                                                         );
-                                                        let _ =
-                                                            ct_tx.try_send(ServerMessage::Resync {
+                                                        if !send_control(
+                                                            &ct_tx,
+                                                            ServerMessage::Resync {
                                                                 session_id: sid,
-                                                            });
+                                                            },
+                                                        )
+                                                        .await
+                                                        {
+                                                            let _ = ft_tx.try_send(());
+                                                        }
                                                         break;
                                                     }
                                                     Err(TrySendError::Closed(_)) => break,
@@ -278,10 +378,17 @@ async fn handle_socket(socket: WebSocket, state: AppState, principal: Principal)
                                             }
                                             Ok(None) => break,
                                             Err(err) => {
-                                                let _ = ct_tx.try_send(ServerMessage::Error {
-                                                    session_id: Some(sid),
-                                                    error: ApiError::from(&err),
-                                                });
+                                                if !send_control(
+                                                    &ct_tx,
+                                                    ServerMessage::Error {
+                                                        session_id: Some(sid),
+                                                        error: ApiError::from(&err),
+                                                    },
+                                                )
+                                                .await
+                                                {
+                                                    let _ = ft_tx.try_send(());
+                                                }
                                                 break;
                                             }
                                         }

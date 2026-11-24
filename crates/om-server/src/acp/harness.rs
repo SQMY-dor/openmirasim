@@ -1,7 +1,7 @@
 use super::ACP_PROTOCOL_VERSION;
 use super::mapping;
-use super::rpc::{Incoming, RpcConnection, RpcError};
-use crate::stream::ReceiverStream;
+use super::rpc::{Incoming, RpcConnection, RpcError, read_line_capped};
+use crate::stream::BoundedReceiverStream;
 use async_trait::async_trait;
 use om_core::approval::ApprovalDecision;
 use om_core::content::Prompt;
@@ -19,7 +19,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -83,16 +83,20 @@ struct State {
     tool_titles: Mutex<HashMap<String, String>>,
     /// Suppresses replayed history while `session/load` runs.
     loading: AtomicBool,
-    events: Mutex<Option<mpsc::UnboundedSender<HarnessEvent>>>,
+    events: Mutex<Option<mpsc::Sender<HarnessEvent>>>,
     child: tokio::sync::Mutex<Child>,
 }
 
+/// Bounded capacity for the harness event stream (propagates backpressure to ACP stdout).
+const EVENTS_CAPACITY: usize = 512;
+/// Maximum bytes buffered for a single stderr log line before discarding the rest.
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+
 impl State {
-    fn emit(&self, ev: HarnessEvent) {
-        if let Ok(guard) = self.events.lock()
-            && let Some(tx) = guard.as_ref()
-        {
-            let _ = tx.send(ev);
+    async fn emit(&self, ev: HarnessEvent) {
+        let tx = self.events.lock().ok().and_then(|g| g.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(ev).await;
         }
     }
 
@@ -112,7 +116,7 @@ fn cancelled_outcome() -> Value {
     json!({"outcome": {"outcome": "cancelled"}})
 }
 
-async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
+async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::Receiver<Incoming>) {
     while let Some(msg) = incoming.recv().await {
         match msg {
             Incoming::Notification { method, params } if method == "session/update" => {
@@ -125,16 +129,21 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                 if let Some(ev) = mapping::session_update_to_event(update) {
                     if let HarnessEvent::ToolCall(info) = &ev
                         && let Ok(mut titles) = state.tool_titles.lock()
+                        && titles.len() < 1024
                     {
                         titles.insert(info.tool_call_id.clone(), info.title.clone());
                     }
-                    state.emit(ev);
+                    state.emit(ev).await;
                 }
             }
             Incoming::Notification { method, .. } => {
                 tracing::debug!(harness = %state.harness_id, %method, "ignoring ACP notification");
             }
             Incoming::Request { id, method, params } if method == "session/request_permission" => {
+                if state.loading.load(Ordering::SeqCst) {
+                    let _ = state.conn.respond(id, Ok(cancelled_outcome()));
+                    continue;
+                }
                 let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
                 let tool_call_id = tool_call
                     .get("toolCallId")
@@ -143,10 +152,14 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                 let title = tool_call
                     .get("title")
                     .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
                     .map(str::to_owned)
                     .or_else(|| {
                         let titles = state.tool_titles.lock().ok()?;
-                        titles.get(tool_call_id.as_deref()?).cloned()
+                        titles
+                            .get(tool_call_id.as_deref()?)
+                            .filter(|s| !s.trim().is_empty())
+                            .cloned()
                     })
                     .unwrap_or_else(|| crate::approval::PLACEHOLDER_TITLE.to_owned());
                 let kind = tool_call
@@ -174,14 +187,16 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
                 if let Ok(mut p) = state.permissions.lock() {
                     p.insert(request_id.clone(), id);
                 }
-                state.emit(HarnessEvent::PermissionRequested {
-                    request_id,
-                    tool_call_id,
-                    title,
-                    kind,
-                    locations,
-                    options,
-                });
+                state
+                    .emit(HarnessEvent::PermissionRequested {
+                        request_id,
+                        tool_call_id,
+                        title,
+                        kind,
+                        locations,
+                        options,
+                    })
+                    .await;
             }
             Incoming::Request { id, method, .. } => {
                 // fs/* and terminal/* are not advertised; anything else is unknown.
@@ -206,17 +221,21 @@ async fn handle_incoming(state: Arc<State>, mut incoming: mpsc::UnboundedReceive
     }
     let status = {
         let mut child = state.child.lock().await;
-        tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .ok()
-            .and_then(Result::ok)
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(s)) => Some(s),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                let _ = child.start_kill();
+                None
+            }
+        }
     };
     let error = match status {
         Some(s) if s.success() => None,
         Some(s) => Some(format!("agent exited with {s}")),
         None => Some("agent stopped responding".to_owned()),
     };
-    state.emit(HarnessEvent::Exited { error });
+    state.emit(HarnessEvent::Exited { error }).await;
     if let Ok(mut tx) = state.events.lock() {
         tx.take();
     }
@@ -281,15 +300,24 @@ impl Harness for AcpHarness {
             let harness = self.id.clone();
             let session = ctx.session_id.to_string();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(%harness, %session, "agent stderr: {line}");
+                let mut reader = BufReader::new(stderr);
+                loop {
+                    match read_line_capped(&mut reader, MAX_STDERR_LINE_BYTES).await {
+                        Ok(Some(Some(bytes))) => {
+                            let line = String::from_utf8_lossy(&bytes);
+                            tracing::debug!(%harness, %session, "agent stderr: {line}");
+                        }
+                        Ok(Some(None)) => {
+                            tracing::debug!(%harness, %session, "agent stderr: <oversized line discarded>");
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
                 }
             });
         }
 
         let (conn, incoming) = RpcConnection::spawn(stdout, stdin);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(EVENTS_CAPACITY);
         let state = Arc::new(State {
             harness_id: self.id.clone(),
             conn: conn.clone(),
@@ -314,10 +342,10 @@ impl Harness for AcpHarness {
                 if let Ok(mut n) = state.native_id.lock() {
                     *n = Some(native_id.clone());
                 }
-                state.emit(HarnessEvent::NativeSessionId(native_id));
+                state.emit(HarnessEvent::NativeSessionId(native_id)).await;
                 Ok(StartedSession {
                     session: Box::new(AcpSession { state }),
-                    events: Box::pin(ReceiverStream::new(rx)),
+                    events: Box::pin(BoundedReceiverStream::new(rx)),
                 })
             }
             Err(e) => {
@@ -451,6 +479,9 @@ impl HarnessSession for AcpSession {
             for id in state.take_permissions() {
                 let _ = state.conn.respond(id, Ok(cancelled_outcome()));
             }
+            if let Ok(mut titles) = state.tool_titles.lock() {
+                titles.clear();
+            }
             let ev = match result {
                 Ok(v) => HarnessEvent::TurnEnded {
                     stop_reason: mapping::stop_reason_from_acp(&v),
@@ -461,7 +492,7 @@ impl HarnessSession for AcpSession {
                     error: Some(e.to_string()),
                 },
             };
-            state.emit(ev);
+            state.emit(ev).await;
         });
         if let Ok(mut t) = self.state.turn_task.lock() {
             *t = Some(task);

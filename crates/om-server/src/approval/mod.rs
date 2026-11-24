@@ -121,28 +121,30 @@ impl ApprovalPolicy {
             && let Some(key) = rule_key(req.kind, req.title)
             && let Some(r) = remembered.get(&key)
         {
+            // Never forward `AllowAlways` or `RejectAlways` to the agent: the server
+            // is the sole owner of remembered rules so `clear_approval_rules` and
+            // worktree/`.git` bounds stay enforceable.
             let picked = if r.allow {
-                pick(
-                    req.options,
-                    &[
-                        ApprovalOptionKind::AllowOnce,
-                        ApprovalOptionKind::AllowAlways,
-                    ],
-                )
+                pick(req.options, &[ApprovalOptionKind::AllowOnce])
             } else {
-                pick(
-                    req.options,
-                    &[
-                        ApprovalOptionKind::RejectOnce,
-                        ApprovalOptionKind::RejectAlways,
-                    ],
-                )
+                pick(req.options, &[ApprovalOptionKind::RejectOnce])
             };
-            // A remembered reject applies everywhere. A remembered allow for a file tool
-            // stays inside the sandboxed worktree; for anything else it was given by a
-            // member for this exact command or URL, so it applies as is.
-            let allow_in_scope = !r.allow
-                || !is_file_tool(req.kind)
+            // A remembered reject wins over everything else — if the agent omitted a
+            // one-shot reject option, ask the member instead of falling through into
+            // automatic allow rules.
+            if !r.allow {
+                return match picked {
+                    Some(option_id) => Verdict::Auto {
+                        option_id,
+                        rule: format!("remembered:{key}"),
+                    },
+                    None => Verdict::Ask,
+                };
+            }
+            // A remembered allow for a file tool stays inside the sandboxed worktree;
+            // for non-file tools (e.g. Execute/Fetch), the rule key binds to the exact
+            // command or URL explicitly approved by a member.
+            let allow_in_scope = !is_file_tool(req.kind)
                 || (req.sandbox == SandboxMode::Bwrap && all_within(req.cwd, req.locations));
             if allow_in_scope && let Some(option_id) = picked {
                 return Verdict::Auto {
@@ -230,7 +232,11 @@ pub fn all_within(cwd: &str, locations: &[String]) -> bool {
     let Some(root) = normalize(Path::new(cwd)) else {
         return false;
     };
-    if !root.is_absolute() || locations.is_empty() {
+    if !root.is_absolute()
+        || root.parent().is_none()
+        || root.components().any(|c| c.as_os_str() == ".git")
+        || locations.is_empty()
+    {
         return false;
     }
     locations.iter().all(|loc| {
@@ -246,6 +252,7 @@ pub fn all_within(cwd: &str, locations: &[String]) -> bool {
         match normalize(&joined) {
             Some(n) => {
                 n.starts_with(&root)
+                    && n != root
                     && !n
                         .strip_prefix(&root)
                         .map(|rel| rel.components().any(|c| c.as_os_str() == ".git"))

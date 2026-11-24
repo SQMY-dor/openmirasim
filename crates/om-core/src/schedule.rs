@@ -61,7 +61,7 @@ impl Weekday {
 
     /// The weekday of a day counted from the Unix epoch (1970-01-01 was a Thursday).
     fn of_epoch_day(day: i64) -> Weekday {
-        Self::ALL[(day + 3).rem_euclid(7) as usize]
+        Self::ALL[((day.rem_euclid(7) + 3) % 7) as usize]
     }
 }
 
@@ -129,6 +129,17 @@ impl ScheduleSpec {
             } if utc_offset_minutes.unsigned_abs() > 14 * 60 => Err(CoreError::InvalidInput(
                 "`utc_offset_minutes` must be within ±14 hours".into(),
             )),
+            ScheduleSpec::Daily { weekdays, .. }
+                if weekdays.len() > 7
+                    || weekdays
+                        .iter()
+                        .enumerate()
+                        .any(|(i, w)| weekdays[i + 1..].contains(w)) =>
+            {
+                Err(CoreError::InvalidInput(
+                    "`weekdays` must contain at most 7 unique days".into(),
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -162,12 +173,19 @@ impl ScheduleSpec {
                 utc_offset_minutes,
                 ref weekdays,
             } => {
-                let offset = utc_offset_minutes as i64 * MINUTE_MS;
-                let local_day = (after + offset).div_euclid(DAY_MS);
+                if minute_of_day >= 1440 || utc_offset_minutes.unsigned_abs() > 14 * 60 {
+                    return None;
+                }
+                let offset = i64::from(utc_offset_minutes).checked_mul(MINUTE_MS)?;
+                let local_day = after.checked_add(offset)?.div_euclid(DAY_MS);
+                let minute_ms = i64::from(minute_of_day).checked_mul(MINUTE_MS)?;
                 // Today's slot may still be ahead; otherwise one of the next 7 days is.
                 (0..=7).find_map(|d| {
-                    let day = local_day + d;
-                    let at = day * DAY_MS + minute_of_day as i64 * MINUTE_MS - offset;
+                    let day = local_day.checked_add(d)?;
+                    let at = day
+                        .checked_mul(DAY_MS)?
+                        .checked_add(minute_ms)?
+                        .checked_sub(offset)?;
                     let wanted =
                         weekdays.is_empty() || weekdays.contains(&Weekday::of_epoch_day(day));
                     (at > after && wanted).then_some(at)

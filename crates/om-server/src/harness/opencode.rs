@@ -3,33 +3,14 @@
 //! Launches `opencode acp` via [`crate::acp::AcpHarness`] with explicit BYOK environment
 //! allowlisting so server tokens are never leaked into agent child processes.
 
+use super::probe::{apply_safe_base_env, env_binary_or, probe_cli_version};
 use crate::acp::{AcpHarness, AcpHarnessOptions};
 use om_core::sandbox::CommandSpec;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
+use std::path::PathBuf;
 
 /// Environment variable overriding the `opencode` binary path.
 pub const ENV_OPENCODE_BIN: &str = "OM_OPENCODE_BIN";
-
-/// Non-secret host environment variables safe to preserve when `clear_env` is enabled
-/// under `DirectSandbox` (under `BwrapSandbox`, the sandbox itself manages env isolation).
-const SAFE_BASE_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TZ",
-    "TMPDIR",
-    "USER",
-    "TERM",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_CACHE_HOME",
-];
 
 /// BYOK / model-provider env vars forwarded only when the server is NOT using [`crate::proxy::KeyProxy`].
 const FORWARDED_PROVIDER_ENV: &[&str] = &[
@@ -79,42 +60,26 @@ impl OpenCodeConfig {
         cfg
     }
 
-    /// Builds configuration from `OM_OPENCODE_BIN` **without** forwarding raw host API keys.
+    /// Builds configuration from `OM_OPENCODE_BIN` **without** forwarding raw host API keys
+    /// or `OPENCODE_CONFIG` / `OPENCODE_CONFIG_CONTENT` (which may embed upstream credentials).
     ///
     /// Use this when [`crate::proxy::KeyProxy`] or strict [`crate::sandbox::BwrapSandbox`]
     /// key isolation is active so raw upstream secrets are never placed in `CommandSpec::env`.
     pub fn from_env_for_proxy() -> Self {
-        let binary = std::env::var(ENV_OPENCODE_BIN)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "opencode".into());
-
-        let env = ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"]
-            .iter()
-            .filter_map(|key| std::env::var(key).ok().map(|val| ((*key).to_string(), val)))
-            .collect();
-
         Self {
-            binary,
+            binary: env_binary_or(ENV_OPENCODE_BIN, "opencode"),
             extra_args: Vec::new(),
-            env,
+            env: Vec::new(),
             acp_options: AcpHarnessOptions::default(),
         }
     }
 
     /// Builds the [`CommandSpec`] executed inside the session sandbox.
     ///
-    /// Always sets `clear_env = true` and copies only [`SAFE_BASE_ENV`] plus explicit `self.env`
-    /// so `OM_TOKEN` and other server secrets never leak under `DirectSandbox`.
+    /// Always sets `clear_env = true` and copies only [`super::probe::SAFE_BASE_ENV`] plus
+    /// explicit `self.env` so `OM_TOKEN` and other server secrets never leak under `DirectSandbox`.
     pub fn command_spec(&self) -> CommandSpec {
-        let mut spec = CommandSpec::new(&self.binary).arg("acp");
-        spec.clear_env = true;
-        for key in SAFE_BASE_ENV {
-            if let Ok(val) = std::env::var(key) {
-                spec = spec.env(*key, val);
-            }
-        }
+        let mut spec = apply_safe_base_env(CommandSpec::new(&self.binary)).arg("acp");
         for arg in &self.extra_args {
             spec = spec.arg(arg);
         }
@@ -143,101 +108,12 @@ pub struct OpenCodeProbe {
 
 /// Checks whether the configured `opencode` binary exists and responds to `--version`.
 pub async fn probe_opencode(binary: &str) -> OpenCodeProbe {
-    let resolved = resolve_executable(binary);
-    let Some(path) = resolved else {
-        return OpenCodeProbe {
-            available: false,
-            binary: binary.to_string(),
-            binary_path: None,
-            version: None,
-            error: Some(format!("executable '{binary}' not found on PATH")),
-        };
-    };
-
-    let mut cmd = Command::new(&path);
-    cmd.arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    match tokio::time::timeout(Duration::from_secs(5), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let version = stdout
-                .lines()
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned);
-            OpenCodeProbe {
-                available: true,
-                binary: binary.to_string(),
-                binary_path: Some(path),
-                version,
-                error: None,
-            }
-        }
-        Ok(Ok(out)) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            OpenCodeProbe {
-                available: false,
-                binary: binary.to_string(),
-                binary_path: Some(path),
-                version: None,
-                error: Some(if stderr.is_empty() {
-                    format!("exited with status {}", out.status)
-                } else {
-                    stderr
-                }),
-            }
-        }
-        Ok(Err(e)) => OpenCodeProbe {
-            available: false,
-            binary: binary.to_string(),
-            binary_path: Some(path),
-            version: None,
-            error: Some(e.to_string()),
-        },
-        Err(_) => OpenCodeProbe {
-            available: false,
-            binary: binary.to_string(),
-            binary_path: Some(path),
-            version: None,
-            error: Some("timed out running --version".into()),
-        },
-    }
-}
-
-fn resolve_executable(bin: &str) -> Option<PathBuf> {
-    let p = Path::new(bin);
-    if p.components().count() > 1 {
-        return is_executable_file(p).then(|| p.to_path_buf());
-    }
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
+    let p = probe_cli_version(binary, &["--version"]).await;
+    OpenCodeProbe {
+        available: p.available,
+        binary: p.binary,
+        binary_path: p.binary_path,
+        version: p.version,
+        error: p.error,
     }
 }

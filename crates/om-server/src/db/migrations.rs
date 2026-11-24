@@ -211,4 +211,10 @@ pub(super) const MIGRATIONS: &[&str] = &[
     CREATE INDEX audit_logs_space ON audit_logs(space_id, id DESC);
     CREATE INDEX audit_logs_space_target ON audit_logs(space_id, target, id DESC);
     "#,
+    // v8: track the originating turn id on agent dispatches so per-turn fan-out limits
+    // are immune to wall-clock steps and separate from manual dispatches.
+    r#"
+    ALTER TABLE dispatches ADD COLUMN from_turn_id TEXT;
+    CREATE INDEX dispatches_from_turn ON dispatches(from_session, from_turn_id);
+    "#,
 ];

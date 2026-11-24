@@ -1,17 +1,19 @@
 //! Claude Code (`cc`) `stream-json` headless CLI adapter and probe (W1-4).
 //!
-//! Invokes `claude -p --output-format stream-json --verbose [--resume <session_id>]`
+//! Invokes `claude -p --output-format stream-json --verbose [--resume <session_id>] -- <prompt>`
 //! per turn inside the session sandbox, parsing NDJSON events into [`HarnessEvent`]s.
 
-use super::probe::{CliProbe, apply_safe_base_env, env_binary_or, probe_cli_version};
+use super::probe::{
+    CliProbe, apply_safe_base_env, env_binary_or, is_safe_cli_arg_value, probe_cli_version,
+};
 use super::stream_cli::{NdjsonTurnParser, StreamCliAdapter, start_stream_cli};
 use async_trait::async_trait;
-use om_core::CoreResult;
 use om_core::content::ContentBlock;
 use om_core::event::{ToolCallInfo, ToolCallStatus, ToolCallUpdate, ToolKind};
 use om_core::harness::{Harness, HarnessCapabilities, HarnessEvent, StartContext, StartedSession};
 use om_core::sandbox::CommandSpec;
 use om_core::session::StopReason;
+use om_core::{CoreError, CoreResult};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +35,7 @@ const FORWARDED_PROVIDER_ENV: &[&str] = &[
 pub struct ClaudeCodeConfig {
     /// Executable name or absolute path (default `"claude"`).
     pub binary: String,
-    /// Extra CLI arguments appended before the prompt.
+    /// Extra CLI arguments appended before `-- <prompt>`.
     pub extra_args: Vec<String>,
     /// Explicit environment variables injected into the agent process.
     pub env: Vec<(String, String)>,
@@ -128,25 +130,35 @@ impl StreamCliAdapter for ClaudeCodeAdapter {
         cwd: &Path,
         model: Option<&str>,
         native_session_id: Option<&str>,
-    ) -> CommandSpec {
+    ) -> CoreResult<CommandSpec> {
         let mut spec = apply_safe_base_env(CommandSpec::new(&self.cfg.binary))
             .args(["-p", "--output-format", "stream-json", "--verbose"])
             .cwd(cwd);
 
         if let Some(id) = native_session_id {
+            if !is_safe_cli_arg_value(id) {
+                return Err(CoreError::InvalidInput(
+                    "unsafe native_session_id for claude --resume".into(),
+                ));
+            }
             spec = spec.args(["--resume", id]);
         }
         if let Some(m) = model {
+            if !is_safe_cli_arg_value(m) {
+                return Err(CoreError::InvalidInput(
+                    "unsafe model identifier for claude --model".into(),
+                ));
+            }
             spec = spec.args(["--model", m]);
         }
         for arg in &self.cfg.extra_args {
             spec = spec.arg(arg);
         }
-        spec = spec.arg(prompt_text);
+        spec = spec.arg("--").arg(prompt_text);
         for (k, v) in &self.cfg.env {
             spec = spec.env(k, v);
         }
-        spec
+        Ok(spec)
     }
 
     fn new_parser(&self) -> Box<dyn NdjsonTurnParser> {
@@ -157,6 +169,8 @@ impl StreamCliAdapter for ClaudeCodeAdapter {
 #[derive(Default)]
 struct ClaudeNdjsonParser {
     emitted_text: bool,
+    streamed_text_in_msg: bool,
+    streamed_thinking_in_msg: bool,
     emitted_native_id: Option<String>,
     result_error: Option<String>,
 }
@@ -214,6 +228,7 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
 
         if let Some(sid) = value.get("session_id").and_then(Value::as_str)
             && !sid.is_empty()
+            && is_safe_cli_arg_value(sid)
             && self.emitted_native_id.as_deref() != Some(sid)
         {
             self.emitted_native_id = Some(sid.to_string());
@@ -226,10 +241,12 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
 
         match kind {
             "assistant" => {
+                let skip_text = std::mem::take(&mut self.streamed_text_in_msg);
+                let skip_thinking = std::mem::take(&mut self.streamed_thinking_in_msg);
                 if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) {
                     for block in blocks {
                         match block.get("type").and_then(Value::as_str) {
-                            Some("text") => {
+                            Some("text") if !skip_text => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str)
                                     && !text.is_empty()
                                 {
@@ -239,7 +256,7 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
                                     }));
                                 }
                             }
-                            Some("thinking") => {
+                            Some("thinking") if !skip_thinking => {
                                 if let Some(text) = block
                                     .get("thinking")
                                     .or_else(|| block.get("text"))
@@ -312,6 +329,7 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
                                 && !text.is_empty()
                             {
                                 self.emitted_text = true;
+                                self.streamed_text_in_msg = true;
                                 out.push(HarnessEvent::MessageChunk(ContentBlock::Text {
                                     text: text.to_string(),
                                 }));
@@ -321,6 +339,7 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
                             if let Some(text) = delta.get("thinking").and_then(Value::as_str)
                                 && !text.is_empty()
                             {
+                                self.streamed_thinking_in_msg = true;
                                 out.push(HarnessEvent::ThoughtChunk(ContentBlock::Text {
                                     text: text.to_string(),
                                 }));
@@ -347,7 +366,19 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
                         }));
                     }
                 } else if is_error {
-                    self.result_error = Some("claude returned an error result".into());
+                    let errors_joined = value
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .filter(|s| !s.is_empty());
+                    self.result_error = Some(
+                        errors_joined.unwrap_or_else(|| "claude returned an error result".into()),
+                    );
                 }
             }
             _ => {}

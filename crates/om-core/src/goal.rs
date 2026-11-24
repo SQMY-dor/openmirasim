@@ -107,11 +107,31 @@ impl Goal {
     }
 
     /// Whether `reply` (the agent's text for one turn) reports the goal met: the marker on
-    /// a line of its own, ignoring surrounding whitespace and backticks.
+    /// a line of its own outside fenced code blocks, ignoring surrounding whitespace and backticks.
     pub fn is_met_by(&self, reply: &str) -> bool {
-        reply
-            .lines()
-            .any(|l| l.trim().trim_matches('`').trim() == self.done_marker)
+        let mut fence: Option<char> = None;
+        for raw in reply.lines() {
+            let trimmed = raw.trim();
+            if let Some(ch) = fence {
+                if trimmed.starts_with(ch) && trimmed.chars().take_while(|&c| c == ch).count() >= 3
+                {
+                    fence = None;
+                }
+                continue;
+            }
+            if trimmed.starts_with("```") {
+                fence = Some('`');
+                continue;
+            }
+            if trimmed.starts_with("~~~") {
+                fence = Some('~');
+                continue;
+            }
+            if trimmed.trim_matches('`').trim() == self.done_marker {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -152,10 +172,16 @@ impl NewGoal {
                 "max_turns must be between 1 and {MAX_GOAL_TURNS}"
             )));
         }
-        if let Some(d) = self.deadline_at
-            && d <= now
-        {
-            return Err(CoreError::InvalidInput("deadline_at is in the past".into()));
+        if let Some(d) = self.deadline_at {
+            if d <= now {
+                return Err(CoreError::InvalidInput("deadline_at is in the past".into()));
+            }
+            let max_deadline = now.saturating_add(366_i64 * 86_400 * 1000);
+            if d > crate::schedule::MAX_TIMESTAMP_MS || d > max_deadline {
+                return Err(CoreError::InvalidInput(
+                    "deadline_at must be within 366 days".into(),
+                ));
+            }
         }
         Ok(turns)
     }

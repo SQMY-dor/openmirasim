@@ -176,12 +176,35 @@ impl Orchestrator {
     ) -> CoreResult<(Arc<dyn Sandbox>, Option<SessionGrant>)> {
         let sandbox = self.scoped_sandbox(id, config).await?;
         match &self.key_proxy {
-            Some(proxy) if config.sandbox == SandboxMode::Bwrap => {
+            Some(proxy) => {
                 let grant = proxy.grant(id)?;
                 Ok((Arc::new(ProxyEnvSandbox::new(sandbox, &grant)), Some(grant)))
             }
-            _ => Ok((sandbox, None)),
+            None => Ok((sandbox, None)),
         }
+    }
+
+    /// Whether `SandboxMode::Direct` is permitted by server configuration.
+    pub fn allow_direct_sandbox(&self) -> bool {
+        self.config.allow_direct_sandbox
+    }
+
+    /// Returns whether a session currently has a live or starting actor.
+    pub fn is_session_live(&self, id: &SessionId) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+
+    /// Builds the scoped sandbox (bwrap + worktree + gitdir overlays + per-session HOME,
+    /// or `DirectSandbox` when explicitly allowed) for an interactive PTY shell.
+    pub async fn pty_sandbox(
+        &self,
+        id: &SessionId,
+        config: &SessionConfig,
+    ) -> CoreResult<Arc<dyn Sandbox>> {
+        self.scoped_sandbox(id, config).await
     }
 
     /// Reserves the session's live slot, failing when an agent runs or is starting.
@@ -297,12 +320,16 @@ impl Orchestrator {
         let (tx, rx) = mpsc::channel(self.config.command_capacity);
         let id = spec.session_id.clone();
         let generation = reservation.generation;
-        if let Ok(mut map) = self.live.lock()
-            && let Some(entry) = map.get_mut(&id)
+        let mut map = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.get_mut(&id)
             && entry.generation == generation
         {
             entry.tx = Some(tx);
         }
+        drop(map);
         reservation.armed = false;
         // Weak: once every Orchestrator clone is dropped, the command senders go away and
         // actors shut their agents down instead of being kept alive by this callback.
@@ -312,11 +339,13 @@ impl Orchestrator {
             if let (Some(proxy), Some(grant)) = (&proxy, &grant) {
                 proxy.revoke_grant(&id, grant);
             }
-            if let Some(live) = live.upgrade()
-                && let Ok(mut map) = live.lock()
-                && map.get(&id).is_some_and(|e| e.generation == generation)
-            {
-                map.remove(&id);
+            if let Some(live) = live.upgrade() {
+                let mut map = live
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if map.get(&id).is_some_and(|e| e.generation == generation) {
+                    map.remove(&id);
+                }
             }
         };
         tokio::spawn(actor::run(
@@ -329,7 +358,11 @@ impl Orchestrator {
     }
 
     fn live_sender(&self, id: &SessionId) -> Option<mpsc::Sender<Command>> {
-        self.live.lock().ok()?.get(id).and_then(|e| e.tx.clone())
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .and_then(|e| e.tx.clone())
     }
 
     async fn send<T>(
@@ -386,7 +419,7 @@ impl Orchestrator {
         };
         let created = self
             .db
-            .create_session(space_id, config.clone(), created_by)
+            .create_session(space_id, config.clone(), created_by.clone())
             .await;
         let (summary, event) = match created {
             Ok(v) => v,
@@ -397,16 +430,57 @@ impl Orchestrator {
                 return Err(e);
             }
         };
-        if let (Some(p), Some(mgr)) = (prepared, &self.workspaces) {
-            mgr.attach(&summary.id, p).await?;
+        if let (Some(p), Some(mgr)) = (prepared, &self.workspaces)
+            && let Err(e) = mgr.attach(&summary.id, p).await
+        {
+            let _ = self
+                .db
+                .append_events(
+                    &summary.id,
+                    vec![
+                        EventPayload::Error {
+                            message: format!("failed to attach worktree: {e}"),
+                        },
+                        EventPayload::StatusChanged {
+                            from: SessionStatus::Starting,
+                            to: SessionStatus::Failed,
+                        },
+                    ],
+                )
+                .await;
+            return Err(e);
         }
         self.hub.publish(std::slice::from_ref(&event));
         let reservation = self.reserve(&summary.id)?;
-        let (sandbox, grant) = self.session_sandbox(&summary.id, &config).await?;
+        let (sandbox, grant) = match self.session_sandbox(&summary.id, &config).await {
+            Ok(v) => v,
+            Err(e) => {
+                let failed = self
+                    .db
+                    .append_events(
+                        &summary.id,
+                        vec![
+                            EventPayload::Error {
+                                message: format!("failed to initialize sandbox: {e}"),
+                            },
+                            EventPayload::StatusChanged {
+                                from: SessionStatus::Starting,
+                                to: SessionStatus::Failed,
+                            },
+                        ],
+                    )
+                    .await;
+                if let Ok(evs) = failed {
+                    self.hub.publish(&evs);
+                }
+                return Err(e);
+            }
+        };
         self.spawn_actor(
             ActorSpec {
                 session_id: summary.id.clone(),
                 config,
+                created_by,
                 status: SessionStatus::Starting,
                 resume_native_session_id: None,
                 harness,
@@ -441,10 +515,21 @@ impl Orchestrator {
             .native_session_id
             .clone()
             .filter(|_| harness.capabilities().resume);
+        let created_by = self
+            .db
+            .list_events(&summary.id, 0, 1)
+            .await
+            .ok()
+            .and_then(|page| page.events.into_iter().next())
+            .and_then(|ev| match ev.payload {
+                EventPayload::SessionCreated { created_by, .. } => created_by,
+                _ => None,
+            });
         self.spawn_actor(
             ActorSpec {
                 session_id: summary.id.clone(),
                 config: summary.config.clone(),
+                created_by,
                 status: summary.status,
                 resume_native_session_id: resume,
                 harness,
@@ -597,15 +682,27 @@ impl Orchestrator {
 
     /// Closes a session (terminal). Works for live and failed sessions.
     pub async fn close_session(&self, id: &SessionId) -> CoreResult<()> {
-        if self.live_sender(id).is_some() {
-            return self.send(id, |reply| Command::Close { reply }).await;
+        if let Some(tx) = self.live_sender(id) {
+            let (reply, rx) = oneshot::channel();
+            if tx.send(Command::Close { reply }).await.is_ok()
+                && let Ok(res) = rx.await
+            {
+                return res;
+            }
+            // Actor exited concurrently (e.g., agent crashed to Failed): fall through to
+            // close the non-live session cleanly.
         }
         // Hold the slot so the session cannot be resumed while it is being closed.
         let _reservation = match self.reserve(id) {
             Ok(r) => r,
             Err(_) => {
-                if self.live_sender(id).is_some() {
-                    return self.send(id, |reply| Command::Close { reply }).await;
+                if let Some(tx) = self.live_sender(id) {
+                    let (reply, rx) = oneshot::channel();
+                    if tx.send(Command::Close { reply }).await.is_ok()
+                        && let Ok(res) = rx.await
+                    {
+                        return res;
+                    }
                 }
                 let s = self.db.get_session(id).await?;
                 return Err(CoreError::InvalidTransition {
@@ -639,5 +736,29 @@ impl Orchestrator {
     /// Whether the session currently has a running actor.
     pub fn is_live(&self, id: &SessionId) -> bool {
         self.live_sender(id).is_some()
+    }
+
+    /// Gracefully stops all live actors during server shutdown without permanently
+    /// closing sessions (so interrupted sessions remain resumable after restart).
+    pub async fn shutdown_all(&self) {
+        let senders: Vec<mpsc::Sender<Command>> = {
+            let map = self
+                .live
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.values().filter_map(|e| e.tx.clone()).collect()
+        };
+        let mut waiters = Vec::with_capacity(senders.len());
+        for tx in senders {
+            let (reply, rx) = oneshot::channel();
+            if tx.send(Command::Shutdown { reply }).await.is_ok() {
+                waiters.push(rx);
+            }
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            futures::future::join_all(waiters),
+        )
+        .await;
     }
 }

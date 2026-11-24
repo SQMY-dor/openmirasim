@@ -6,8 +6,8 @@
 //! worktrees/<uuid>/          one checkout per session, on branch `om/<uuid>`
 //! gitdirs/<uuid>/            the session's own repository (its `.git`)
 //! scratch/<uuid>/            empty working dir for sandboxed sessions without a workspace
-//! homes/<space>/<member>/    private HOME per member, bound into the sandbox
-//! homes/_anonymous/<uuid>/   per-session HOME when no member is known
+//! homes/<space>/<member>/<uuid>/   per-session private HOME, isolated by space, member & session
+//! homes/_anonymous/<uuid>/         per-session HOME when no member is known
 //! ```
 //!
 //! Isolation (review P0-1): a session never sees the registered repository's `.git`.
@@ -289,7 +289,9 @@ impl WorkspaceManager {
 
     // ------------------------------------------------------------ worktrees
 
-    /// The member's private HOME, per space; an unknown member gets one per session.
+    /// Each session gets its own private HOME, scoped under `(space, member, session_key)`
+    /// (or `_anonymous/<session_key>`), so different spaces, members, and concurrent
+    /// sessions/workspaces never share mutable dotfiles or agent state.
     async fn member_home(
         &self,
         space: Option<&SpaceId>,
@@ -307,11 +309,43 @@ impl WorkspaceManager {
                     .join("homes")
                     .join(safe_component(space.as_str())?)
                     .join(safe_component(m.as_str())?)
+                    .join(key)
             }
             None => self.config.root.join("homes").join("_anonymous").join(key),
         };
-        std::fs::create_dir_all(&home).map_err(|e| io("creating member home", e))?;
+        std::fs::create_dir_all(&home).map_err(|e| io("creating session home", e))?;
         Ok(home)
+    }
+
+    fn remove_session_home(&self, home: Option<&str>) {
+        let Some(h) = home else {
+            return;
+        };
+        let path = Path::new(h);
+        let homes_root = self.config.root.join("homes");
+        let Ok(rel) = path.strip_prefix(&homes_root) else {
+            return;
+        };
+        let comps: Vec<_> = rel.components().collect();
+        let is_per_session = matches!(
+            comps.as_slice(),
+            [Component::Normal(first), Component::Normal(_)] if *first == "_anonymous"
+        ) || matches!(
+            comps.as_slice(),
+            [
+                Component::Normal(_),
+                Component::Normal(_),
+                Component::Normal(_)
+            ]
+        );
+        if !is_per_session {
+            return;
+        }
+        if let Err(e) = std::fs::remove_dir_all(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), error = %e, "failed to remove session home");
+        }
     }
 
     /// Creates a checkout on a new branch `om/<uuid>` from `base` (default: the
@@ -500,6 +534,7 @@ impl WorkspaceManager {
         {
             tracing::warn!(error = %e, "failed to discard session git dir");
         }
+        self.remove_session_home(prepared.stored.home_path.as_deref());
     }
 
     pub async fn worktree(&self, session_id: &SessionId) -> CoreResult<StoredWorktree> {
@@ -530,22 +565,22 @@ impl WorkspaceManager {
                         .into(),
                 ));
             }
+            // Bind both `<gd>` and `<gd>/objects` read-write as mountpoints so Linux
+            // `vfs_rename` refuses (`EBUSY`) renaming `<gd>/objects` to displace the
+            // read-only `<gd>/objects/info` overlay.
+            nofollow::verify_no_symlinks_under(&gd, Path::new("objects"))?;
             paths.writable.push(gd.clone());
-            for p in [
+            paths.writable.push(gd.join("objects"));
+            for rel in [
                 "config",
                 "hooks",
                 "info",
                 "commondir",
+                "objects/info",
                 "objects/info/alternates",
             ] {
-                let p = gd.join(p);
-                if !p.exists() {
-                    return Err(CoreError::Workspace(format!(
-                        "session git dir is missing {}",
-                        p.display()
-                    )));
-                }
-                paths.readonly.push(p);
+                nofollow::verify_no_symlinks_under(&gd, Path::new(rel))?;
+                paths.readonly.push(gd.join(rel));
             }
             if let Some(ws_id) = &wt.info.workspace_id {
                 let ws = self.db.get_workspace(ws_id).await?;
@@ -581,11 +616,13 @@ impl WorkspaceManager {
             return Ok(());
         }
         let ws = self.db.get_workspace(ws_id).await?;
+        self.verify_git_alternates(Path::new(git_dir), Some(&ws.git_common_dir))?;
         let lock = self.lock_for(&ws.git_common_dir);
         let _guard = lock.lock().await;
         let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
         Git::at(&self.config.git_bin, &ws.summary.repo_path)
             .with_config("protocol.file.allow", "always")
+            .with_config("core.alternateRefsCommand", "")
             .with_config("transfer.fsckObjects", "true")
             .with_config("fetch.fsckObjects", "true")
             .run(
@@ -605,17 +642,66 @@ impl WorkspaceManager {
         Ok(())
     }
 
+    fn verify_git_alternates(
+        &self,
+        git_dir: &Path,
+        expected_common_dir: Option<&str>,
+    ) -> CoreResult<()> {
+        if !self.owned("gitdirs", git_dir) {
+            return Ok(());
+        }
+        let bytes = nofollow::read(
+            git_dir,
+            Path::new("objects/info/alternates"),
+            4096,
+            "objects/info/alternates",
+        )?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| CoreError::Workspace("corrupt session git alternates file".into()))?;
+        let expected_objects = expected_common_dir.map(|c| Path::new(c).join("objects"));
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            if let Some(ref exp) = expected_objects {
+                let p = Path::new(line);
+                let canon_line = p.canonicalize().ok();
+                let canon_exp = exp.canonicalize().ok();
+                if p != exp && (canon_line.is_none() || canon_line != canon_exp) {
+                    return Err(CoreError::Workspace(
+                        "session git alternates points outside its registered repository".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn checkout_git(&self, wt: &StoredWorktree) -> CoreResult<Git> {
         let git_dir = wt.git_dir.as_ref().ok_or_else(|| CoreError::Unsupported {
             harness: "workspace".into(),
             capability: "git operations on a scratch directory",
         })?;
-        Ok(Git::worktree(&self.config.git_bin, git_dir, &wt.info.path))
+        Ok(Git::worktree(&self.config.git_bin, git_dir, &wt.info.path)
+            .with_config("core.alternateRefsCommand", ""))
     }
 
     /// Changes relative to the base commit: committed, staged, unstaged and untracked.
     pub async fn diff(&self, session_id: &SessionId) -> CoreResult<WorktreeDiff> {
         let wt = self.worktree(session_id).await?;
+        if let Some(git_dir) = &wt.git_dir {
+            let expected_common = match &wt.info.workspace_id {
+                Some(ws_id) => self
+                    .db
+                    .get_workspace(ws_id)
+                    .await
+                    .ok()
+                    .map(|w| w.git_common_dir),
+                None => None,
+            };
+            self.verify_git_alternates(Path::new(git_dir), expected_common.as_deref())?;
+        }
         let git = self.checkout_git(&wt)?;
         let base = wt.info.base_commit.clone().unwrap_or_default();
         let diff_opts = ["--no-ext-diff", "--no-textconv", "--no-color", "-M"];
@@ -623,8 +709,12 @@ impl WorkspaceManager {
         let mut args = vec!["diff", "--name-status", "-z"];
         args.extend(diff_opts);
         args.extend([base.as_str(), "--"]);
-        // Names are bounded by the entry cap (generously sized per entry).
-        let name_cap = self.config.max_entries.saturating_mul(4096).max(1 << 20);
+        // Cap name list memory strictly (16 MiB ceiling).
+        let name_cap = self
+            .config
+            .max_entries
+            .saturating_mul(1024)
+            .clamp(1 << 20, 16 << 20);
         let (names, _) = git
             .run_capped("diff --name-status", &args, name_cap, &[])
             .await?;
@@ -670,53 +760,62 @@ impl WorkspaceManager {
                 &[],
             )
             .await?;
-        let untracked = split_z(&untracked);
+        let untracked: Vec<String> = split_z(&untracked)
+            .into_iter()
+            .take(self.config.max_entries)
+            .collect();
         let root = PathBuf::from(&wt.info.path);
-        for path in untracked.into_iter().take(self.config.max_entries) {
-            // Only regular files: a FIFO or device would block or never end.
-            let regular = std::fs::symlink_metadata(root.join(&path))
-                .map(|m| m.file_type().is_file())
-                .unwrap_or(false);
-            if truncated || patch.len() >= max || !regular {
-                if patch.len() >= max {
-                    truncated = true;
+        // Never invoke unsandboxed `git diff --no-index` on untracked paths (which follows
+        // intermediate directory symlinks and can block on FIFOs). Read each file strictly
+        // via component-wise `O_NOFOLLOW` + `O_NONBLOCK` and render the unified diff in-process.
+        let initial_len = patch.len();
+        let (extra_patch, extra_truncated, extra_files) = tokio::task::spawn_blocking(move || {
+            let mut out_patch = Vec::new();
+            let mut out_truncated = truncated;
+            let mut out_files = Vec::with_capacity(untracked.len());
+            let mut used = initial_len;
+            for path in untracked {
+                if out_truncated || used >= max {
+                    if used >= max {
+                        out_truncated = true;
+                    }
+                    out_files.push(FileChange {
+                        path,
+                        kind: FileChangeKind::Untracked,
+                        old_path: None,
+                    });
+                    continue;
                 }
-                files.push(FileChange {
+                let room = max - used;
+                if let Some((bytes, file_trunc)) =
+                    nofollow::read_truncated(&root, Path::new(&path), room as u64)
+                {
+                    let formatted = format_untracked_patch(&path, &bytes, file_trunc);
+                    if formatted.len() > room {
+                        out_patch.extend_from_slice(&formatted[..room]);
+                        used = max;
+                        out_truncated = true;
+                    } else {
+                        out_patch.extend_from_slice(&formatted);
+                        used += formatted.len();
+                        out_truncated |= file_trunc;
+                    }
+                }
+                out_files.push(FileChange {
                     path,
                     kind: FileChangeKind::Untracked,
                     old_path: None,
                 });
-                continue;
             }
-            // `--no-index` exits 1 when files differ; that is the normal case here.
-            let room = max - patch.len();
-            if let Ok((out, more)) = git
-                .run_capped(
-                    "diff --no-index",
-                    [
-                        "diff",
-                        "--no-index",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--no-color",
-                        "--",
-                        "/dev/null",
-                        &path,
-                    ],
-                    room,
-                    &[1],
-                )
-                .await
-            {
-                patch.extend_from_slice(&out);
-                truncated |= more;
-            }
-            files.push(FileChange {
-                path,
-                kind: FileChangeKind::Untracked,
-                old_path: None,
-            });
-        }
+            (out_patch, out_truncated, out_files)
+        })
+        .await
+        .map_err(|e| CoreError::Workspace(format!("diff untracked task failed: {e}")))?;
+
+        patch.extend_from_slice(&extra_patch);
+        truncated = extra_truncated;
+        files.extend(extra_files);
+
         Ok(WorktreeDiff {
             base_commit: base,
             files,
@@ -729,36 +828,64 @@ impl WorkspaceManager {
     pub async fn list_files(&self, session_id: &SessionId) -> CoreResult<Vec<WorktreeEntry>> {
         let wt = self.worktree(session_id).await?;
         let root = PathBuf::from(&wt.info.path);
+        let name_cap = self
+            .config
+            .max_entries
+            .saturating_mul(1024)
+            .clamp(1 << 20, 16 << 20);
+        let max_entries = self.config.max_entries;
         let paths = match self.checkout_git(&wt) {
-            Ok(git) => split_z(
-                &git.run(
-                    "ls-files",
-                    [
+            Ok(git) => {
+                if let Some(git_dir) = &wt.git_dir {
+                    let expected_common = match &wt.info.workspace_id {
+                        Some(ws_id) => self
+                            .db
+                            .get_workspace(ws_id)
+                            .await
+                            .ok()
+                            .map(|w| w.git_common_dir),
+                        None => None,
+                    };
+                    self.verify_git_alternates(Path::new(git_dir), expected_common.as_deref())?;
+                }
+                let (raw, _) = git
+                    .run_capped(
                         "ls-files",
-                        "-z",
-                        "--cached",
-                        "--others",
-                        "--exclude-standard",
-                        "--deduplicate",
-                    ],
-                )
-                .await?,
-            ),
-            Err(_) => walk_dir(&root, self.config.max_entries),
+                        [
+                            "ls-files",
+                            "-z",
+                            "--cached",
+                            "--others",
+                            "--exclude-standard",
+                            "--deduplicate",
+                        ],
+                        name_cap,
+                        &[],
+                    )
+                    .await?;
+                split_z(&raw)
+            }
+            Err(_) => {
+                let walk_root = root.clone();
+                tokio::task::spawn_blocking(move || walk_dir(&walk_root, max_entries))
+                    .await
+                    .map_err(|e| CoreError::Workspace(format!("walk task failed: {e}")))?
+            }
         };
-        let mut entries: Vec<WorktreeEntry> = paths
-            .into_iter()
-            .filter_map(|p| {
-                // `symlink_metadata`: never follow links out of the checkout.
-                let meta = std::fs::symlink_metadata(root.join(&p)).ok()?;
-                (!meta.is_dir()).then_some(WorktreeEntry {
-                    path: p,
-                    size: meta.len(),
+        let entries = tokio::task::spawn_blocking(move || {
+            let mut entries: Vec<WorktreeEntry> = paths
+                .into_iter()
+                .filter_map(|p| {
+                    let size = nofollow::stat_non_dir(&root, Path::new(&p))?;
+                    Some(WorktreeEntry { path: p, size })
                 })
-            })
-            .take(self.config.max_entries)
-            .collect();
-        entries.sort_by(|a, b| a.path.cmp(&b.path));
+                .take(max_entries)
+                .collect();
+            entries.sort_by(|a, b| a.path.cmp(&b.path));
+            entries
+        })
+        .await
+        .map_err(|e| CoreError::Workspace(format!("stat task failed: {e}")))?;
         Ok(entries)
     }
 
@@ -810,46 +937,93 @@ impl WorkspaceManager {
 
     async fn delete_checkout(&self, wt: &StoredWorktree) -> CoreResult<()> {
         let path = PathBuf::from(&wt.info.path);
-        let Some(git_dir) = &wt.git_dir else {
-            if path.starts_with(self.config.root.join("scratch")) {
-                self.remove_owned("scratch", &path)?;
+        let res = match &wt.git_dir {
+            None => {
+                if path.starts_with(self.config.root.join("scratch")) {
+                    self.remove_owned("scratch", &path)?;
+                }
+                Ok(())
             }
-            return Ok(());
+            Some(git_dir) => {
+                let gd = PathBuf::from(git_dir);
+                if self.owned("gitdirs", &gd) {
+                    // Our own directories: deleting them needs no git and works even when the
+                    // workspace row is gone or the agent wrecked its repository.
+                    self.remove_owned("worktrees", &path)?;
+                    self.remove_owned("gitdirs", &gd)
+                } else {
+                    // Legacy linked worktree inside the repository's git dir.
+                    if let Some(ws_id) = &wt.info.workspace_id
+                        && let Ok(ws) = self.db.get_workspace(ws_id).await
+                    {
+                        let lock = self.lock_for(&ws.git_common_dir);
+                        let _guard = lock.lock().await;
+                        let git = Git::at(&self.config.git_bin, &ws.summary.repo_path);
+                        let _ = git
+                            .run(
+                                "worktree remove",
+                                ["worktree", "remove", "--force", &wt.info.path],
+                            )
+                            .await;
+                        let _ = git.run("worktree prune", ["worktree", "prune"]).await;
+                    }
+                    self.remove_owned("worktrees", &path)
+                }
+            }
         };
-        let gd = PathBuf::from(git_dir);
-        if self.owned("gitdirs", &gd) {
-            // Our own directories: deleting them needs no git and works even when the
-            // workspace row is gone or the agent wrecked its repository.
-            self.remove_owned("worktrees", &path)?;
-            return self.remove_owned("gitdirs", &gd);
-        }
-        // Legacy linked worktree inside the repository's git dir.
-        if let Some(ws_id) = &wt.info.workspace_id
-            && let Ok(ws) = self.db.get_workspace(ws_id).await
-        {
-            let lock = self.lock_for(&ws.git_common_dir);
-            let _guard = lock.lock().await;
-            let git = Git::at(&self.config.git_bin, &ws.summary.repo_path);
-            let _ = git
-                .run(
-                    "worktree remove",
-                    ["worktree", "remove", "--force", &wt.info.path],
-                )
-                .await;
-            let _ = git.run("worktree prune", ["worktree", "prune"]).await;
-        }
-        self.remove_owned("worktrees", &path)
+        self.remove_session_home(wt.home_path.as_deref());
+        res
     }
+}
+
+fn format_untracked_patch(path: &str, bytes: &[u8], file_truncated: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(
+        format!("diff --git a/{path} b/{path}\nnew file mode 100644\n").as_bytes(),
+    );
+    if bytes.is_empty() {
+        return out;
+    }
+    if bytes.contains(&0) {
+        out.extend_from_slice(format!("Binary files /dev/null and b/{path} differ\n").as_bytes());
+        return out;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let count = lines.len();
+    let range = if count == 1 {
+        "1".to_string()
+    } else {
+        format!("1,{count}")
+    };
+    out.extend_from_slice(format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +{range} @@\n").as_bytes());
+    for line in &lines {
+        out.push(b'+');
+        out.extend_from_slice(line.as_bytes());
+        if !line.ends_with('\n') {
+            out.push(b'\n');
+            if !file_truncated {
+                out.extend_from_slice(b"\\ No newline at end of file\n");
+            }
+        }
+    }
+    out
 }
 
 fn walk_dir(root: &Path, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![PathBuf::new()];
+    let max_visits = limit.saturating_mul(4).max(4096);
+    let mut visits = 0usize;
     while let Some(rel) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(root.join(&rel)) else {
             continue;
         };
         for e in rd.flatten() {
+            visits += 1;
+            if visits > max_visits {
+                return out;
+            }
             let r = rel.join(e.file_name());
             match e.file_type() {
                 Ok(t) if t.is_dir() => stack.push(r),

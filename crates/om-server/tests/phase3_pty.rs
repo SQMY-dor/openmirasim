@@ -346,6 +346,164 @@ async fn pty_binary_ws_ring_catchup_viewer_readonly_cast_recording_and_cleanup()
     let after_kill = pty.status(&sess.id);
     assert!(!after_kill.active);
     assert!(after_kill.has_recording);
+
+    // 8. Viewer cannot DELETE /pty (403 Forbidden)
+    let forbidden_kill = app
+        .oneshot(bearer_req(
+            &viewer_tok.secret,
+            "DELETE",
+            &format!("/api/v1/sessions/{}/pty", sess.id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden_kill.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
+    use om_server::sandbox::BwrapSandbox;
+    use om_server::workspace::{WorkspaceConfig, WorkspaceManager};
+
+    let bwrap = match BwrapSandbox::default().probe().await {
+        Ok(b) => b,
+        Err(e) => {
+            if std::env::var("OM_REQUIRE_BWRAP").as_deref() == Ok("1") {
+                panic!("OM_REQUIRE_BWRAP=1 set but bwrap probe failed: {e}");
+            }
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("work");
+    let data_dir = dir.path().join("data");
+    let secret_dir = dir.path().join("host-secrets");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&secret_dir).unwrap();
+    let secret_file = secret_dir.join("secret.txt");
+    std::fs::write(&secret_file, "TOP_SECRET_HOST_DATA").unwrap();
+
+    let db = Db::open(dir.path().join("pty-bwrap.db")).unwrap();
+    let space_id = db.ensure_space("default").await.unwrap();
+    let auth = Auth::new(db.clone());
+    let (_owner, owner_tok) = auth
+        .bootstrap_owner(&space_id, "Owner", "cli")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let workspaces = WorkspaceManager::new(db.clone(), WorkspaceConfig::new(&data_dir)).unwrap();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(MockHarness::instant()));
+    let orchestrator = Orchestrator::new(
+        db,
+        registry,
+        OrchestratorConfig {
+            allow_direct_sandbox: false,
+            ..Default::default()
+        },
+    )
+    .with_workspaces(workspaces)
+    .with_bwrap_sandbox(Arc::new(bwrap));
+    let pty = PtyManager::new(PtyConfig::default());
+
+    let app = build_router_with_extensions(
+        AppState {
+            orchestrator,
+            config: ApiConfig {
+                auth_token: "bwrap-pty-token".into(),
+                default_space_id: space_id,
+                static_dir: None,
+                allow_cors_origin: None,
+            },
+        },
+        ApiExtensions {
+            pty: Some(pty.clone()),
+            ..Default::default()
+        },
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app_clone).await;
+    });
+
+    let res = app
+        .clone()
+        .oneshot(bearer_req(
+            &owner_tok.secret,
+            "POST",
+            "/api/v1/sessions",
+            Some(
+                serde_json::to_string(&CreateSessionRequest {
+                    config: SessionConfig {
+                        harness_id: "mock".into(),
+                        cwd: work_dir.to_string_lossy().into_owned(),
+                        workspace_id: None,
+                        model: None,
+                        sandbox: SandboxMode::Bwrap,
+                        title: Some("Bwrap PTY Test".into()),
+                    },
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let sess: SessionSummary = serde_json::from_slice(&bytes).unwrap();
+
+    let (mut pty_ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/pty/{}?token={}",
+        sess.id, owner_tok.secret
+    ))
+    .await
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), pty_ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // Split marker literals so terminal local-echo does not trigger the assertion early.
+    let cmd = format!(
+        "cat {} 2>&1 || echo BLOCKED\"_\"SECRET; echo DONE\"_\"BWRAP_CHECK\n",
+        secret_file.display()
+    );
+    pty_ws
+        .send(WsMessage::Binary(Bytes::from(cmd.into_bytes())))
+        .await
+        .unwrap();
+
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_millis(400), pty_ws.next()).await
+            && let WsMessage::Binary(chunk) = frame
+        {
+            collected.push_str(&String::from_utf8_lossy(&chunk));
+            if collected.contains("DONE_BWRAP_CHECK") {
+                break;
+            }
+        }
+    }
+    assert!(
+        collected.contains("BLOCKED_SECRET"),
+        "expected sandboxed PTY to be blocked from reading host secret, got: {collected:?}"
+    );
+    assert!(
+        !collected.contains("TOP_SECRET_HOST_DATA"),
+        "bwrap PTY must NOT read host files outside work_dir!"
+    );
+    pty.kill(&sess.id);
 }
 
 use std::sync::Arc;

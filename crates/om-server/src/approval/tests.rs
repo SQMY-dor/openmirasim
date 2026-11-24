@@ -310,3 +310,78 @@ fn remembers_only_always_options() {
         Some("r1")
     );
 }
+
+#[test]
+fn remembered_reject_never_falls_through_to_auto_allow_when_reject_option_missing() {
+    let p = ApprovalPolicy::default();
+    let only_allow_once = vec![ApprovalOption {
+        option_id: "a1".into(),
+        name: "Allow once".into(),
+        kind: ApprovalOptionKind::AllowOnce,
+    }];
+    let mut mem = HashMap::new();
+    mem.insert("edit".to_string(), Remembered { allow: false });
+    mem.insert("read".to_string(), Remembered { allow: false });
+    mem.insert("think".to_string(), Remembered { allow: false });
+    let inside = vec!["src/main.rs".to_string()];
+    for kind in [ToolKind::Edit, ToolKind::Read, ToolKind::Think] {
+        assert_eq!(
+            p.evaluate(
+                &req(
+                    SandboxMode::Bwrap,
+                    Some(kind),
+                    &inside,
+                    "t",
+                    &only_allow_once
+                ),
+                &mem
+            ),
+            Verdict::Ask,
+            "remembered reject for {kind:?} must never fall through to auto-allow"
+        );
+    }
+}
+
+#[test]
+fn remembered_allow_requires_allow_once_and_bwrap_for_files_and_rejects_root_cwd() {
+    let p = ApprovalPolicy::default();
+    let only_allow_always = vec![ApprovalOption {
+        option_id: "aa".into(),
+        name: "Allow always".into(),
+        kind: ApprovalOptionKind::AllowAlways,
+    }];
+    let mut mem = HashMap::new();
+    mem.insert("execute:cargo test".to_string(), Remembered { allow: true });
+    mem.insert("edit".to_string(), Remembered { allow: true });
+    assert_eq!(
+        p.evaluate(
+            &req(
+                SandboxMode::Bwrap,
+                Some(ToolKind::Execute),
+                &[],
+                "cargo test",
+                &only_allow_always
+            ),
+            &mem
+        ),
+        Verdict::Ask,
+        "never forward AllowAlways back to the agent"
+    );
+    assert_eq!(
+        p.evaluate(
+            &req(
+                SandboxMode::Direct,
+                Some(ToolKind::Edit),
+                &["src/main.rs".into()],
+                "edit",
+                &opts()
+            ),
+            &mem
+        ),
+        Verdict::Ask,
+        "remembered file-tool allow must not apply in Direct mode"
+    );
+    assert!(!all_within("/", &["/etc/passwd".into()]));
+    assert!(!all_within("/data/worktrees/s1", &[".".into()]));
+    assert!(!all_within("/data/.git/work", &["a.rs".into()]));
+}

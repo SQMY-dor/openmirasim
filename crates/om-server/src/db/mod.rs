@@ -33,7 +33,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 type WriteJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
@@ -50,6 +50,8 @@ struct Inner {
     writer: Mutex<Option<mpsc::Sender<WriteJob>>>,
     writer_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     readers: Mutex<Vec<Connection>>,
+    read_permits: Arc<Semaphore>,
+    max_pooled_readers: usize,
     path: PathBuf,
 }
 
@@ -122,8 +124,8 @@ fn configure(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
-    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let known = migrations::MIGRATIONS.len() as i64;
+    let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if current > known {
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
@@ -132,12 +134,27 @@ fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
             )),
         ));
     }
+    if current == known {
+        return Ok(());
+    }
+    // Re-check user_version inside BEGIN IMMEDIATE so concurrent startups cannot race
+    // applying the same migration twice.
     for (idx, sql) in migrations::MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
-        if version <= current {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let latest: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if latest > known {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                Some(format!(
+                    "database schema v{latest} is newer than this server (v{known}); upgrade the server"
+                )),
+            ));
+        }
+        if version <= latest {
+            tx.commit()?;
             continue;
         }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
@@ -162,6 +179,9 @@ impl Db {
         }
 
         let mut writer = Connection::open(&path).map_err(storage)?;
+        // Set busy_timeout & foreign_keys before changing journal_mode so brief startup
+        // lock contention retries instead of failing with SQLITE_BUSY.
+        configure(&writer).map_err(storage)?;
         let mode: String = writer
             .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
             .map_err(storage)?;
@@ -173,16 +193,14 @@ impl Db {
         writer
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(storage)?;
-        configure(&writer).map_err(storage)?;
         migrate(&mut writer).map_err(storage)?;
 
-        let mut pool = Vec::with_capacity(readers.max(1));
-        for _ in 0..readers.max(1) {
+        let reader_count = readers.max(1);
+        let mut pool = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
             let conn = Connection::open_with_flags(
                 &path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                    | OpenFlags::SQLITE_OPEN_URI,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(storage)?;
             configure(&conn).map_err(storage)?;
@@ -195,15 +213,30 @@ impl Db {
             .spawn(move || {
                 let mut conn = writer;
                 while let Ok(job) = rx.recv() {
-                    job(&mut conn);
+                    if let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut conn)))
+                    {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("non-string panic");
+                        tracing::error!(panic = %msg, "db writer job panicked; keeping writer thread alive");
+                        let _ = conn.execute_batch("ROLLBACK");
+                    }
                 }
             })?;
+
+        let max_pooled_readers = reader_count.saturating_mul(2);
+        let read_permits = Arc::new(Semaphore::new(reader_count.saturating_mul(4).max(16)));
 
         Ok(Self {
             inner: Arc::new(Inner {
                 writer: Mutex::new(Some(tx)),
                 writer_thread: Mutex::new(Some(handle)),
                 readers: Mutex::new(pool),
+                read_permits,
+                max_pooled_readers,
                 path,
             }),
         })
@@ -243,13 +276,20 @@ impl Db {
         T: Send + 'static,
         F: FnOnce(&Connection) -> CoreResult<T> + Send + 'static,
     {
+        let _permit = self
+            .inner
+            .read_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CoreError::Storage("database reader semaphore closed".into()))?;
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
             let conn = inner.readers.lock().map_err(storage)?.pop();
             let conn = match conn {
                 Some(c) => c,
                 None => {
-                    // Pool exhausted: open a temporary extra reader.
+                    // Pool exhausted: open a bounded temporary extra reader.
                     let c = Connection::open_with_flags(
                         &inner.path,
                         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -261,7 +301,7 @@ impl Db {
             };
             let result = f(&conn);
             if let Ok(mut pool) = inner.readers.lock()
-                && pool.len() < DEFAULT_READERS.max(1) * 2
+                && pool.len() < inner.max_pooled_readers
             {
                 pool.push(conn);
             }
@@ -692,6 +732,10 @@ impl Db {
                 append_in_tx(&tx, &session_id, payloads)?;
                 recovered.push(session_id);
             }
+            // Drop stale in-flight dispatch reservations left by a crash so they never
+            // permanently inflate `to_session`'s dispatch depth after restart.
+            tx.execute("DELETE FROM dispatches WHERE submit = 'null'", [])
+                .map_err(storage)?;
             tx.commit().map_err(storage)?;
             Ok(recovered)
         })

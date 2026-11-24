@@ -129,21 +129,41 @@ fn closed() -> RpcError {
     RpcError::new(RpcError::CONNECTION_CLOSED, "agent connection closed")
 }
 
-/// Marks the connection closed and fails every waiting request.
-fn close_pending(pending: &Pending) {
-    let drained = pending
+/// Marks the connection closed and drains every waiting request.
+fn take_pending(pending: &Pending) -> HashMap<u64, Reply> {
+    pending
         .lock()
         .map(|mut p| p.take())
         .unwrap_or_else(|e| e.into_inner().take())
-        .unwrap_or_default();
-    for (_, tx) in drained {
+        .unwrap_or_default()
+}
+
+/// Marks the connection closed and fails every waiting request immediately.
+fn close_pending(pending: &Pending) {
+    for (_, tx) in take_pending(pending) {
         let _ = tx.send(Err(closed()));
+    }
+}
+
+/// Marks the connection closed and fails every waiting request in causal order behind
+/// notifications already queued on `in_tx`.
+async fn close_pending_ordered(pending: &Pending, in_tx: &mpsc::Sender<Incoming>) {
+    for (_, tx) in take_pending(pending) {
+        let settlement = Settlement {
+            tx,
+            result: Err(closed()),
+        };
+        if let Err(mpsc::error::SendError(Incoming::Settle(s))) =
+            in_tx.send(Incoming::Settle(settlement)).await
+        {
+            s.complete();
+        }
     }
 }
 
 /// Reads one `\n`-terminated line of at most `max` bytes. `Ok(None)` at EOF;
 /// `Ok(Some(None))` for a line that was too long (skipped).
-async fn read_line_capped<R: AsyncRead + Unpin>(
+pub(crate) async fn read_line_capped<R: AsyncRead + Unpin>(
     r: &mut BufReader<R>,
     max: usize,
 ) -> std::io::Result<Option<Option<Vec<u8>>>> {
@@ -187,18 +207,22 @@ pub struct RpcConnection {
     next_id: Arc<AtomicU64>,
 }
 
+/// Bounded capacity of the incoming RPC channel (propagates backpressure to stdout pipe).
+const INCOMING_CAPACITY: usize = 512;
+
 impl RpcConnection {
     /// Starts reader and writer tasks over the given streams.
-    pub fn spawn<R, W>(reader: R, writer: W) -> (Self, mpsc::UnboundedReceiver<Incoming>)
+    pub fn spawn<R, W>(reader: R, writer: W) -> (Self, mpsc::Receiver<Incoming>)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::channel(INCOMING_CAPACITY);
         let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
 
         let writer_pending = pending.clone();
+        let writer_in_tx = in_tx.clone();
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(line) = out_rx.recv().await {
@@ -206,8 +230,9 @@ impl RpcConnection {
                     || writer.write_all(b"\n").await.is_err()
                     || writer.flush().await.is_err()
                 {
-                    // The peer can no longer receive requests: nothing will answer.
+                    // The peer can no longer receive requests: fail waiters and close stream.
                     close_pending(&writer_pending);
+                    let _ = writer_in_tx.send(Incoming::Closed).await;
                     break;
                 }
             }
@@ -225,18 +250,24 @@ impl RpcConnection {
                             continue;
                         }
                         match serde_json::from_str::<Value>(line) {
-                            Ok(msg) => dispatch(msg, &reader_pending, &in_tx),
+                            Ok(msg) => dispatch(msg, &reader_pending, &in_tx).await,
                             Err(_) => tracing::debug!("ignoring non-JSON line from agent"),
                         }
                     }
                     Ok(Some(None)) => {
-                        tracing::warn!(max = MAX_LINE_BYTES, "skipping oversized line from agent")
+                        // Treat an oversized JSON-RPC frame as fatal rather than hanging a
+                        // pending `session/prompt` request forever waiting for a skipped response.
+                        tracing::warn!(
+                            max = MAX_LINE_BYTES,
+                            "agent emitted oversized RPC line; closing connection"
+                        );
+                        break;
                     }
                     Ok(None) | Err(_) => break,
                 }
             }
-            close_pending(&reader_pending);
-            let _ = in_tx.send(Incoming::Closed);
+            close_pending_ordered(&reader_pending, &in_tx).await;
+            let _ = in_tx.send(Incoming::Closed).await;
         });
 
         (
@@ -286,11 +317,21 @@ impl RpcConnection {
                 "agent connection closed",
             ));
         }
+        // Clean up `pending` even if the caller drops/cancels this future mid-flight.
+        struct PendingGuard<'a> {
+            conn: &'a RpcConnection,
+            id: u64,
+        }
+        impl Drop for PendingGuard<'_> {
+            fn drop(&mut self) {
+                self.conn.forget(self.id);
+            }
+        }
+        let _guard = PendingGuard { conn: self, id };
         let result = match timeout {
             Some(t) => match tokio::time::timeout(t, rx).await {
                 Ok(r) => r,
                 Err(_) => {
-                    self.forget(id);
                     return Err(RpcError::new(
                         RpcError::TIMEOUT,
                         format!("`{method}` timed out after {t:?}"),
@@ -330,16 +371,16 @@ impl RpcConnection {
     }
 }
 
-fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::UnboundedSender<Incoming>) {
+async fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::Sender<Incoming>) {
     let method = msg.get("method").and_then(Value::as_str).map(str::to_owned);
     let id = msg.get("id").filter(|v| !v.is_null()).cloned();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     match (method, id) {
         (Some(method), Some(id)) => {
-            let _ = in_tx.send(Incoming::Request { id, method, params });
+            let _ = in_tx.send(Incoming::Request { id, method, params }).await;
         }
         (Some(method), None) => {
-            let _ = in_tx.send(Incoming::Notification { method, params });
+            let _ = in_tx.send(Incoming::Notification { method, params }).await;
         }
         (None, Some(id)) => {
             let Some(num) = id.as_u64() else {
@@ -356,8 +397,9 @@ fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::UnboundedSender<Incomin
                     _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 // Through the channel, behind every earlier notification.
-                if let Err(mpsc::error::SendError(Incoming::Settle(s))) =
-                    in_tx.send(Incoming::Settle(Settlement { tx, result }))
+                if let Err(mpsc::error::SendError(Incoming::Settle(s))) = in_tx
+                    .send(Incoming::Settle(Settlement { tx, result }))
+                    .await
                 {
                     s.complete();
                 }
@@ -423,7 +465,7 @@ mod tests {
     }
 
     /// Completes settlements and forwards everything else, like a harness does.
-    fn pump(mut raw: mpsc::UnboundedReceiver<Incoming>) -> mpsc::UnboundedReceiver<Incoming> {
+    fn pump(mut raw: mpsc::Receiver<Incoming>) -> mpsc::UnboundedReceiver<Incoming> {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(m) = raw.recv().await {
@@ -516,7 +558,8 @@ mod tests {
     async fn pending_requests_fail_on_close_and_timeout() {
         let (client_io, agent_io) = tokio::io::duplex(4096);
         let (client_r, client_w) = tokio::io::split(client_io);
-        let (conn, _incoming) = RpcConnection::spawn(client_r, client_w);
+        let (conn, raw) = RpcConnection::spawn(client_r, client_w);
+        let _incoming = pump(raw);
         let err = conn
             .request("slow", Value::Null, Some(Duration::from_millis(50)))
             .await

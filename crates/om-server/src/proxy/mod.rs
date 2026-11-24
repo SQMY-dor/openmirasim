@@ -131,7 +131,7 @@ impl Default for ProxyConfig {
         Self {
             providers: Vec::new(),
             token_ttl: Duration::from_secs(24 * 3600),
-            max_body_bytes: 32 * 1024 * 1024,
+            max_body_bytes: 8 * 1024 * 1024,
             connect_timeout: Duration::from_secs(10),
             use_system_proxy: true,
             read_timeout: Duration::from_secs(300),
@@ -213,6 +213,8 @@ struct Inner {
     providers: HashMap<String, Provider>,
     store: Mutex<GrantStore>,
     in_flight: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent buffered request bodies in RAM (16 * 8 MiB <= 128 MiB worst-case).
+    body_slots: Arc<tokio::sync::Semaphore>,
     client: reqwest::Client,
 }
 
@@ -348,9 +350,13 @@ impl KeyProxy {
         let listener = TcpListener::bind(bind).await?;
         let addr = listener.local_addr()?;
         let in_flight = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
+        let body_slots = Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent.clamp(1, 16),
+        ));
         let proxy = Self {
             inner: Arc::new(Inner {
                 in_flight,
+                body_slots,
                 addr,
                 config,
                 providers,
@@ -694,8 +700,16 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
         return error(StatusCode::BAD_REQUEST, "path not allowed");
     };
 
-    // Concurrency: one slot per session, then a global slot.
+    // Concurrency: check per-session cap BEFORE acquiring a global slot so a noisy session
+    // cannot steal global capacity while being rate-limited with 429.
     let per_session = grant.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    if per_session > proxy.inner.config.max_concurrent_per_session {
+        grant.in_flight.fetch_sub(1, Ordering::Relaxed);
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent requests for this session",
+        );
+    }
     let Ok(permit) = proxy.inner.in_flight.clone().try_acquire_owned() else {
         grant.in_flight.fetch_sub(1, Ordering::Relaxed);
         return error(StatusCode::SERVICE_UNAVAILABLE, "proxy is busy");
@@ -704,12 +718,6 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
         grant: grant.clone(),
         _permit: permit,
     };
-    if per_session > proxy.inner.config.max_concurrent_per_session {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many concurrent requests for this session",
-        );
-    }
 
     let hop = connection_named(req.headers());
     let mut headers = HeaderMap::new();
@@ -721,6 +729,10 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
     match provider.config.kind {
         ProviderKind::Anthropic => headers.insert("x-api-key", provider.key_header.clone()),
         ProviderKind::OpenAi => headers.insert(header::AUTHORIZATION, provider.key_header.clone()),
+    };
+
+    let Ok(_body_permit) = proxy.inner.body_slots.clone().try_acquire_owned() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "proxy body buffer busy");
     };
 
     let body = match tokio::time::timeout(
@@ -742,6 +754,7 @@ async fn handle(proxy: KeyProxy, provider_id: String, rest: String, req: Request
         .body(body)
         .send()
         .await;
+    drop(_body_permit);
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
@@ -794,9 +807,11 @@ impl Sandbox for ProxyEnvSandbox {
 
     fn wrap(&self, spec: &SandboxSpec, mut cmd: CommandSpec) -> CoreResult<CommandSpec> {
         let mut spec = spec.clone();
-        spec.network = true;
-        // The proxy's values win over anything the harness set for the same variable.
-        cmd.env.extend(self.env.clone());
+        if !self.env.is_empty() {
+            spec.network = true;
+            // The proxy's values win over anything the harness set for the same variable.
+            cmd.env.extend(self.env.clone());
+        }
         self.inner.wrap(&spec, cmd)
     }
 }

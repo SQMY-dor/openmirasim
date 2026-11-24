@@ -26,17 +26,20 @@ pub fn safe_cast_path(dir: &Path, session_id: &str) -> CoreResult<PathBuf> {
     Ok(dir.join(format!("{trimmed}.cast")))
 }
 
-/// Append-only asciicast v2 file writer with hard byte-size capping.
+/// Append-only asciicast v2 file writer with hard byte-size capping and UTF-8 boundary carry.
 pub struct CastWriter {
     writer: BufWriter<File>,
     started: Instant,
     bytes_written: u64,
     max_bytes: u64,
     truncated: bool,
+    /// Up to 3 trailing bytes of an incomplete UTF-8 sequence carried to the next chunk.
+    utf8_carry: Vec<u8>,
 }
 
 impl CastWriter {
-    /// Creates (or replaces) an asciicast v2 file and writes the mandatory JSON header line.
+    /// Creates (or replaces) an asciicast v2 file without following symlinks and writes the
+    /// mandatory JSON header line.
     pub fn create(
         path: &Path,
         cols: u16,
@@ -45,13 +48,29 @@ impl CastWriter {
         max_bytes: u64,
     ) -> CoreResult<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                if !parent.exists() {
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)?;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = opts.open(path)?;
         let mut writer = BufWriter::new(file);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -79,16 +98,60 @@ impl CastWriter {
             bytes_written: line.len() as u64,
             max_bytes: max_bytes.max(4096),
             truncated: false,
+            utf8_carry: Vec::with_capacity(4),
         })
     }
 
-    /// Appends one asciicast v2 output event `[elapsed_secs, "o", data]`.
-    pub fn record_output(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() || self.truncated {
+    fn decode_utf8_streaming(&mut self, bytes: &[u8]) -> String {
+        let owned;
+        let mut slice = if self.utf8_carry.is_empty() {
+            bytes
+        } else {
+            let mut combined = Vec::with_capacity(self.utf8_carry.len() + bytes.len());
+            combined.extend_from_slice(&self.utf8_carry);
+            combined.extend_from_slice(bytes);
+            self.utf8_carry.clear();
+            owned = combined;
+            owned.as_slice()
+        };
+
+        let mut out = String::with_capacity(slice.len());
+        loop {
+            match std::str::from_utf8(slice) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    break;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    if valid_up_to > 0 {
+                        // SAFETY: `valid_up_to` is guaranteed by `std::str::from_utf8` to be valid UTF-8.
+                        if let Ok(valid) = std::str::from_utf8(&slice[..valid_up_to]) {
+                            out.push_str(valid);
+                        }
+                    }
+                    match e.error_len() {
+                        Some(invalid_len) => {
+                            out.push('\u{FFFD}');
+                            slice = &slice[valid_up_to + invalid_len..];
+                        }
+                        None => {
+                            // Incomplete multi-byte sequence at chunk end: carry up to 3 bytes.
+                            self.utf8_carry.extend_from_slice(&slice[valid_up_to..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn write_event_text(&mut self, text: &str) {
+        if text.is_empty() || self.truncated {
             return;
         }
         let elapsed = self.started.elapsed().as_secs_f64();
-        let text = String::from_utf8_lossy(bytes);
         let Ok(mut line) = serde_json::to_string(&json!([elapsed, "o", text])) else {
             return;
         };
@@ -106,6 +169,15 @@ impl CastWriter {
         }
     }
 
+    /// Appends one asciicast v2 output event `[elapsed_secs, "o", data]`.
+    pub fn record_output(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.truncated {
+            return;
+        }
+        let text = self.decode_utf8_streaming(bytes);
+        self.write_event_text(&text);
+    }
+
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
@@ -117,6 +189,11 @@ impl CastWriter {
 
 impl Drop for CastWriter {
     fn drop(&mut self) {
+        if !self.utf8_carry.is_empty() && !self.truncated {
+            let leftover = std::mem::take(&mut self.utf8_carry);
+            let text = String::from_utf8_lossy(&leftover).into_owned();
+            self.write_event_text(&text);
+        }
         let _ = self.writer.flush();
     }
 }
@@ -146,6 +223,28 @@ mod tests {
         let ev1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(ev1[1], "o");
         assert_eq!(ev1[2], "hello world\r\n");
+    }
+
+    #[test]
+    fn cast_writer_preserves_multibyte_utf8_split_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = safe_cast_path(dir.path(), "sess-utf8").unwrap();
+        let mut writer = CastWriter::create(&path, 80, 24, "/bin/sh", 4096).unwrap();
+        let bytes = "你好世界".as_bytes();
+        // Split right in the middle of the second 3-byte Chinese character.
+        writer.record_output(&bytes[..4]);
+        writer.record_output(&bytes[4..]);
+        drop(writer);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let combined: String = content
+            .lines()
+            .skip(1)
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get(2).and_then(|s| s.as_str()).map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(combined, "你好世界");
+        assert!(!combined.contains('\u{FFFD}'));
     }
 
     #[test]

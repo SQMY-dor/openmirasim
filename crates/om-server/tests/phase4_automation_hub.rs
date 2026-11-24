@@ -26,7 +26,8 @@ use om_core::session::{SessionConfig, SessionSummary};
 use om_core::workspace::WorkspaceSummary;
 use om_server::api::hub::{
     CreateMcpServerRequest, CreateSkillRequest, EffectiveHubResponse, HubScopeLevel,
-    McpProbeResult, McpServerRecord, McpTransport, SkillLifecycle, SkillRecord, UpdateSkillRequest,
+    McpProbeResult, McpServerRecord, McpTransport, SkillLifecycle, SkillRecord,
+    UpdateMcpServerRequest, UpdateSkillRequest,
 };
 use om_server::api::{ApiConfig, ApiExtensions, AppState, build_router_with_extensions};
 use om_server::auth::Auth;
@@ -410,7 +411,7 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
     let disps: ListDispatchesResponse = json_body(list_disp_res).await;
     assert_eq!(disps.dispatches.len(), 1);
 
-    // 5. Two-tier Space / Workspace MCP Hub & Skills Lifecycle
+    // 5. Two-tier Space / Workspace MCP Hub (member-isolated + Admin global control) & Skills Lifecycle
     let space_mcp_req = CreateMcpServerRequest {
         scope: HubScopeLevel::Space,
         workspace_id: None,
@@ -422,6 +423,7 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
         env_keys: vec!["GITHUB_TOKEN".into()],
         description: "Space default GitHub MCP".into(),
         enabled: true,
+        global_available: Some(true),
     };
 
     // Member cannot create Space-wide MCP server (Admin+ required)
@@ -437,7 +439,7 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
         .unwrap();
     assert_eq!(member_space_res.status(), StatusCode::FORBIDDEN);
 
-    // Owner creates Space-wide default
+    // Owner creates globally-available Space default
     let owner_space_res = app
         .clone()
         .oneshot(bearer_req(
@@ -449,8 +451,10 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
         .await
         .unwrap();
     assert_eq!(owner_space_res.status(), StatusCode::CREATED);
+    let space_mcp: McpServerRecord = json_body(owner_space_res).await;
+    assert!(space_mcp.global_available);
 
-    // Member CAN create Workspace-scoped override
+    // Member CAN create their own private Workspace-scoped override
     let ws_mcp_res = app
         .clone()
         .oneshot(bearer_req(
@@ -469,6 +473,7 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
                     env_keys: vec!["REPO_GH_TOKEN".into()],
                     description: "Workspace stdio override".into(),
                     enabled: true,
+                    global_available: None,
                 })
                 .unwrap(),
             ),
@@ -477,12 +482,14 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
         .unwrap();
     assert_eq!(ws_mcp_res.status(), StatusCode::CREATED);
     let ws_mcp: McpServerRecord = json_body(ws_mcp_res).await;
+    assert_eq!(ws_mcp.owner_member_id.as_ref(), Some(&member.id));
+    assert!(!ws_mcp.global_available);
 
-    // Probe the stdio MCP server
+    // Member probes their own stdio MCP server -> reachable (without disclosing host path)
     let probe_res = app
         .clone()
         .oneshot(bearer_req(
-            &viewer_tok.secret,
+            &member_tok.secret,
             "POST",
             &format!("/api/v1/mcp/servers/{}/probe", ws_mcp.id),
             None,
@@ -492,6 +499,19 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
     assert_eq!(probe_res.status(), StatusCode::OK);
     let probe: McpProbeResult = json_body(probe_res).await;
     assert!(probe.reachable);
+
+    // Other members (e.g. Viewer) CANNOT see or probe Member's private Workspace MCP
+    let viewer_probe_private = app
+        .clone()
+        .oneshot(bearer_req(
+            &viewer_tok.secret,
+            "POST",
+            &format!("/api/v1/mcp/servers/{}/probe", ws_mcp.id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(viewer_probe_private.status(), StatusCode::NOT_FOUND);
 
     // Skill lifecycle: Draft -> Active -> Archived (re-enabling archived fails cleanly)
     let skill_res = app
@@ -540,8 +560,28 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
     let active_skill: SkillRecord = json_body(activate_res).await;
     assert_eq!(active_skill.lifecycle, SkillLifecycle::Active);
 
-    // Effective resolution merges Space Skill + Workspace MCP override
-    let eff_res = app
+    // Effective resolution for Member merges global Space Skill + Member's private Workspace MCP override
+    let eff_member_res = app
+        .clone()
+        .oneshot(bearer_req(
+            &member_tok.secret,
+            "GET",
+            &format!("/api/v1/hub/effective?workspace_id={}", workspace.id),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(eff_member_res.status(), StatusCode::OK);
+    let eff_member: EffectiveHubResponse = json_body(eff_member_res).await;
+    assert_eq!(eff_member.mcp_servers.len(), 1);
+    assert_eq!(eff_member.mcp_servers[0].record.id, ws_mcp.id);
+    assert!(eff_member.mcp_servers[0].overridden_space_default);
+    assert_eq!(eff_member.skills.len(), 1);
+    assert!(eff_member.mcp_client_config["mcpServers"]["github"].is_object());
+    assert!(hub_path.is_file());
+
+    // Viewer sees ONLY the Admin-approved global Space MCP (not Member's private Workspace MCP)
+    let eff_viewer_res = app
         .clone()
         .oneshot(bearer_req(
             &viewer_tok.secret,
@@ -551,14 +591,46 @@ async fn phase4_schedules_goals_dispatches_and_two_tier_mcp_skills_hub() {
         ))
         .await
         .unwrap();
-    assert_eq!(eff_res.status(), StatusCode::OK);
-    let eff: EffectiveHubResponse = json_body(eff_res).await;
-    assert_eq!(eff.mcp_servers.len(), 1);
-    assert_eq!(eff.mcp_servers[0].record.id, ws_mcp.id);
-    assert!(eff.mcp_servers[0].overridden_space_default);
-    assert_eq!(eff.skills.len(), 1);
-    assert!(eff.mcp_client_config["mcpServers"]["github"].is_object());
-    assert!(hub_path.is_file());
+    assert_eq!(eff_viewer_res.status(), StatusCode::OK);
+    let eff_viewer: EffectiveHubResponse = json_body(eff_viewer_res).await;
+    assert_eq!(eff_viewer.mcp_servers.len(), 1);
+    assert_eq!(eff_viewer.mcp_servers[0].record.id, space_mcp.id);
+    assert!(!eff_viewer.mcp_servers[0].overridden_space_default);
+
+    // Admin revokes global availability of Space `github` -> Viewer no longer gets it in effective hub
+    let unpublish_res = app
+        .clone()
+        .oneshot(bearer_req(
+            &owner_tok.secret,
+            "PATCH",
+            &format!("/api/v1/mcp/servers/{}", space_mcp.id),
+            Some(
+                serde_json::to_string(&UpdateMcpServerRequest {
+                    global_available: Some(false),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unpublish_res.status(), StatusCode::OK);
+    let eff_viewer_after: EffectiveHubResponse = json_body(
+        app.clone()
+            .oneshot(bearer_req(
+                &viewer_tok.secret,
+                "GET",
+                &format!("/api/v1/hub/effective?workspace_id={}", workspace.id),
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        eff_viewer_after.mcp_servers.is_empty(),
+        "unpublished Space MCP must not appear for non-admin members"
+    );
 
     // Audit log recorded Hub actions
     let audit_res = app

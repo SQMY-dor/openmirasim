@@ -165,14 +165,15 @@ impl Auth {
         if !p.role.can_assign(role) {
             return Err(denied(p, format!("add a {role:?}")));
         }
-        // Checked again inside the write, against the actor's current role.
-        let auth = Authorize::new(p.member_id.clone(), move |actor, _| {
-            if actor.role.can_assign(role) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!("add a {role:?}")))
-            }
-        });
+        // Checked again inside the write, against the actor's current role & token.
+        let auth =
+            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), move |actor, _| {
+                if actor.role.can_assign(role) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!("add a {role:?}")))
+                }
+            });
         self.db
             .create_member_checked(
                 &p.space_id,
@@ -198,18 +199,23 @@ impl Auth {
         if !self_owner && !(p.role.can_manage(target.role) && p.role.can_assign(role)) {
             return Err(denied(p, format!("change a {:?} to {role:?}", target.role)));
         }
-        let auth = Authorize::new(p.member_id.clone(), move |actor, target| {
-            let target = target.expect("role change has a target");
-            let self_owner = target.id == actor.id && actor.role == Role::Owner;
-            if self_owner || (actor.role.can_manage(target.role) && actor.role.can_assign(role)) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!(
-                    "change a {:?} to {role:?}",
-                    target.role
-                )))
-            }
-        });
+        let auth = Authorize::with_token(
+            p.member_id.clone(),
+            p.token_id.clone(),
+            move |actor, target| {
+                let target = target.expect("role change has a target");
+                let self_owner = target.id == actor.id && actor.role == Role::Owner;
+                if self_owner || (actor.role.can_manage(target.role) && actor.role.can_assign(role))
+                {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!(
+                        "change a {:?} to {role:?}",
+                        target.role
+                    )))
+                }
+            },
+        );
         self.db
             .set_member_role_checked(member_id, role, Some(p.member_id.clone()), Some(auth))
             .await
@@ -227,15 +233,19 @@ impl Auth {
         if !self_owner && !p.role.can_manage(target.role) {
             return Err(denied(p, format!("disable a {:?}", target.role)));
         }
-        let auth = Authorize::new(p.member_id.clone(), move |actor, target| {
-            let target = target.expect("disable has a target");
-            let self_owner = target.id == actor.id && actor.role == Role::Owner;
-            if self_owner || actor.role.can_manage(target.role) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!("disable a {:?}", target.role)))
-            }
-        });
+        let auth = Authorize::with_token(
+            p.member_id.clone(),
+            p.token_id.clone(),
+            move |actor, target| {
+                let target = target.expect("disable has a target");
+                let self_owner = target.id == actor.id && actor.role == Role::Owner;
+                if self_owner || actor.role.can_manage(target.role) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!("disable a {:?}", target.role)))
+                }
+            },
+        );
         self.db
             .disable_member_checked(member_id, Some(p.member_id.clone()), Some(auth))
             .await
@@ -253,7 +263,7 @@ impl Auth {
         let target = self.member_in_space(p, member_id).await?;
         self.ensure_manages(p, &target, "issue a token for")?;
         let now = now_ms();
-        let mut expires_at = match ttl {
+        let expires_at = match ttl {
             Some(ttl) if ttl < MIN_TOKEN_TTL => {
                 return Err(CoreError::InvalidInput(format!(
                     "token ttl must be at least {MIN_TOKEN_TTL:?}"
@@ -262,23 +272,21 @@ impl Auth {
             Some(ttl) => Some(now.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64)),
             None => None,
         };
-        // A token can never mint one that outlives it.
-        if let Ok(own) = self.db.get_token(&p.token_id).await
-            && let Some(own_exp) = own.expires_at
-        {
-            expires_at = Some(expires_at.map_or(own_exp, |e| e.min(own_exp)));
-        }
-        let auth = Authorize::new(p.member_id.clone(), |actor, target| {
-            let target = target.expect("token has an owner");
-            if target.id == actor.id || actor.role.can_manage(target.role) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!(
-                    "issue a token for a {:?}",
-                    target.role
-                )))
-            }
-        });
+        // Caller token usability & expiry ceiling are enforced atomically inside the
+        // `create_token_checked` write transaction so a transient read error or concurrent
+        // revocation can never mint an unrevoked or permanent token.
+        let auth =
+            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), |actor, target| {
+                let target = target.expect("token has an owner");
+                if target.id == actor.id || actor.role.can_manage(target.role) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!(
+                        "issue a token for a {:?}",
+                        target.role
+                    )))
+                }
+            });
         let secret = generate_secret()?;
         let token = self
             .db
@@ -312,25 +320,66 @@ impl Auth {
         token_id: &TokenId,
     ) -> CoreResult<DeviceTokenRecord> {
         let token = self.db.get_token(token_id).await?;
-        let owner = self
-            .member_in_space(p, &token.member_id)
-            .await
-            .map_err(|_| CoreError::NotFound(format!("token {token_id}")))?;
-        self.ensure_manages(p, &owner, "revoke a token of")?;
-        let auth = Authorize::new(p.member_id.clone(), |actor, owner| {
-            let owner = owner.expect("token has an owner");
-            if owner.id == actor.id || actor.role.can_manage(owner.role) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!(
-                    "revoke a token of a {:?}",
-                    owner.role
-                )))
+        let owner = match self.member_in_space(p, &token.member_id).await {
+            Ok(m) => m,
+            Err(CoreError::NotFound(_)) => {
+                return Err(CoreError::NotFound(format!("token {token_id}")));
             }
-        });
+            Err(e) => return Err(e),
+        };
+        self.ensure_manages(p, &owner, "revoke a token of")?;
+        let auth =
+            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), |actor, owner| {
+                let owner = owner.expect("token has an owner");
+                if owner.id == actor.id || actor.role.can_manage(owner.role) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!(
+                        "revoke a token of a {:?}",
+                        owner.role
+                    )))
+                }
+            });
         self.db
             .revoke_token_checked(token_id, Some(p.member_id.clone()), Some(auth))
             .await
+    }
+
+    /// Re-verifies a cached [`Principal`] (e.g. on long-lived WebSocket connections) against
+    /// current member status, role, and device-token usability.
+    pub async fn verify_principal(&self, p: &Principal) -> CoreResult<Principal> {
+        let member = match self.db.get_member(&p.member_id).await {
+            Ok(m) if m.is_active() && m.space_id == p.space_id => m,
+            Ok(_) | Err(CoreError::NotFound(_)) => {
+                return Err(CoreError::Unauthenticated(
+                    "member is disabled or no longer active".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if p.token_id.as_str() != "static-bootstrap" {
+            let tok = match self.db.get_token(&p.token_id).await {
+                Ok(t) => t,
+                Err(CoreError::NotFound(_)) => {
+                    return Err(CoreError::Unauthenticated(
+                        "token is expired or revoked".into(),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            if tok.member_id != member.id || !tok.is_usable(now_ms()) {
+                return Err(CoreError::Unauthenticated(
+                    "token is expired or revoked".into(),
+                ));
+            }
+        }
+        Ok(Principal {
+            member_id: member.id,
+            space_id: member.space_id,
+            display_name: member.display_name,
+            role: member.role,
+            token_id: p.token_id.clone(),
+        })
     }
 
     /// Newest-first audit entries (admins and owners only).

@@ -44,11 +44,17 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRun> {
 fn name_taken(e: rusqlite::Error, name: &str) -> CoreError {
     match e {
         rusqlite::Error::SqliteFailure(f, _)
-            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
         {
             CoreError::InvalidInput(format!(
                 "a schedule named `{name}` already exists in this space"
             ))
+        }
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+        {
+            CoreError::NotFound("referenced space or member".into())
         }
         other => storage(other),
     }
@@ -166,33 +172,53 @@ impl Db {
         .await
     }
 
-    /// Pauses or resumes a schedule, touching only those columns so a concurrent
-    /// edit of its definition is not overwritten (review P2-7).
+    /// Pauses or resumes a schedule atomically inside `BEGIN IMMEDIATE`, computing
+    /// `next_run_at` from the row's current `spec` so a concurrent `update_schedule`
+    /// edit cannot be paired with a stale fire slot.
     pub async fn set_schedule_enabled(
         &self,
         id: &ScheduleId,
         enabled: bool,
-        next_run_at: Option<i64>,
         updated_at: i64,
     ) -> CoreResult<Schedule> {
         let id = id.clone();
         self.write(move |conn| {
-            let n = conn
-                .execute(
-                    "UPDATE schedules SET enabled = ?2, next_run_at = ?3, updated_at = ?4
-                     WHERE id = ?1",
-                    params![id.as_str(), enabled, next_run_at, updated_at],
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            let current: Schedule = tx
+                .query_row(
+                    &format!("{SCHEDULE_COLUMNS} WHERE id = ?1"),
+                    [id.as_str()],
+                    row_to_schedule,
+                )
+                .optional()
+                .map_err(storage)?
+                .ok_or_else(|| CoreError::NotFound(format!("schedule {id}")))?;
+            if current.enabled == enabled {
+                tx.commit().map_err(storage)?;
+                return Ok(current);
+            }
+            let next_run_at = if enabled {
+                current.spec.next_after(updated_at)
+            } else {
+                None
+            };
+            tx.execute(
+                "UPDATE schedules SET enabled = ?2, next_run_at = ?3, updated_at = ?4
+                 WHERE id = ?1",
+                params![id.as_str(), enabled, next_run_at, updated_at],
+            )
+            .map_err(storage)?;
+            let updated = tx
+                .query_row(
+                    &format!("{SCHEDULE_COLUMNS} WHERE id = ?1"),
+                    [id.as_str()],
+                    row_to_schedule,
                 )
                 .map_err(storage)?;
-            if n == 0 {
-                return Err(CoreError::NotFound(format!("schedule {id}")));
-            }
-            conn.query_row(
-                &format!("{SCHEDULE_COLUMNS} WHERE id = ?1"),
-                [id.as_str()],
-                row_to_schedule,
-            )
-            .map_err(storage)
+            tx.commit().map_err(storage)?;
+            Ok(updated)
         })
         .await
     }
@@ -269,7 +295,10 @@ impl Db {
     /// Records a fire. A run for a schedule deleted meanwhile is dropped silently.
     pub async fn record_schedule_run(&self, run: ScheduleRun) -> CoreResult<()> {
         self.write(move |conn| {
-            conn.execute(
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            tx.execute(
                 "INSERT INTO schedule_runs (id, schedule_id, scheduled_for, fired_at, outcome,
                                             session_id, manual)
                  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
@@ -286,12 +315,15 @@ impl Db {
             )
             .map_err(storage)?;
             if run.manual {
-                conn.execute(
-                    "UPDATE schedules SET last_run_at = ?2 WHERE id = ?1",
+                tx.execute(
+                    "UPDATE schedules
+                     SET last_run_at = MAX(COALESCE(last_run_at, 0), ?2)
+                     WHERE id = ?1",
                     params![run.schedule_id.as_str(), run.fired_at],
                 )
                 .map_err(storage)?;
             }
+            tx.commit().map_err(storage)?;
             Ok(())
         })
         .await
@@ -304,6 +336,7 @@ impl Db {
         limit: usize,
     ) -> CoreResult<Vec<ScheduleRun>> {
         let id = id.clone();
+        let clamped = i64::try_from(limit).unwrap_or(500).clamp(1, 500);
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(&format!(
@@ -311,10 +344,31 @@ impl Db {
                      LIMIT ?2"
                 ))
                 .map_err(storage)?;
-            stmt.query_map(params![id.as_str(), limit as i64], row_to_run)
+            stmt.query_map(params![id.as_str(), clamped], row_to_run)
                 .map_err(storage)?
                 .collect::<Result<_, _>>()
                 .map_err(storage)
+        })
+        .await
+    }
+
+    /// Whether any session started or prompted by a prior run of this schedule is
+    /// currently active (`starting`, `running`, or `waiting_approval`).
+    pub async fn has_active_schedule_session(&self, id: &ScheduleId) -> CoreResult<bool> {
+        let id = id.clone();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM schedule_runs r
+                     JOIN sessions s ON s.id = r.session_id
+                     WHERE r.schedule_id = ?1
+                       AND r.session_id IS NOT NULL
+                       AND s.status IN ('starting', 'running', 'waiting_approval')
+                 )",
+                [id.as_str()],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(storage)
         })
         .await
     }

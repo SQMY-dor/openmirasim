@@ -5,7 +5,8 @@
 //! lines from stdout with a strict line-length cap, extracts/persists the agent's native
 //! session/thread id for `--resume`, and supports cooperative cancellation + clean shutdown.
 
-use crate::stream::ReceiverStream;
+use super::probe::is_safe_cli_arg_value;
+use crate::stream::BoundedReceiverStream;
 use async_trait::async_trait;
 use om_core::approval::ApprovalDecision;
 use om_core::content::{ContentBlock, Prompt};
@@ -16,17 +17,25 @@ use om_core::sandbox::{CommandSpec, Sandbox, SandboxSpec};
 use om_core::session::StopReason;
 use om_core::{CoreError, CoreResult};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 /// Maximum bytes accepted on a single NDJSON stdout line from a CLI subprocess (4 MiB).
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum stderr bytes retained in memory for diagnostics (16 KiB rolling tail).
+const MAX_STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+/// Capacity of the bounded harness event channel.
+const EVENT_CHANNEL_CAPACITY: usize = 512;
 
 /// Stateful per-turn NDJSON parser implemented by each concrete CLI adapter (`cc`, `codexcli`).
 pub trait NdjsonTurnParser: Send + 'static {
@@ -82,7 +91,7 @@ pub trait StreamCliAdapter: Send + Sync + 'static {
         cwd: &Path,
         model: Option<&str>,
         native_session_id: Option<&str>,
-    ) -> CommandSpec;
+    ) -> CoreResult<CommandSpec>;
 
     /// Creates a fresh per-turn NDJSON parser.
     fn new_parser(&self) -> Box<dyn NdjsonTurnParser>;
@@ -107,29 +116,44 @@ struct SessionState<A: StreamCliAdapter> {
     sandbox: Arc<dyn Sandbox>,
     native_id: Mutex<Option<String>>,
     turn_active: AtomicBool,
-    cancelled: AtomicBool,
     closed: AtomicBool,
-    events: Mutex<Option<mpsc::UnboundedSender<HarnessEvent>>>,
+    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    cancel_notify: Notify,
+    events: Mutex<Option<mpsc::Sender<HarnessEvent>>>,
     active_child: tokio::sync::Mutex<Option<Child>>,
     turn_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl<A: StreamCliAdapter> SessionState<A> {
-    fn emit(&self, ev: HarnessEvent) {
-        if let HarnessEvent::NativeSessionId(ref id) = ev
-            && let Ok(mut guard) = self.native_id.lock()
-        {
-            *guard = Some(id.clone());
+    async fn emit(&self, ev: HarnessEvent) {
+        if let HarnessEvent::NativeSessionId(ref id) = ev {
+            if !is_safe_cli_arg_value(id) {
+                tracing::warn!(
+                    harness = %self.adapter.id(),
+                    "ignoring unsafe native_session_id emitted by CLI agent"
+                );
+                return;
+            }
+            *self
+                .native_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
         }
-        if let Ok(guard) = self.events.lock()
-            && let Some(tx) = guard.as_ref()
-        {
-            let _ = tx.send(ev);
+        let tx = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(ev).await;
         }
     }
 
     fn native_id(&self) -> Option<String> {
-        self.native_id.lock().ok().and_then(|g| g.clone())
+        self.native_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -145,10 +169,24 @@ pub fn start_stream_cli<A: StreamCliAdapter>(
             ctx.config.cwd
         )));
     }
+    if let Some(ref model) = ctx.config.model
+        && !is_safe_cli_arg_value(model)
+    {
+        return Err(CoreError::InvalidInput(
+            "model contains unsupported characters or starts with '-'".into(),
+        ));
+    }
+    if let Some(ref native) = ctx.resume_native_session_id
+        && !is_safe_cli_arg_value(native)
+    {
+        return Err(CoreError::InvalidInput(
+            "resume native_session_id contains unsupported characters".into(),
+        ));
+    }
 
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     if let Some(ref native) = ctx.resume_native_session_id {
-        let _ = tx.send(HarnessEvent::NativeSessionId(native.clone()));
+        let _ = tx.try_send(HarnessEvent::NativeSessionId(native.clone()));
     }
 
     let state = Arc::new(SessionState {
@@ -158,8 +196,9 @@ pub fn start_stream_cli<A: StreamCliAdapter>(
         sandbox: ctx.sandbox,
         native_id: Mutex::new(ctx.resume_native_session_id),
         turn_active: AtomicBool::new(false),
-        cancelled: AtomicBool::new(false),
         closed: AtomicBool::new(false),
+        active_cancel: Mutex::new(None),
+        cancel_notify: Notify::new(),
         events: Mutex::new(Some(tx)),
         active_child: tokio::sync::Mutex::new(None),
         turn_task: tokio::sync::Mutex::new(None),
@@ -167,7 +206,7 @@ pub fn start_stream_cli<A: StreamCliAdapter>(
 
     Ok(StartedSession {
         session: Box::new(StreamCliSession { state }),
-        events: Box::pin(ReceiverStream::new(rx)),
+        events: Box::pin(BoundedReceiverStream::new(rx)),
     })
 }
 
@@ -175,14 +214,85 @@ struct StreamCliSession<A: StreamCliAdapter> {
     state: Arc<SessionState<A>>,
 }
 
-async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_text: String) {
+impl<A: StreamCliAdapter> Drop for StreamCliSession<A> {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::SeqCst);
+        if let Some(flag) = self
+            .state
+            .active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
+        if let Ok(mut guard) = self.state.active_child.try_lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.start_kill();
+        }
+        self.state.cancel_notify.notify_waiters();
+        if let Ok(mut guard) = self.state.turn_task.try_lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
+        }
+    }
+}
+
+struct TurnActiveGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for TurnActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn run_cli_turn<A: StreamCliAdapter>(
+    state: Arc<SessionState<A>>,
+    prompt_text: String,
+    turn_cancelled: Arc<AtomicBool>,
+    prev_task: Option<JoinHandle<()>>,
+) {
+    // Ensure any previous turn task has fully emitted its TurnEnded before we start.
+    if let Some(prev) = prev_task {
+        let _ = prev.await;
+    }
+
+    let _active_guard = TurnActiveGuard {
+        flag: &state.turn_active,
+    };
+
+    if turn_cancelled.load(Ordering::SeqCst) || state.closed.load(Ordering::SeqCst) {
+        state
+            .emit(HarnessEvent::TurnEnded {
+                stop_reason: StopReason::Cancelled,
+                error: None,
+            })
+            .await;
+        return;
+    }
+
     let native = state.native_id();
-    let base_cmd = state.adapter.build_turn_command(
+    let base_cmd = match state.adapter.build_turn_command(
         &prompt_text,
         &state.cwd,
         state.model.as_deref(),
         native.as_deref(),
-    );
+    ) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            state
+                .emit(HarnessEvent::TurnEnded {
+                    stop_reason: StopReason::Failed,
+                    error: Some(e.to_string()),
+                })
+                .await;
+            return;
+        }
+    };
 
     let spec = SandboxSpec {
         writable_paths: vec![state.cwd.clone()],
@@ -194,11 +304,12 @@ async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_t
     let wrapped = match state.sandbox.wrap(&spec, base_cmd) {
         Ok(cmd) => cmd,
         Err(e) => {
-            state.turn_active.store(false, Ordering::SeqCst);
-            state.emit(HarnessEvent::TurnEnded {
-                stop_reason: StopReason::Failed,
-                error: Some(e.to_string()),
-            });
+            state
+                .emit(HarnessEvent::TurnEnded {
+                    stop_reason: StopReason::Failed,
+                    error: Some(e.to_string()),
+                })
+                .await;
             return;
         }
     };
@@ -218,30 +329,64 @@ async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_t
         command.current_dir(dir);
     }
 
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            state.turn_active.store(false, Ordering::SeqCst);
-            state.emit(HarnessEvent::TurnEnded {
-                stop_reason: StopReason::Failed,
-                error: Some(format!("failed to spawn `{}`: {e}", wrapped.program)),
-            });
+    let (stdout, stderr) = {
+        let mut child_guard = state.active_child.lock().await;
+        if turn_cancelled.load(Ordering::SeqCst) || state.closed.load(Ordering::SeqCst) {
+            drop(child_guard);
+            state
+                .emit(HarnessEvent::TurnEnded {
+                    stop_reason: StopReason::Cancelled,
+                    error: None,
+                })
+                .await;
             return;
         }
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                drop(child_guard);
+                state
+                    .emit(HarnessEvent::TurnEnded {
+                        stop_reason: StopReason::Failed,
+                        error: Some(format!("failed to spawn `{}`: {e}", wrapped.program)),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take();
+        *child_guard = Some(child);
+        (stdout, stderr)
     };
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take();
-    *state.active_child.lock().await = Some(child);
-
-    // Collect up to 16 KiB of stderr for diagnostics without unbounded RAM growth.
+    // Drain stderr completely to EOF so verbose children never block or receive SIGPIPE,
+    // retaining only the trailing 16 KiB for diagnostics.
     let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(err) = stderr {
-            let mut limited = err.take(16 * 1024);
-            let _ = limited.read_to_end(&mut buf).await;
+        let mut tail: VecDeque<u8> = VecDeque::new();
+        if let Some(mut err) = stderr {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match err.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let slice = if n >= MAX_STDERR_TAIL_BYTES {
+                            tail.clear();
+                            &chunk[n - MAX_STDERR_TAIL_BYTES..n]
+                        } else {
+                            let excess = (tail.len() + n).saturating_sub(MAX_STDERR_TAIL_BYTES);
+                            if excess > 0 {
+                                tail.drain(..excess);
+                            }
+                            &chunk[..n]
+                        };
+                        tail.extend(slice);
+                    }
+                }
+            }
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        let bytes: Vec<u8> = tail.into_iter().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     });
 
     let mut parser = state.adapter.new_parser();
@@ -265,7 +410,6 @@ async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_t
                         limit = MAX_LINE_BYTES,
                         "dropping oversized NDJSON line from CLI agent"
                     );
-                    // Drain remaining bytes until the next newline or EOF.
                     if !line_buf.ends_with(b"\n") {
                         let mut discard = Vec::new();
                         loop {
@@ -291,7 +435,7 @@ async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_t
                 match serde_json::from_str::<Value>(trimmed) {
                     Ok(val) => {
                         for ev in parser.on_json(&val) {
-                            state.emit(ev);
+                            state.emit(ev).await;
                         }
                     }
                     Err(_) => {
@@ -309,37 +453,58 @@ async fn run_cli_turn<A: StreamCliAdapter>(state: Arc<SessionState<A>>, prompt_t
         }
     }
 
-    let exit_status = {
-        let mut child_guard = state.active_child.lock().await;
-        if let Some(mut child) = child_guard.take() {
-            child.wait().await.ok()
+    // Take the child out before awaiting exit so cancel()/shutdown() never deadlock on active_child.
+    let child_opt = state.active_child.lock().await.take();
+    let exit_status = if let Some(mut child) = child_opt {
+        if turn_cancelled.load(Ordering::SeqCst) || state.closed.load(Ordering::SeqCst) {
+            let _ = child.start_kill();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
         } else {
-            None
+            tokio::select! {
+                res = child.wait() => res.ok(),
+                _ = state.cancel_notify.notified() => {
+                    let _ = child.start_kill();
+                    tokio::time::timeout(Duration::from_secs(5), child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                }
+            }
         }
+    } else {
+        None
     };
+
     let stderr_tail = stderr_task.await.unwrap_or_default();
+    let was_cancelled = turn_cancelled.load(Ordering::SeqCst);
 
-    state.turn_active.store(false, Ordering::SeqCst);
-
-    if state.cancelled.load(Ordering::SeqCst) {
-        state.emit(HarnessEvent::TurnEnded {
-            stop_reason: StopReason::Cancelled,
-            error: None,
-        });
+    if was_cancelled {
+        state
+            .emit(HarnessEvent::TurnEnded {
+                stop_reason: StopReason::Cancelled,
+                error: None,
+            })
+            .await;
         return;
     }
 
-    let exit_ok = exit_status.is_some_and(|s| s.success()) && !line_overflow;
-    let (tail_events, stop_reason, error) = parser.finish(exit_ok, &stderr_tail);
+    let exit_ok = exit_status.is_some_and(|s| s.success());
+    let (tail_events, mut stop_reason, mut error) = parser.finish(exit_ok, &stderr_tail);
     for ev in tail_events {
-        state.emit(ev);
+        state.emit(ev).await;
     }
-    let error = if line_overflow && error.is_none() {
-        Some("agent emitted an oversized output line".into())
-    } else {
-        error
-    };
-    state.emit(HarnessEvent::TurnEnded { stop_reason, error });
+    if line_overflow {
+        stop_reason = StopReason::Failed;
+        if error.is_none() || exit_ok {
+            error = Some("agent emitted an oversized output line".into());
+        }
+    }
+    state
+        .emit(HarnessEvent::TurnEnded { stop_reason, error })
+        .await;
 }
 
 #[async_trait]
@@ -366,11 +531,18 @@ impl<A: StreamCliAdapter> HarnessSession for StreamCliSession<A> {
         {
             return Err(CoreError::InvalidInput("a turn is already running".into()));
         }
-        self.state.cancelled.store(false, Ordering::SeqCst);
+        let turn_cancelled = Arc::new(AtomicBool::new(false));
+        *self
+            .state
+            .active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&turn_cancelled));
         let text = prompt_to_plain_text(&prompt);
         let state = Arc::clone(&self.state);
-        let handle = tokio::spawn(run_cli_turn(state, text));
-        *self.state.turn_task.lock().await = Some(handle);
+        let mut task_guard = self.state.turn_task.lock().await;
+        let prev = task_guard.take();
+        let handle = tokio::spawn(run_cli_turn(state, text, turn_cancelled, prev));
+        *task_guard = Some(handle);
         Ok(())
     }
 
@@ -389,10 +561,19 @@ impl<A: StreamCliAdapter> HarnessSession for StreamCliSession<A> {
     }
 
     async fn cancel(&self) -> CoreResult<()> {
-        self.state.cancelled.store(true, Ordering::SeqCst);
+        if let Some(flag) = self
+            .state
+            .active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
         if let Some(child) = self.state.active_child.lock().await.as_mut() {
             let _ = child.start_kill();
         }
+        self.state.cancel_notify.notify_waiters();
         Ok(())
     }
 
@@ -400,17 +581,28 @@ impl<A: StreamCliAdapter> HarnessSession for StreamCliSession<A> {
         if self.state.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.state.cancelled.store(true, Ordering::SeqCst);
+        if let Some(flag) = self
+            .state
+            .active_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            flag.store(true, Ordering::SeqCst);
+        }
         if let Some(child) = self.state.active_child.lock().await.as_mut() {
             let _ = child.start_kill();
         }
+        self.state.cancel_notify.notify_waiters();
         if let Some(handle) = self.state.turn_task.lock().await.take() {
             let _ = handle.await;
         }
-        self.state.emit(HarnessEvent::Exited { error: None });
-        if let Ok(mut guard) = self.state.events.lock() {
-            guard.take();
-        }
+        self.state.emit(HarnessEvent::Exited { error: None }).await;
+        self.state
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         Ok(())
     }
 }

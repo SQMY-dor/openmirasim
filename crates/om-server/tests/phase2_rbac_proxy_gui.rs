@@ -792,12 +792,19 @@ async fn pwa_web_push_subscriptions_and_ssrf_validation() {
         },
     );
 
-    // 1. SSRF / non-HTTPS endpoints are rejected
+    // 1. SSRF / non-HTTPS / IPv6 / IPv4-mapped endpoints are rejected
     for bad_endpoint in [
         "http://169.254.169.254/latest/meta-data",
         "http://10.0.0.5/push",
         "http://example.com/push",
         "https://user:pass@fcm.googleapis.com/fcm/send/abc",
+        "https://[::1]/push",
+        "https://[::ffff:169.254.169.254]/latest/meta-data",
+        "https://[fe80::1]/push",
+        "https://[fc00::1]/push",
+        "https://100.64.0.1/push",
+        "https://localhost./push",
+        "https://sub.localhost/push",
     ] {
         let res = app
             .clone()
@@ -859,7 +866,8 @@ async fn pwa_web_push_subscriptions_and_ssrf_validation() {
         .await
         .unwrap();
     let tested: Value = read_json(test_res).await;
-    assert_eq!(tested["delivered"], 1);
+    assert_eq!(tested["delivered"], 0);
+    assert_eq!(tested["registered"], 1);
 
     let del = app
         .oneshot(bearer_req(
