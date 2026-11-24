@@ -141,10 +141,11 @@ impl ApprovalPolicy {
                     None => Verdict::Ask,
                 };
             }
-            // Remembered allows only apply inside `Bwrap`; file tools also must stay
-            // inside the worktree and out of `.git`.
-            let allow_in_scope = req.sandbox == SandboxMode::Bwrap
-                && (!is_file_tool(req.kind) || all_within(req.cwd, req.locations));
+            // A remembered allow for a file tool stays inside the sandboxed worktree;
+            // for non-file tools (e.g. Execute/Fetch), the rule key binds to the exact
+            // command or URL explicitly approved by a member.
+            let allow_in_scope = !is_file_tool(req.kind)
+                || (req.sandbox == SandboxMode::Bwrap && all_within(req.cwd, req.locations));
             if allow_in_scope && let Some(option_id) = picked {
                 return Verdict::Auto {
                     option_id,

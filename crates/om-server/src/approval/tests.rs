@@ -343,7 +343,7 @@ fn remembered_reject_never_falls_through_to_auto_allow_when_reject_option_missin
 }
 
 #[test]
-fn remembered_allow_requires_allow_once_and_bwrap_and_rejects_root_cwd() {
+fn remembered_allow_requires_allow_once_and_bwrap_for_files_and_rejects_root_cwd() {
     let p = ApprovalPolicy::default();
     let only_allow_always = vec![ApprovalOption {
         option_id: "aa".into(),
@@ -352,6 +352,7 @@ fn remembered_allow_requires_allow_once_and_bwrap_and_rejects_root_cwd() {
     }];
     let mut mem = HashMap::new();
     mem.insert("execute:cargo test".to_string(), Remembered { allow: true });
+    mem.insert("edit".to_string(), Remembered { allow: true });
     assert_eq!(
         p.evaluate(
             &req(
@@ -370,15 +371,15 @@ fn remembered_allow_requires_allow_once_and_bwrap_and_rejects_root_cwd() {
         p.evaluate(
             &req(
                 SandboxMode::Direct,
-                Some(ToolKind::Execute),
-                &[],
-                "cargo test",
+                Some(ToolKind::Edit),
+                &["src/main.rs".into()],
+                "edit",
                 &opts()
             ),
             &mem
         ),
         Verdict::Ask,
-        "remembered allow must not apply in Direct mode"
+        "remembered file-tool allow must not apply in Direct mode"
     );
     assert!(!all_within("/", &["/etc/passwd".into()]));
     assert!(!all_within("/data/worktrees/s1", &[".".into()]));
