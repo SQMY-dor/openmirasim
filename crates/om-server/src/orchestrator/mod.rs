@@ -712,9 +712,6 @@ impl Orchestrator {
             }
         };
         let s = self.db.get_session(id).await?;
-        if s.status == SessionStatus::Closed {
-            return Ok(());
-        }
         let events = self
             .db
             .append_events(
