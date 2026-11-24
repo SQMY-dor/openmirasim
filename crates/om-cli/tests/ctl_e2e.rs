@@ -201,7 +201,68 @@ async fn ctl_drives_workspaces_sessions_prompts_approvals_diff_and_queue() {
     .await;
     assert_eq!(resolved["status"], "resolved");
 
-    // 6. Query audit logs & close session
+    // 6. Phase 4: MCP Hub, Skills lifecycle, Effective merge & Schedules via `om-cli ctl`
+    let mcp = run_ctl(
+        &base_url,
+        &[
+            "mcp",
+            "add",
+            "--name",
+            "github",
+            "--scope",
+            "space",
+            "--transport",
+            "stdio",
+            "--command",
+            "/bin/sh",
+            "--env-key",
+            "GITHUB_TOKEN",
+        ],
+    )
+    .await;
+    let mcp_id = mcp["id"].as_str().unwrap().to_string();
+    let probe = run_ctl(&base_url, &["mcp", "probe", &mcp_id]).await;
+    assert_eq!(probe["reachable"], true);
+
+    let skill = run_ctl(
+        &base_url,
+        &[
+            "skills",
+            "install",
+            "--name",
+            "pr-reviewer",
+            "--scope",
+            "space",
+            "--instructions",
+            "# Reviewer",
+        ],
+    )
+    .await;
+    assert_eq!(skill["name"], "pr-reviewer");
+
+    let eff = run_ctl(&base_url, &["hub", "effective", "--workspace", &ws_id]).await;
+    assert_eq!(eff["mcp_servers"].as_array().unwrap().len(), 1);
+    assert_eq!(eff["skills"].as_array().unwrap().len(), 1);
+
+    let sched = run_ctl(
+        &base_url,
+        &[
+            "schedules",
+            "create",
+            "--name",
+            "CLI Schedule",
+            "--interval-secs",
+            "3600",
+            "--session",
+            &sid,
+            "--prompt",
+            "ping",
+        ],
+    )
+    .await;
+    assert_eq!(sched["name"], "CLI Schedule");
+
+    // 7. Query audit logs & close session
     let audit = run_ctl(&base_url, &["audit", "--limit", "10"]).await;
     assert!(audit["entries"].is_array());
 

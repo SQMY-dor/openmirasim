@@ -36,11 +36,15 @@ export type { IssuedToken } from "../generated/IssuedToken";
 export type { ListApprovalRulesResponse } from "../generated/ListApprovalRulesResponse";
 export type { ListApprovalsResponse } from "../generated/ListApprovalsResponse";
 export type { ListAuditResponse } from "../generated/ListAuditResponse";
+export type { ListDispatchesResponse } from "../generated/ListDispatchesResponse";
 export type { ListEventsQuery } from "../generated/ListEventsQuery";
 export type { ListEventsResponse } from "../generated/ListEventsResponse";
+export type { ListGoalsResponse } from "../generated/ListGoalsResponse";
 export type { ListMembersResponse } from "../generated/ListMembersResponse";
 export type { ListProvidersResponse } from "../generated/ListProvidersResponse";
 export type { ListQueueResponse } from "../generated/ListQueueResponse";
+export type { ListScheduleRunsResponse } from "../generated/ListScheduleRunsResponse";
+export type { ListSchedulesResponse } from "../generated/ListSchedulesResponse";
 export type { ListSessionsResponse } from "../generated/ListSessionsResponse";
 export type { ListTokensResponse } from "../generated/ListTokensResponse";
 export type { ListWorkspacesResponse } from "../generated/ListWorkspacesResponse";
@@ -80,6 +84,7 @@ export type { SessionEvent } from "../generated/SessionEvent";
 export type { SessionId } from "../generated/SessionId";
 export type { SessionStatus } from "../generated/SessionStatus";
 export type { SessionSummary } from "../generated/SessionSummary";
+export type { SetScheduleEnabledRequest } from "../generated/SetScheduleEnabledRequest";
 export type { SkipReason } from "../generated/SkipReason";
 export type { SpaceId } from "../generated/SpaceId";
 export type { StopReason } from "../generated/StopReason";
@@ -318,3 +323,111 @@ export function renderContentBlockText(block: ContentBlock): string {
 export function renderContentBlocks(blocks: readonly ContentBlock[]): string {
   return blocks.map(renderContentBlockText).join("");
 }
+
+/** Phase 4: Space / Workspace two-tier MCP Hub & Skills lifecycle types. */
+export type HubScopeLevel = "space" | "workspace";
+export type McpTransport = "stdio" | "sse" | "streamable_http";
+export type SkillLifecycle = "draft" | "active" | "deprecated" | "archived";
+
+export interface McpServerRecord {
+  id: string;
+  space_id: string;
+  scope: HubScopeLevel;
+  workspace_id?: string;
+  name: string;
+  transport: McpTransport;
+  command?: string;
+  args: string[];
+  url?: string;
+  env_keys: string[];
+  description: string;
+  enabled: boolean;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateMcpServerRequest {
+  scope: HubScopeLevel;
+  workspace_id?: string;
+  name: string;
+  transport: McpTransport;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env_keys?: string[];
+  description?: string;
+  enabled?: boolean;
+}
+
+export interface UpdateMcpServerRequest {
+  enabled?: boolean;
+  description?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  env_keys?: string[];
+}
+
+export interface McpProbeResult {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  reachable: boolean;
+  detail: string;
+}
+
+export interface SkillRecord {
+  id: string;
+  space_id: string;
+  scope: HubScopeLevel;
+  workspace_id?: string;
+  name: string;
+  version: string;
+  description: string;
+  tags: string[];
+  instructions: string;
+  lifecycle: SkillLifecycle;
+  enabled: boolean;
+  created_by: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateSkillRequest {
+  scope: HubScopeLevel;
+  workspace_id?: string;
+  name: string;
+  version?: string;
+  description?: string;
+  tags?: string[];
+  instructions: string;
+  lifecycle?: SkillLifecycle;
+  enabled?: boolean;
+}
+
+export interface UpdateSkillRequest {
+  version?: string;
+  description?: string;
+  tags?: string[];
+  instructions?: string;
+  lifecycle?: SkillLifecycle;
+  enabled?: boolean;
+}
+
+export interface EffectiveMcpServer extends McpServerRecord {
+  overridden_space_default: boolean;
+}
+
+export interface EffectiveSkill extends SkillRecord {
+  overridden_space_default: boolean;
+}
+
+export interface EffectiveHubResponse {
+  space_id: string;
+  workspace_id?: string;
+  mcp_servers: EffectiveMcpServer[];
+  skills: EffectiveSkill[];
+  mcp_client_config: Record<string, unknown>;
+}
+

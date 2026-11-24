@@ -1629,5 +1629,116 @@ button {
   margin-top: 4px;
 }
 
+/* ---------- Phase 4: Schedules / Goals / Dispatch & Two-tier MCP Hub / Skills ---------- */
+.phase4-nav-bar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+
+.phase4-nav-bar .btn {
+  justify-content: center;
+}
+
+.hub-form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-code);
+}
+
+.hub-form-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.hub-form-row > .input,
+.hub-form-row > textarea.input {
+  flex: 1;
+  min-width: 140px;
+}
+
+.hub-notice {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(108, 215, 186, 0.4);
+  background: rgba(108, 215, 186, 0.1);
+  color: var(--text-primary);
+  font-size: 12.5px;
+}
+
+.hub-context-bar {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.hub-subpanel {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hub-subpanel-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.hub-run-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--border-subtle);
+}
+
+.hub-run-item:last-child {
+  border-bottom: none;
+}
+
+.muted-empty {
+  padding: 14px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.muted-ts {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.hub-json-preview {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-code);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-x: auto;
+  max-height: 220px;
+}
+
+
 
 

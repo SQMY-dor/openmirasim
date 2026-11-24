@@ -4,6 +4,7 @@
 //! [`crate::workspace::WorkspaceManager`], and [`crate::db::Db`].
 
 pub mod auth;
+pub mod hub;
 pub mod pty_ws;
 pub mod push;
 pub mod ws;
@@ -15,6 +16,7 @@ use crate::harness::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::pty::{PtyConfig, PtyManager, PtyStatus};
+use crate::scheduler::{Dispatcher, GoalRunner, Scheduler};
 use auth::{authenticate_secret, extract_bearer_token};
 use axum::extract::{Extension, FromRef, Path, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -22,20 +24,30 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use hub::{
+    CreateMcpServerRequest, CreateSkillRequest, EffectiveHubResponse, HubScopeLevel, HubStore,
+    ListMcpServersResponse, ListSkillsResponse, McpProbeResult, McpServerRecord, SkillRecord,
+    UpdateMcpServerRequest, UpdateSkillRequest,
+};
 use om_core::CoreError;
 use om_core::api::{
     AddMemberRequest, ApiError, ApiErrorCode, ApprovalRule, AuditEntry, ChangeRoleRequest,
     ClearApprovalRulesResponse, CreateSessionRequest, IssueTokenRequest, ListApprovalRulesResponse,
-    ListApprovalsResponse, ListAuditResponse, ListEventsQuery, ListEventsResponse,
-    ListMembersResponse, ListProvidersResponse, ListQueueResponse, ListSessionsResponse,
+    ListApprovalsResponse, ListAuditResponse, ListDispatchesResponse, ListEventsQuery,
+    ListEventsResponse, ListGoalsResponse, ListMembersResponse, ListProvidersResponse,
+    ListQueueResponse, ListScheduleRunsResponse, ListSchedulesResponse, ListSessionsResponse,
     ListTokensResponse, ListWorkspacesResponse, ListWorktreeFilesResponse, MAX_EVENTS_PAGE,
     MoveQueuedRequest, ProxyStats, RegisterWorkspaceRequest, ResolveApprovalRequest,
-    SubmitPromptRequest, SubmitPromptResponse,
+    SetScheduleEnabledRequest, SubmitPromptRequest, SubmitPromptResponse,
 };
 use om_core::auth::{Action, DeviceTokenRecord, IssuedToken, MemberRecord, Principal};
+use om_core::dispatch::{Dispatch, NewDispatch};
+use om_core::goal::{Goal, NewGoal};
 use om_core::ids::{
-    ApprovalId, MemberId, QueuedPromptId, SessionId, SpaceId, TokenId, WorkspaceId,
+    ApprovalId, GoalId, MemberId, QueuedPromptId, ScheduleId, SessionId, SpaceId, TokenId,
+    WorkspaceId,
 };
+use om_core::schedule::{NewSchedule, Schedule, ScheduleRun};
 use om_core::workspace::{WorkspaceSummary, WorktreeDiff, WorktreeInfo};
 use push::{
     ListPushSubscriptionsResponse, PushConfigResponse, PushStore, PushSubscriptionRecord,
@@ -62,7 +74,8 @@ pub struct ApiConfig {
     pub allow_cors_origin: Option<String>,
 }
 
-/// Optional Phase 2/3 gateway extensions (remote GUI screen registry, PWA Web Push, PTY runtime).
+/// Optional Phase 2–4 gateway extensions (remote GUI screen registry, PWA Web Push, PTY runtime,
+/// Schedules/Goals/Dispatch orchestration, and two-tier MCP Hub / Skills store).
 #[derive(Clone, Default)]
 pub struct ApiExtensions {
     pub remote_screens: RemoteScreenRegistry,
@@ -70,6 +83,10 @@ pub struct ApiExtensions {
     pub vapid_public_key: Option<String>,
     pub allow_loopback_push: bool,
     pub pty: Option<PtyManager>,
+    pub scheduler: Option<Scheduler>,
+    pub goals: Option<GoalRunner>,
+    pub dispatcher: Option<Dispatcher>,
+    pub hub_store_path: Option<PathBuf>,
 }
 
 /// Shared Axum router state.
@@ -86,6 +103,10 @@ pub(super) struct GatewayState {
     pub(super) push: PushStore,
     pub(super) remote_screens: RemoteScreenRegistry,
     pub(super) pty: PtyManager,
+    pub(super) scheduler: Scheduler,
+    pub(super) goals: GoalRunner,
+    pub(super) dispatcher: Dispatcher,
+    pub(super) hub: HubStore,
 }
 
 impl FromRef<GatewayState> for AppState {
@@ -118,13 +139,14 @@ impl IntoResponse for HttpApiError {
 
 type ApiResult<T> = Result<T, HttpApiError>;
 
-/// Builds the complete Axum router with default Phase 2/3 extensions.
+/// Builds the complete Axum router with default Phase 2–4 extensions.
 pub fn build_router(state: AppState) -> Router {
     build_router_with_extensions(state, ApiExtensions::default())
 }
 
-/// Builds the complete Axum router with explicit Phase 2/3 extensions (remote GUI screen
-/// registry, persistent PWA push store, optional VAPID key, and native PTY supervisor).
+/// Builds the complete Axum router with explicit Phase 2–4 extensions (remote GUI screen
+/// registry, persistent PWA push store, optional VAPID key, native PTY supervisor,
+/// Schedules/Goals/Dispatch engines, and two-tier MCP Hub / Skills registry).
 pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Router {
     let auth = Auth::new(state.orchestrator.db().clone());
     let push = PushStore::new(
@@ -135,12 +157,26 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
     let pty = ext
         .pty
         .unwrap_or_else(|| PtyManager::new(PtyConfig::default()));
+    let scheduler = ext
+        .scheduler
+        .unwrap_or_else(|| Scheduler::new(state.orchestrator.clone()));
+    let goals = ext
+        .goals
+        .unwrap_or_else(|| GoalRunner::new(state.orchestrator.clone()));
+    let dispatcher = ext
+        .dispatcher
+        .unwrap_or_else(|| Dispatcher::new(state.orchestrator.clone()));
+    let hub = HubStore::new(ext.hub_store_path);
     let gw = GatewayState {
         app: state.clone(),
         auth,
         push,
         remote_screens: ext.remote_screens,
         pty,
+        scheduler,
+        goals,
+        dispatcher,
+        hub,
     };
 
     let api_routes = Router::new()
@@ -204,6 +240,34 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
         )
         .route("/push/subscriptions/{id}", delete(delete_push_subscription))
         .route("/push/test", post(test_push))
+        // Schedules, Goals & Session-to-Session Dispatches (Phase 4)
+        .route("/schedules", get(list_schedules).post(create_schedule))
+        .route(
+            "/schedules/{id}",
+            get(get_schedule)
+                .put(update_schedule)
+                .delete(delete_schedule),
+        )
+        .route("/schedules/{id}/enabled", post(set_schedule_enabled))
+        .route("/schedules/{id}/trigger", post(trigger_schedule))
+        .route("/schedules/{id}/runs", get(list_schedule_runs))
+        .route("/sessions/{id}/goals", get(list_goals).post(set_goal))
+        .route("/goals/{id}/stop", post(stop_goal))
+        .route("/sessions/{id}/dispatches", get(list_dispatches))
+        .route("/dispatches", post(create_dispatch))
+        // Two-tier Space / Workspace MCP Hub & Skills Lifecycle (Phase 4)
+        .route(
+            "/mcp/servers",
+            get(list_mcp_servers).post(create_mcp_server),
+        )
+        .route(
+            "/mcp/servers/{id}",
+            patch(update_mcp_server).delete(delete_mcp_server),
+        )
+        .route("/mcp/servers/{id}/probe", post(probe_mcp_server))
+        .route("/skills", get(list_skills).post(create_skill))
+        .route("/skills/{id}", patch(update_skill).delete(delete_skill))
+        .route("/hub/effective", get(get_effective_hub))
         .layer(middleware::from_fn_with_state(gw.clone(), require_auth));
 
     let mut router = Router::new()
@@ -1035,4 +1099,472 @@ async fn get_pty_recording(
         bytes,
     )
         .into_response())
+}
+
+// -------------------------------------------------- Schedules, Goals, Dispatch
+
+#[derive(Deserialize, Default)]
+struct LimitQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn ensure_schedule_in_space(
+    gw: &GatewayState,
+    principal: &Principal,
+    id: &ScheduleId,
+) -> ApiResult<Schedule> {
+    let s = gw.scheduler.get(id).await?;
+    if s.space_id != principal.space_id {
+        return Err(HttpApiError::from(CoreError::NotFound(format!(
+            "schedule {id}"
+        ))));
+    }
+    Ok(s)
+}
+
+async fn list_schedules(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<Json<ListSchedulesResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let schedules = gw.scheduler.list(&principal.space_id).await?;
+    Ok(Json(ListSchedulesResponse { schedules }))
+}
+
+async fn create_schedule(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<NewSchedule>,
+) -> ApiResult<(StatusCode, Json<Schedule>)> {
+    let schedule = gw
+        .scheduler
+        .create(principal.space_id.clone(), &principal.member_id, body)
+        .await?;
+    Ok((StatusCode::CREATED, Json(schedule)))
+}
+
+async fn get_schedule(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Schedule>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let schedule = ensure_schedule_in_space(&gw, &principal, &ScheduleId::from(id)).await?;
+    Ok(Json(schedule))
+}
+
+async fn update_schedule(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<NewSchedule>,
+) -> ApiResult<Json<Schedule>> {
+    let schedule = gw
+        .scheduler
+        .update(&ScheduleId::from(id), &principal.member_id, body)
+        .await?;
+    Ok(Json(schedule))
+}
+
+async fn set_schedule_enabled(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<SetScheduleEnabledRequest>,
+) -> ApiResult<Json<Schedule>> {
+    let schedule = gw
+        .scheduler
+        .set_enabled(&ScheduleId::from(id), &principal.member_id, body.enabled)
+        .await?;
+    Ok(Json(schedule))
+}
+
+async fn trigger_schedule(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ScheduleRun>> {
+    let run = gw
+        .scheduler
+        .trigger(&ScheduleId::from(id), &principal.member_id)
+        .await?;
+    Ok(Json(run))
+}
+
+async fn list_schedule_runs(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Json<ListScheduleRunsResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let sid = ScheduleId::from(id);
+    ensure_schedule_in_space(&gw, &principal, &sid).await?;
+    let runs = gw.scheduler.runs(&sid, query.limit.unwrap_or(50)).await?;
+    Ok(Json(ListScheduleRunsResponse { runs }))
+}
+
+async fn delete_schedule(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    gw.scheduler
+        .delete(&ScheduleId::from(id), &principal.member_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_goals(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ListGoalsResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    let goals = gw.goals.list(&sid).await?;
+    Ok(Json(ListGoalsResponse { goals }))
+}
+
+async fn set_goal(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<NewGoal>,
+) -> ApiResult<(StatusCode, Json<Goal>)> {
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    let goal = gw.goals.set_goal(&sid, &principal.member_id, body).await?;
+    Ok((StatusCode::CREATED, Json(goal)))
+}
+
+async fn stop_goal(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Goal>> {
+    let goal = gw
+        .goals
+        .stop_goal(&GoalId::from(id), &principal.member_id)
+        .await?;
+    Ok(Json(goal))
+}
+
+async fn list_dispatches(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> ApiResult<Json<ListDispatchesResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    let dispatches = gw.dispatcher.list(&sid, query.limit.unwrap_or(50)).await?;
+    Ok(Json(ListDispatchesResponse { dispatches }))
+}
+
+async fn create_dispatch(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<NewDispatch>,
+) -> ApiResult<(StatusCode, Json<Dispatch>)> {
+    ensure_session_in_space(&gw, &principal, &body.from_session).await?;
+    let dispatch = gw
+        .dispatcher
+        .dispatch_as(&principal.member_id, body)
+        .await?;
+    Ok((StatusCode::CREATED, Json(dispatch)))
+}
+
+// ------------------------------------------------- Space/Workspace MCP & Skills
+
+#[derive(Deserialize, Default)]
+struct HubFilterQuery {
+    #[serde(default)]
+    scope: Option<HubScopeLevel>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn ensure_workspace_in_space(
+    gw: &GatewayState,
+    principal: &Principal,
+    ws_id: &WorkspaceId,
+) -> ApiResult<()> {
+    let stored = gw.app.orchestrator.db().get_workspace(ws_id).await?;
+    if stored.summary.space_id != principal.space_id {
+        return Err(HttpApiError::from(CoreError::NotFound(format!(
+            "workspace {ws_id}"
+        ))));
+    }
+    Ok(())
+}
+
+async fn require_hub_write(
+    gw: &GatewayState,
+    principal: &Principal,
+    scope: HubScopeLevel,
+    workspace_id: Option<&WorkspaceId>,
+) -> ApiResult<()> {
+    match scope {
+        HubScopeLevel::Space => {
+            gw.auth.require(principal, Action::ManageWorkspaces)?;
+        }
+        HubScopeLevel::Workspace => {
+            gw.auth.require(principal, Action::CreateSession)?;
+            if let Some(ws) = workspace_id {
+                ensure_workspace_in_space(gw, principal, ws).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn list_mcp_servers(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<HubFilterQuery>,
+) -> ApiResult<Json<ListMcpServersResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let ws = query
+        .workspace_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(WorkspaceId::from);
+    if let Some(ref wid) = ws {
+        ensure_workspace_in_space(&gw, &principal, wid).await?;
+    }
+    let servers = gw
+        .hub
+        .list_mcp(&principal.space_id, query.scope, ws.as_ref());
+    Ok(Json(ListMcpServersResponse { servers }))
+}
+
+async fn create_mcp_server(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<CreateMcpServerRequest>,
+) -> ApiResult<(StatusCode, Json<McpServerRecord>)> {
+    require_hub_write(&gw, &principal, body.scope, body.workspace_id.as_ref()).await?;
+    let record = gw.hub.create_mcp(
+        principal.space_id.clone(),
+        principal.member_id.clone(),
+        body,
+    )?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "mcp.created",
+            &record.id,
+            serde_json::json!({
+                "name": record.name,
+                "scope": record.scope,
+                "workspace_id": record.workspace_id,
+                "transport": record.transport,
+            }),
+        )
+        .await;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+async fn update_mcp_server(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMcpServerRequest>,
+) -> ApiResult<Json<McpServerRecord>> {
+    let existing = gw.hub.get_mcp(&principal.space_id, &id)?;
+    require_hub_write(
+        &gw,
+        &principal,
+        existing.scope,
+        existing.workspace_id.as_ref(),
+    )
+    .await?;
+    let updated = gw.hub.update_mcp(&principal.space_id, &id, body)?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "mcp.updated",
+            &updated.id,
+            serde_json::json!({ "name": updated.name, "enabled": updated.enabled }),
+        )
+        .await;
+    Ok(Json(updated))
+}
+
+async fn delete_mcp_server(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let existing = gw.hub.get_mcp(&principal.space_id, &id)?;
+    require_hub_write(
+        &gw,
+        &principal,
+        existing.scope,
+        existing.workspace_id.as_ref(),
+    )
+    .await?;
+    let removed = gw.hub.delete_mcp(&principal.space_id, &id)?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "mcp.deleted",
+            &removed.id,
+            serde_json::json!({ "name": removed.name }),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn probe_mcp_server(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<McpProbeResult>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let result = gw.hub.probe_mcp(&principal.space_id, &id)?;
+    Ok(Json(result))
+}
+
+async fn list_skills(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<HubFilterQuery>,
+) -> ApiResult<Json<ListSkillsResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let ws = query
+        .workspace_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(WorkspaceId::from);
+    if let Some(ref wid) = ws {
+        ensure_workspace_in_space(&gw, &principal, wid).await?;
+    }
+    let skills = gw
+        .hub
+        .list_skills(&principal.space_id, query.scope, ws.as_ref());
+    Ok(Json(ListSkillsResponse { skills }))
+}
+
+async fn create_skill(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<CreateSkillRequest>,
+) -> ApiResult<(StatusCode, Json<SkillRecord>)> {
+    require_hub_write(&gw, &principal, body.scope, body.workspace_id.as_ref()).await?;
+    let record = gw.hub.create_skill(
+        principal.space_id.clone(),
+        principal.member_id.clone(),
+        body,
+    )?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "skill.created",
+            &record.id,
+            serde_json::json!({
+                "name": record.name,
+                "version": record.version,
+                "scope": record.scope,
+                "lifecycle": record.lifecycle,
+            }),
+        )
+        .await;
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+async fn update_skill(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateSkillRequest>,
+) -> ApiResult<Json<SkillRecord>> {
+    let existing = gw.hub.get_skill(&principal.space_id, &id)?;
+    require_hub_write(
+        &gw,
+        &principal,
+        existing.scope,
+        existing.workspace_id.as_ref(),
+    )
+    .await?;
+    let updated = gw.hub.update_skill(&principal.space_id, &id, body)?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "skill.updated",
+            &updated.id,
+            serde_json::json!({
+                "name": updated.name,
+                "version": updated.version,
+                "lifecycle": updated.lifecycle,
+                "enabled": updated.enabled,
+            }),
+        )
+        .await;
+    Ok(Json(updated))
+}
+
+async fn delete_skill(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let existing = gw.hub.get_skill(&principal.space_id, &id)?;
+    require_hub_write(
+        &gw,
+        &principal,
+        existing.scope,
+        existing.workspace_id.as_ref(),
+    )
+    .await?;
+    let removed = gw.hub.delete_skill(&principal.space_id, &id)?;
+    let _ = gw
+        .app
+        .orchestrator
+        .db()
+        .audit(
+            Some(principal.member_id.clone()),
+            "skill.deleted",
+            &removed.id,
+            serde_json::json!({ "name": removed.name }),
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_effective_hub(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<HubFilterQuery>,
+) -> ApiResult<Json<EffectiveHubResponse>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let ws = query
+        .workspace_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(WorkspaceId::from);
+    if let Some(ref wid) = ws {
+        ensure_workspace_in_space(&gw, &principal, wid).await?;
+    }
+    let resolved = gw.hub.effective(&principal.space_id, ws.as_ref());
+    Ok(Json(resolved))
 }

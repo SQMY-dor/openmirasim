@@ -43,10 +43,10 @@
 
 ### Phase 4：编排扩展与按需演进
 **可复现 Demo 验收标准**：
-- [ ] Space / Workspace 两级 MCP Hub 与 Skills 生命周期管理
-- [ ] Schedules & Goals 定时任务与目标驱动循环、Session-to-Session 协同派发
-- [ ] 视实际社区/第三方需求评估是否引入 Protobuf SDK 与原生 Tauri Mobile 客户端
-- [ ] 公开推广前完成品牌名/商标合规复核
+- [x] Space / Workspace 两级 MCP Hub 与 Skills 生命周期管理（`api/hub.rs` 持久化注册表 + 两级覆盖合并与 `mcpServers` 导出 + RBAC/审计 + `om-cli ctl mcp/skills/hub` + Web `HubConsole`）
+- [x] Schedules & Goals 定时任务与目标驱动循环、Session-to-Session 协同派发（`om-server` 后台定时调度循环与重启恢复 + 完整 REST API + `om-cli ctl schedules/goals/dispatches` + Web `AutomationConsole` + 全栈 E2E）
+- [ ] 视实际社区/第三方需求评估是否引入 Protobuf SDK 与原生 Tauri Mobile 客户端（按需延后）
+- [ ] 公开推广前完成品牌名/商标合规复核（非工程项，公开发布前执行）
 
 ---
 

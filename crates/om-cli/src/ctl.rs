@@ -90,6 +90,36 @@ pub enum CtlCommand {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// Manage automated schedules (Phase 4).
+    Schedules {
+        #[command(subcommand)]
+        action: ScheduleCmd,
+    },
+    /// Manage goal-driven agent loops (Phase 4).
+    Goals {
+        #[command(subcommand)]
+        action: GoalCmd,
+    },
+    /// Manage Session-to-Session dispatches (Phase 4).
+    Dispatches {
+        #[command(subcommand)]
+        action: DispatchCmd,
+    },
+    /// Manage Space / Workspace two-tier MCP Hub servers (Phase 4).
+    Mcp {
+        #[command(subcommand)]
+        action: McpCmd,
+    },
+    /// Manage Space / Workspace two-tier Skills lifecycle (Phase 4).
+    Skills {
+        #[command(subcommand)]
+        action: SkillCmd,
+    },
+    /// Inspect effective inherited MCP Hub + Skills configuration (Phase 4).
+    Hub {
+        #[command(subcommand)]
+        action: HubCmd,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -287,6 +317,165 @@ pub enum ApprovalCmd {
     Rules { session_id: String },
     /// Clear all remembered approval rules on a session.
     ClearRules { session_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCmd {
+    /// List all schedules in the current space.
+    List,
+    /// Create a recurring interval schedule targeting an existing session.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 3600)]
+        interval_secs: u64,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        prompt: String,
+    },
+    /// Enable or pause a schedule.
+    SetEnabled {
+        schedule_id: String,
+        #[arg(long)]
+        enabled: bool,
+    },
+    /// Manually trigger a schedule immediately.
+    Trigger { schedule_id: String },
+    /// List recent runs of a schedule.
+    Runs {
+        schedule_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Delete a schedule.
+    Delete { schedule_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GoalCmd {
+    /// List goals on a session.
+    List { session_id: String },
+    /// Start a goal-driven loop on a session.
+    Set {
+        session_id: String,
+        #[arg(long)]
+        objective: String,
+        #[arg(long)]
+        max_turns: Option<u32>,
+    },
+    /// Stop an active goal.
+    Stop { goal_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DispatchCmd {
+    /// List sent/received dispatches for a session.
+    List {
+        session_id: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Dispatch a prompt from one session to another existing session.
+    Send {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, value_enum, default_value_t = CliSubmitMode::Queue)]
+        mode: CliSubmitMode,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCmd {
+    /// List registered MCP servers.
+    List {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Register a Space or Workspace MCP server (stores env key names only).
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "space")]
+        scope: String,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long = "env-key")]
+        env_keys: Vec<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Enable or disable an MCP server.
+    SetEnabled {
+        id: String,
+        #[arg(long)]
+        enabled: bool,
+    },
+    /// Probe command/endpoint readiness for an MCP server.
+    Probe { id: String },
+    /// Delete an MCP server.
+    Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCmd {
+    /// List registered skills.
+    List {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Install a new Space or Workspace skill.
+    Install {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "space")]
+        scope: String,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, default_value = "1.0.0")]
+        version: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        instructions: String,
+        #[arg(long, default_value = "active")]
+        lifecycle: String,
+    },
+    /// Update skill lifecycle state or enabled flag.
+    Update {
+        id: String,
+        #[arg(long)]
+        lifecycle: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
+    /// Delete a skill.
+    Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HubCmd {
+    /// Show effective merged Space + Workspace MCP servers, Skills, and client config JSON.
+    Effective {
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 }
 
 pub struct CtlError {
@@ -864,5 +1053,336 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 .send(Method::GET, "/api/v1/audit", &q, None, true)
                 .await
         }
+        CtlCommand::Schedules { action } => match action {
+            ScheduleCmd::List => {
+                client
+                    .send(Method::GET, "/api/v1/schedules", &[], None, true)
+                    .await
+            }
+            ScheduleCmd::Create {
+                name,
+                interval_secs,
+                session,
+                prompt,
+            } => {
+                let start_at = om_core::now_ms() + (interval_secs as i64) * 1000;
+                client
+                    .send(
+                        Method::POST,
+                        "/api/v1/schedules",
+                        &[],
+                        Some(json!({
+                            "name": name,
+                            "spec": {
+                                "kind": "every",
+                                "interval_secs": interval_secs,
+                                "start_at": start_at,
+                            },
+                            "target": {
+                                "kind": "session",
+                                "session_id": session,
+                                "prompt": Prompt::text(prompt),
+                                "mode": "queue",
+                            },
+                            "enabled": true,
+                        })),
+                        true,
+                    )
+                    .await
+            }
+            ScheduleCmd::SetEnabled {
+                schedule_id,
+                enabled,
+            } => {
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/schedules/{schedule_id}/enabled"),
+                        &[],
+                        Some(json!({ "enabled": enabled })),
+                        true,
+                    )
+                    .await
+            }
+            ScheduleCmd::Trigger { schedule_id } => {
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/schedules/{schedule_id}/trigger"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            ScheduleCmd::Runs { schedule_id, limit } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/schedules/{schedule_id}/runs"),
+                        &[("limit", limit.to_string())],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            ScheduleCmd::Delete { schedule_id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/schedules/{schedule_id}"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Goals { action } => match action {
+            GoalCmd::List { session_id } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/sessions/{session_id}/goals"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            GoalCmd::Set {
+                session_id,
+                objective,
+                max_turns,
+            } => {
+                let mut body = json!({ "objective": objective });
+                if let Some(mt) = max_turns {
+                    body["max_turns"] = json!(mt);
+                }
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/sessions/{session_id}/goals"),
+                        &[],
+                        Some(body),
+                        true,
+                    )
+                    .await
+            }
+            GoalCmd::Stop { goal_id } => {
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/goals/{goal_id}/stop"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Dispatches { action } => match action {
+            DispatchCmd::List { session_id, limit } => {
+                client
+                    .send(
+                        Method::GET,
+                        &format!("/api/v1/sessions/{session_id}/dispatches"),
+                        &[("limit", limit.to_string())],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            DispatchCmd::Send {
+                from,
+                to,
+                prompt,
+                mode,
+            } => {
+                let m: SubmitMode = mode.into();
+                client
+                    .send(
+                        Method::POST,
+                        "/api/v1/dispatches",
+                        &[],
+                        Some(json!({
+                            "from_session": from,
+                            "target": {
+                                "kind": "session",
+                                "session_id": to,
+                                "mode": m,
+                            },
+                            "prompt": Prompt::text(prompt),
+                        })),
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Mcp { action } => match action {
+            McpCmd::List { scope, workspace } => {
+                let mut q = Vec::new();
+                if let Some(s) = scope {
+                    q.push(("scope", s));
+                }
+                if let Some(w) = workspace {
+                    q.push(("workspace_id", w));
+                }
+                client
+                    .send(Method::GET, "/api/v1/mcp/servers", &q, None, true)
+                    .await
+            }
+            McpCmd::Add {
+                name,
+                scope,
+                workspace,
+                transport,
+                command,
+                args,
+                url,
+                env_keys,
+                description,
+            } => {
+                client
+                    .send(
+                        Method::POST,
+                        "/api/v1/mcp/servers",
+                        &[],
+                        Some(json!({
+                            "name": name,
+                            "scope": scope,
+                            "workspace_id": workspace,
+                            "transport": transport,
+                            "command": command,
+                            "args": args,
+                            "url": url,
+                            "env_keys": env_keys,
+                            "description": description,
+                            "enabled": true,
+                        })),
+                        true,
+                    )
+                    .await
+            }
+            McpCmd::SetEnabled { id, enabled } => {
+                client
+                    .send(
+                        Method::PATCH,
+                        &format!("/api/v1/mcp/servers/{id}"),
+                        &[],
+                        Some(json!({ "enabled": enabled })),
+                        true,
+                    )
+                    .await
+            }
+            McpCmd::Probe { id } => {
+                client
+                    .send(
+                        Method::POST,
+                        &format!("/api/v1/mcp/servers/{id}/probe"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+            McpCmd::Delete { id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/mcp/servers/{id}"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Skills { action } => match action {
+            SkillCmd::List { scope, workspace } => {
+                let mut q = Vec::new();
+                if let Some(s) = scope {
+                    q.push(("scope", s));
+                }
+                if let Some(w) = workspace {
+                    q.push(("workspace_id", w));
+                }
+                client
+                    .send(Method::GET, "/api/v1/skills", &q, None, true)
+                    .await
+            }
+            SkillCmd::Install {
+                name,
+                scope,
+                workspace,
+                version,
+                description,
+                instructions,
+                lifecycle,
+            } => {
+                client
+                    .send(
+                        Method::POST,
+                        "/api/v1/skills",
+                        &[],
+                        Some(json!({
+                            "name": name,
+                            "scope": scope,
+                            "workspace_id": workspace,
+                            "version": version,
+                            "description": description,
+                            "instructions": instructions,
+                            "lifecycle": lifecycle,
+                            "enabled": true,
+                        })),
+                        true,
+                    )
+                    .await
+            }
+            SkillCmd::Update {
+                id,
+                lifecycle,
+                enabled,
+            } => {
+                let mut body = json!({});
+                if let Some(lc) = lifecycle {
+                    body["lifecycle"] = json!(lc);
+                }
+                if let Some(en) = enabled {
+                    body["enabled"] = json!(en);
+                }
+                client
+                    .send(
+                        Method::PATCH,
+                        &format!("/api/v1/skills/{id}"),
+                        &[],
+                        Some(body),
+                        true,
+                    )
+                    .await
+            }
+            SkillCmd::Delete { id } => {
+                client
+                    .send(
+                        Method::DELETE,
+                        &format!("/api/v1/skills/{id}"),
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
+            }
+        },
+        CtlCommand::Hub { action } => match action {
+            HubCmd::Effective { workspace } => {
+                let mut q = Vec::new();
+                if let Some(w) = workspace {
+                    q.push(("workspace_id", w));
+                }
+                client
+                    .send(Method::GET, "/api/v1/hub/effective", &q, None, true)
+                    .await
+            }
+        },
     }
 }

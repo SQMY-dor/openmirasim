@@ -10,13 +10,25 @@ import {
   type ApprovalRecord,
   type ApprovalRuleView,
   type AuditEntry,
+  type CreateMcpServerRequest,
   type CreateSessionRequest,
+  type CreateSkillRequest,
   type DeviceTokenRecord,
+  type Dispatch,
+  type EffectiveHubResponse,
   type EventPayload,
+  type Goal,
+  type GoalId,
   type HarnessDescriptor,
+  type HubScopeLevel,
   type IssuedToken,
+  type McpProbeResult,
+  type McpServerRecord,
   type MemberId,
   type MemberRecord,
+  type NewDispatch,
+  type NewGoal,
+  type NewSchedule,
   type Principal,
   type ProviderInfo,
   type ProxyStats,
@@ -27,14 +39,21 @@ import {
   type RegisterPushSubscriptionRequest,
   type RemoteScreenResponse,
   type Role,
+  type Schedule,
+  type ScheduleId,
+  type ScheduleRun,
   type ServerInfo,
   type SessionEvent,
   type SessionId,
   type SessionSummary,
+  type SkillRecord,
   type SubmitMode,
   type SubmitOutcome,
   type SubmitPromptResponse,
   type TokenId,
+  type UpdateMcpServerRequest,
+  type UpdateSkillRequest,
+  type WorkspaceId,
   type WorkspaceSummary,
   type WorktreeDiff,
   type WorktreeEntry,
@@ -1022,6 +1041,317 @@ export class MockOpenMirasimClient implements OpenMirasimClient {
       close: () => {
         this.listeners.delete(entry);
         handlers.onStateChange("disconnected", null);
+      },
+    };
+  }
+
+  private mockSchedules: Schedule[] = [];
+  private mockScheduleRuns = new Map<string, ScheduleRun[]>();
+  private mockGoals = new Map<string, Goal[]>();
+  private mockDispatches: Dispatch[] = [];
+  private mockMcpServers: McpServerRecord[] = [
+    {
+      id: "mcp_demo_github",
+      space_id: "space_default",
+      scope: "space",
+      name: "github",
+      transport: "streamable_http",
+      args: [],
+      url: "https://mcp.example.com/github",
+      env_keys: ["GITHUB_TOKEN"],
+      description: "Space 默认 GitHub MCP 演示项",
+      enabled: true,
+      created_by: "member_dev",
+      created_at: nowMs() - 3600_000,
+      updated_at: nowMs() - 3600_000,
+    },
+  ];
+  private mockSkills: SkillRecord[] = [
+    {
+      id: "skl_demo_review",
+      space_id: "space_default",
+      scope: "space",
+      name: "pr-reviewer",
+      version: "1.0.0",
+      description: "团队代码审查规范 Skill",
+      tags: ["review", "rust"],
+      instructions: "# PR Reviewer\n检查权限边界、错误路径与测试覆盖。",
+      lifecycle: "active",
+      enabled: true,
+      created_by: "member_dev",
+      created_at: nowMs() - 3600_000,
+      updated_at: nowMs() - 3600_000,
+    },
+  ];
+
+  async listSchedules(): Promise<Schedule[]> {
+    return [...this.mockSchedules];
+  }
+
+  async createSchedule(req: NewSchedule): Promise<Schedule> {
+    const now = nowMs();
+    const s: Schedule = {
+      id: makeId("sched"),
+      space_id: "space_default",
+      name: req.name,
+      spec: req.spec,
+      target: req.target,
+      created_by: "member_dev",
+      enabled: req.enabled ?? true,
+      missed: req.missed ?? "run_once",
+      overlap: req.overlap ?? "allow",
+      next_run_at: now + 3600_000,
+      created_at: now,
+      updated_at: now,
+    };
+    this.mockSchedules.unshift(s);
+    return s;
+  }
+
+  async setScheduleEnabled(
+    scheduleId: ScheduleId,
+    enabled: boolean
+  ): Promise<Schedule> {
+    const found = this.mockSchedules.find((s) => s.id === scheduleId);
+    if (!found) throw new Error("schedule not found");
+    found.enabled = enabled;
+    found.updated_at = nowMs();
+    return { ...found };
+  }
+
+  async triggerSchedule(scheduleId: ScheduleId): Promise<ScheduleRun> {
+    const now = nowMs();
+    const run: ScheduleRun = {
+      id: makeId("srun"),
+      schedule_id: scheduleId,
+      scheduled_for: now,
+      fired_at: now,
+      outcome: {
+        outcome: "delivered",
+        session_id: this.store.sessions[0]?.id ?? "sess_mock",
+        submit: { outcome: "started", turn_id: makeId("turn") },
+      },
+      manual: true,
+    };
+    const arr = this.mockScheduleRuns.get(scheduleId) ?? [];
+    arr.unshift(run);
+    this.mockScheduleRuns.set(scheduleId, arr);
+    return run;
+  }
+
+  async listScheduleRuns(scheduleId: ScheduleId): Promise<ScheduleRun[]> {
+    return [...(this.mockScheduleRuns.get(scheduleId) ?? [])];
+  }
+
+  async deleteSchedule(scheduleId: ScheduleId): Promise<void> {
+    this.mockSchedules = this.mockSchedules.filter((s) => s.id !== scheduleId);
+  }
+
+  async listGoals(sessionId: SessionId): Promise<Goal[]> {
+    return [...(this.mockGoals.get(sessionId) ?? [])];
+  }
+
+  async setGoal(sessionId: SessionId, req: NewGoal): Promise<Goal> {
+    const now = nowMs();
+    const g: Goal = {
+      id: makeId("goal"),
+      space_id: "space_default",
+      session_id: sessionId,
+      objective: req.objective,
+      done_marker: "[[goal:done]]",
+      max_turns: req.max_turns ?? 10,
+      turns_used: 0,
+      deadline_at: req.deadline_at,
+      created_by: "member_dev",
+      status: "active",
+      created_at: now,
+      updated_at: now,
+    };
+    const arr = this.mockGoals.get(sessionId) ?? [];
+    arr.unshift(g);
+    this.mockGoals.set(sessionId, arr);
+    this.appendEvent(sessionId, { type: "goal_updated", goal: g });
+    return g;
+  }
+
+  async stopGoal(goalId: GoalId): Promise<Goal> {
+    for (const [sid, list] of this.mockGoals.entries()) {
+      const found = list.find((g) => g.id === goalId);
+      if (found) {
+        found.status = "stopped";
+        found.ended_reason = "stopped_by_member";
+        found.updated_at = nowMs();
+        this.appendEvent(sid, { type: "goal_updated", goal: { ...found } });
+        return { ...found };
+      }
+    }
+    throw new Error("goal not found");
+  }
+
+  async listDispatches(sessionId: SessionId): Promise<Dispatch[]> {
+    return this.mockDispatches.filter(
+      (d) => d.from_session === sessionId || d.to_session === sessionId
+    );
+  }
+
+  async createDispatch(req: NewDispatch): Promise<Dispatch> {
+    const toSession =
+      req.target.kind === "session" ? req.target.session_id : makeId("sess");
+    const d: Dispatch = {
+      id: makeId("disp"),
+      space_id: "space_default",
+      from_session: req.from_session,
+      to_session: toSession,
+      member_id: "member_dev",
+      depth: 1,
+      created_session: req.target.kind === "new_session",
+      submit: { outcome: "started", turn_id: makeId("turn") },
+      created_at: nowMs(),
+    };
+    this.mockDispatches.unshift(d);
+    this.appendEvent(req.from_session, { type: "dispatch_sent", dispatch: d });
+    return d;
+  }
+
+  async listMcpServers(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<McpServerRecord[]> {
+    return this.mockMcpServers.filter(
+      (s) =>
+        (!scope || s.scope === scope) &&
+        (!workspaceId || s.workspace_id === workspaceId)
+    );
+  }
+
+  async createMcpServer(req: CreateMcpServerRequest): Promise<McpServerRecord> {
+    const now = nowMs();
+    const rec: McpServerRecord = {
+      id: makeId("mcp"),
+      space_id: "space_default",
+      scope: req.scope,
+      workspace_id: req.workspace_id,
+      name: req.name,
+      transport: req.transport,
+      command: req.command,
+      args: req.args ?? [],
+      url: req.url,
+      env_keys: req.env_keys ?? [],
+      description: req.description ?? "",
+      enabled: req.enabled ?? true,
+      created_by: "member_dev",
+      created_at: now,
+      updated_at: now,
+    };
+    this.mockMcpServers.unshift(rec);
+    return rec;
+  }
+
+  async updateMcpServer(
+    id: string,
+    req: UpdateMcpServerRequest
+  ): Promise<McpServerRecord> {
+    const rec = this.mockMcpServers.find((s) => s.id === id);
+    if (!rec) throw new Error("mcp server not found");
+    if (req.enabled !== undefined) rec.enabled = req.enabled;
+    if (req.description !== undefined) rec.description = req.description;
+    rec.updated_at = nowMs();
+    return { ...rec };
+  }
+
+  async deleteMcpServer(id: string): Promise<void> {
+    this.mockMcpServers = this.mockMcpServers.filter((s) => s.id !== id);
+  }
+
+  async probeMcpServer(id: string): Promise<McpProbeResult> {
+    const rec = this.mockMcpServers.find((s) => s.id === id);
+    if (!rec) throw new Error("mcp server not found");
+    return {
+      id: rec.id,
+      name: rec.name,
+      transport: rec.transport,
+      reachable: true,
+      detail: "mock probe ok",
+    };
+  }
+
+  async listSkills(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<SkillRecord[]> {
+    return this.mockSkills.filter(
+      (s) =>
+        (!scope || s.scope === scope) &&
+        (!workspaceId || s.workspace_id === workspaceId)
+    );
+  }
+
+  async createSkill(req: CreateSkillRequest): Promise<SkillRecord> {
+    const now = nowMs();
+    const rec: SkillRecord = {
+      id: makeId("skl"),
+      space_id: "space_default",
+      scope: req.scope,
+      workspace_id: req.workspace_id,
+      name: req.name,
+      version: req.version ?? "1.0.0",
+      description: req.description ?? "",
+      tags: req.tags ?? [],
+      instructions: req.instructions,
+      lifecycle: req.lifecycle ?? "active",
+      enabled: req.enabled ?? true,
+      created_by: "member_dev",
+      created_at: now,
+      updated_at: now,
+    };
+    this.mockSkills.unshift(rec);
+    return rec;
+  }
+
+  async updateSkill(id: string, req: UpdateSkillRequest): Promise<SkillRecord> {
+    const rec = this.mockSkills.find((s) => s.id === id);
+    if (!rec) throw new Error("skill not found");
+    if (req.lifecycle !== undefined) rec.lifecycle = req.lifecycle;
+    if (req.enabled !== undefined) rec.enabled = req.enabled;
+    if (req.version !== undefined) rec.version = req.version;
+    rec.updated_at = nowMs();
+    return { ...rec };
+  }
+
+  async deleteSkill(id: string): Promise<void> {
+    this.mockSkills = this.mockSkills.filter((s) => s.id !== id);
+  }
+
+  async getEffectiveHub(workspaceId?: WorkspaceId): Promise<EffectiveHubResponse> {
+    const mcpMap = new Map<string, EffectiveHubResponse["mcp_servers"][number]>();
+    for (const s of this.mockMcpServers) {
+      if (s.scope === "space" && s.enabled) {
+        mcpMap.set(s.name.toLowerCase(), { ...s, overridden_space_default: false });
+      }
+    }
+    if (workspaceId) {
+      for (const s of this.mockMcpServers) {
+        if (s.scope === "workspace" && s.workspace_id === workspaceId && s.enabled) {
+          mcpMap.set(s.name.toLowerCase(), {
+            ...s,
+            overridden_space_default: mcpMap.has(s.name.toLowerCase()),
+          });
+        }
+      }
+    }
+    const mcp_servers = [...mcpMap.values()];
+    const skills = this.mockSkills
+      .filter((sk) => sk.enabled && sk.lifecycle !== "archived")
+      .map((sk) => ({ ...sk, overridden_space_default: false }));
+    return {
+      space_id: "space_default",
+      workspace_id: workspaceId,
+      mcp_servers,
+      skills,
+      mcp_client_config: {
+        mcpServers: Object.fromEntries(
+          mcp_servers.map((m) => [m.name, { transport: m.transport, url: m.url, command: m.command }])
+        ),
       },
     };
   }

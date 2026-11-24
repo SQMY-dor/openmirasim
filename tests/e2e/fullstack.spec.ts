@@ -636,5 +636,207 @@ test.describe("OpenMirasim Full-Stack Phase 0 E2E (real om-server + SQLite + Web
       fs.rmSync(dataDir, { recursive: true, force: true });
     }
   });
+
+  test("Phase 4: Schedules trigger & runs, Goals loop, Session-to-Session Dispatch, and two-tier Space/Workspace MCP Hub & Skills lifecycle", async ({
+    page,
+  }) => {
+    expect(fs.existsSync(SERVER_BIN)).toBe(true);
+    expect(fs.existsSync(path.join(STATIC_DIR, "index.html"))).toBe(true);
+
+    const { execFileSync } = await import("node:child_process");
+    const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), "om-phase4-e2e-"));
+    const dataDir = path.join(rootTmp, "data");
+    const repoDir = path.join(rootTmp, "hub-repo");
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.mkdirSync(repoDir, { recursive: true });
+
+    const git = (args: string[]) =>
+      execFileSync("git", args, { cwd: repoDir, stdio: "pipe" });
+    git(["init", "-b", "main"]);
+    git(["config", "user.email", "phase4-e2e@openmirasim.dev"]);
+    git(["config", "user.name", "OpenMirasim Phase 4 E2E"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Phase 4 Hub Repo\n");
+    git(["add", "README.md"]);
+    git(["commit", "-m", "initial"]);
+
+    const port = await findFreePort();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const server = startServer(port, dataDir);
+
+    const consoleErrors: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+    page.on("pageerror", (err) => {
+      consoleErrors.push(err.message);
+    });
+
+    try {
+      await waitForHealthz(baseUrl);
+
+      // Register a workspace + seed two mock sessions via REST so the UI loads immediately with rich state
+      const wsRes = await fetch(`${baseUrl}/api/v1/workspaces`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: "hub-demo", repo_path: repoDir }),
+      });
+      expect(wsRes.status).toBe(201);
+
+      for (const title of ["Phase4 主控会话", "Phase4 协同会话"]) {
+        const sRes = await fetch(`${baseUrl}/api/v1/sessions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            config: {
+              harness_id: "mock",
+              cwd: dataDir,
+              sandbox: "direct",
+              title,
+            },
+          }),
+        });
+        expect(sRes.status).toBe(201);
+      }
+
+      await page.goto(baseUrl);
+      await page.locator("#server-url-input").fill(baseUrl);
+      await page.locator("#access-token-input").fill(TOKEN);
+      await page.locator("#connect-submit-btn").click();
+      await expect(page.locator("#open-automation-console-btn")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // 1. Open Automation Console -> Schedules create + manual trigger -> runs recorded
+      await page.locator("#open-automation-console-btn").click();
+      await expect(page.locator("#automation-console-modal")).toBeVisible();
+
+      await page.locator("#sched-name-input").fill("每日构建巡检");
+      await page.locator("#sched-interval-input").fill("3600");
+      await page.locator("#sched-prompt-input").fill("检查最新构建状态");
+      await page.locator("#confirm-create-schedule-btn").click();
+      await expect(page.locator("#schedules-list")).toContainText("每日构建巡检", {
+        timeout: 10_000,
+      });
+
+      await page.locator("[data-trigger-schedule]").first().click();
+      await expect(page.locator("#schedule-runs-list")).toContainText(
+        "delivered",
+        { timeout: 10_000 }
+      );
+
+      // 2. Goals tab -> launch a Goal loop on the active session
+      await page.locator("#tab-auto-goals").click();
+      await page.locator("#goal-objective-input").fill("确保所有接口验收通过");
+      await page.locator("#goal-max-turns-input").fill("2");
+      await page.locator("#confirm-set-goal-btn").click();
+      await expect(page.locator("#goals-list")).toContainText(
+        "确保所有接口验收通过",
+        { timeout: 10_000 }
+      );
+
+      // 3. Dispatches tab -> dispatch a prompt from active session to the peer session
+      await page.locator("#tab-auto-dispatches").click();
+      await page.locator("#dispatch-prompt-input").fill("请协同复核 PR 改动");
+      await page.locator("#confirm-send-dispatch-btn").click();
+      await expect(page.locator("#dispatches-list")).toContainText("depth 1", {
+        timeout: 10_000,
+      });
+
+      await page
+        .locator('#automation-console-modal button[aria-label="关闭自动化编排面板"]')
+        .click();
+
+      // 4. Open MCP & Skills Hub Console -> create Space default + Workspace override -> Probe
+      await page.locator("#open-hub-console-btn").click();
+      await expect(page.locator("#hub-console-modal")).toBeVisible();
+
+      await page.locator("#mcp-name-input").fill("github");
+      await page.locator("#mcp-scope-select").selectOption("space");
+      await page.locator("#mcp-transport-select").selectOption("streamable_http");
+      await page
+        .locator("#mcp-url-input")
+        .fill("https://mcp.example.com/github");
+      await page.locator("#mcp-env-keys-input").fill("GITHUB_TOKEN");
+      await page.locator("#confirm-create-mcp-btn").click();
+      await expect(page.locator("#mcp-servers-list")).toContainText("SPACE", {
+        timeout: 10_000,
+      });
+
+      await page.locator("#mcp-name-input").fill("github");
+      await page.locator("#mcp-scope-select").selectOption("workspace");
+      await page.locator("#mcp-transport-select").selectOption("stdio");
+      await page.locator("#mcp-command-input").fill("/bin/sh");
+      await page.locator("#mcp-args-input").fill("-c true");
+      await page.locator("#mcp-env-keys-input").fill("REPO_GH_TOKEN");
+      await page.locator("#confirm-create-mcp-btn").click();
+      await expect(page.locator("#mcp-servers-list")).toContainText(
+        "WS:hub-demo",
+        { timeout: 10_000 }
+      );
+
+      await page.locator("[data-probe-mcp]").first().click();
+      await expect(page.locator("[data-mcp-probe]").first()).toContainText(
+        "就绪",
+        { timeout: 10_000 }
+      );
+
+      // 5. Skills tab -> install draft Skill and transition lifecycle to active
+      await page.locator("#tab-hub-skills").click();
+      await page.locator("#skill-name-input").fill("rust-reviewer");
+      await page.locator("#skill-version-input").fill("1.2.0");
+      await page.locator("#skill-lifecycle-select").selectOption("draft");
+      await page.locator("#skill-desc-input").fill("Rust 安全与架构审查");
+      await page
+        .locator("#skill-instructions-input")
+        .fill("# Rust Reviewer\nCheck RBAC and error boundaries.");
+      await page.locator("#confirm-create-skill-btn").click();
+      await expect(page.locator("#skills-list")).toContainText("rust-reviewer", {
+        timeout: 10_000,
+      });
+
+      await page
+        .locator("[data-skill-lifecycle]")
+        .first()
+        .selectOption("active");
+      await expect(page.locator("#skills-list")).toContainText("active", {
+        timeout: 10_000,
+      });
+
+      // 6. Effective merged view shows Workspace override & generated mcpServers JSON
+      await page.locator("#tab-hub-effective").click();
+      await expect(page.locator("#effective-mcp-list")).toContainText(
+        "覆盖 Space 默认",
+        { timeout: 10_000 }
+      );
+      await expect(page.locator("#effective-skills-list")).toContainText(
+        "rust-reviewer"
+      );
+      await expect(page.locator("#effective-mcp-json")).toContainText(
+        '"mcpServers"'
+      );
+
+      // 7. Browser reload preserves persisted Hub & Skills state from hub-registry.json
+      await page.reload();
+      await page.locator("#open-hub-console-btn").click();
+      await expect(page.locator("#mcp-servers-list")).toContainText(
+        "WS:hub-demo",
+        { timeout: 10_000 }
+      );
+      await page.locator("#tab-hub-skills").click();
+      await expect(page.locator("#skills-list")).toContainText("rust-reviewer");
+
+      expect(consoleErrors).toEqual([]);
+    } finally {
+      await stopServer(server);
+      fs.rmSync(rootTmp, { recursive: true, force: true });
+    }
+  });
 });
+
 

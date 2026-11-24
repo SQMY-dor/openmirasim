@@ -29,6 +29,7 @@ use om_server::orchestrator::{Orchestrator, OrchestratorConfig};
 use om_server::proxy::{KeyProxy, ProviderConfig, ProxyConfig};
 use om_server::pty::{PtyConfig, PtyManager};
 use om_server::sandbox::BwrapSandbox;
+use om_server::scheduler::{Dispatcher, GoalRunner, Scheduler};
 use om_server::workspace::{WorkspaceConfig, WorkspaceManager};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -247,6 +248,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let scheduler = Scheduler::new(orchestrator.clone());
+    let goal_runner = GoalRunner::new(orchestrator.clone());
+    let dispatcher = Dispatcher::new(orchestrator.clone());
+    let recovered_goals = goal_runner.recover().await?;
+    if recovered_goals > 0 {
+        tracing::info!(
+            count = recovered_goals,
+            "marked stale active goals as stopped after restart"
+        );
+    }
+    let scheduler_task = scheduler.spawn();
+
     let static_dir = resolve_static_dir();
     let allow_cors_origin = env_non_empty("OM_CORS_ORIGIN");
     let vapid_public_key = env_non_empty("OM_VAPID_PUBLIC_KEY");
@@ -270,6 +283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vapid_public_key,
         allow_loopback_push: bind_addr.ip().is_loopback(),
         pty: Some(pty_manager.clone()),
+        scheduler: Some(scheduler.clone()),
+        goals: Some(goal_runner),
+        dispatcher: Some(dispatcher),
+        hub_store_path: Some(data_dir.join("hub-registry.json")),
     };
 
     let app = build_router_with_extensions(state, extensions);
@@ -290,6 +307,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    scheduler.shutdown();
+    scheduler_task.abort();
     pty_manager.shutdown_all();
     if let Some(task) = proxy_task {
         task.abort();

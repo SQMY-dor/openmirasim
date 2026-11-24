@@ -4,12 +4,24 @@ import type {
   ApprovalRuleView,
   AuditEntry,
   ConnectionState,
+  CreateMcpServerRequest,
   CreateSessionRequest,
+  CreateSkillRequest,
   DeviceTokenRecord,
+  Dispatch,
+  EffectiveHubResponse,
+  Goal,
+  GoalId,
   HarnessDescriptor,
+  HubScopeLevel,
   IssuedToken,
+  McpProbeResult,
+  McpServerRecord,
   MemberId,
   MemberRecord,
+  NewDispatch,
+  NewGoal,
+  NewSchedule,
   Principal,
   ProviderInfo,
   ProxyStats,
@@ -20,14 +32,21 @@ import type {
   RegisterPushSubscriptionRequest,
   RemoteScreenResponse,
   Role,
+  Schedule,
+  ScheduleId,
+  ScheduleRun,
   ServerInfo,
   SessionEvent,
   SessionId,
   SessionSummary,
+  SkillRecord,
   SubmitMode,
   SubmitOutcome,
   SubmitPromptResponse,
   TokenId,
+  UpdateMcpServerRequest,
+  UpdateSkillRequest,
+  WorkspaceId,
   WorkspaceSummary,
   WorktreeDiff,
   WorktreeEntry,
@@ -192,6 +211,46 @@ export interface OpenMirasimClient {
 
   /** Build authenticated `/ws/pty/:id` WebSocket URL (`null` in local mock mode). */
   buildPtyWsUrl(sessionId: SessionId, cols: number, rows: number): string | null;
+
+  // --- Phase 4: Schedules, Goals & Session-to-Session Dispatches ---
+
+  listSchedules(): Promise<Schedule[]>;
+  createSchedule(req: NewSchedule): Promise<Schedule>;
+  setScheduleEnabled(scheduleId: ScheduleId, enabled: boolean): Promise<Schedule>;
+  triggerSchedule(scheduleId: ScheduleId): Promise<ScheduleRun>;
+  listScheduleRuns(scheduleId: ScheduleId, limit?: number): Promise<ScheduleRun[]>;
+  deleteSchedule(scheduleId: ScheduleId): Promise<void>;
+
+  listGoals(sessionId: SessionId): Promise<Goal[]>;
+  setGoal(sessionId: SessionId, req: NewGoal): Promise<Goal>;
+  stopGoal(goalId: GoalId): Promise<Goal>;
+
+  listDispatches(sessionId: SessionId, limit?: number): Promise<Dispatch[]>;
+  createDispatch(req: NewDispatch): Promise<Dispatch>;
+
+  // --- Phase 4: Two-tier Space / Workspace MCP Hub & Skills Lifecycle ---
+
+  listMcpServers(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<McpServerRecord[]>;
+  createMcpServer(req: CreateMcpServerRequest): Promise<McpServerRecord>;
+  updateMcpServer(
+    id: string,
+    req: UpdateMcpServerRequest
+  ): Promise<McpServerRecord>;
+  deleteMcpServer(id: string): Promise<void>;
+  probeMcpServer(id: string): Promise<McpProbeResult>;
+
+  listSkills(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<SkillRecord[]>;
+  createSkill(req: CreateSkillRequest): Promise<SkillRecord>;
+  updateSkill(id: string, req: UpdateSkillRequest): Promise<SkillRecord>;
+  deleteSkill(id: string): Promise<void>;
+
+  getEffectiveHub(workspaceId?: WorkspaceId): Promise<EffectiveHubResponse>;
 
   /**
    * Subscribe to `/ws/events` using the `Hello -> Welcome -> Subscribe { last_seq }` handshake.

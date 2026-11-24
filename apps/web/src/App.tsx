@@ -12,9 +12,11 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AutomationConsole } from "./components/AutomationConsole";
 import { Composer } from "./components/Composer";
 import { ConnectView } from "./components/ConnectView";
 import { EventInspector } from "./components/EventInspector";
+import { HubConsole } from "./components/HubConsole";
 import { NewSessionModal } from "./components/NewSessionModal";
 import { SessionStream } from "./components/SessionStream";
 import { sessionDisplayTitle, Sidebar } from "./components/Sidebar";
@@ -144,6 +146,8 @@ export function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [worktreeOpen, setWorktreeOpen] = useState(false);
   const [teamConsoleOpen, setTeamConsoleOpen] = useState(false);
+  const [automationConsoleOpen, setAutomationConsoleOpen] = useState(false);
+  const [hubConsoleOpen, setHubConsoleOpen] = useState(false);
   const [newModalOpen, setNewModalOpen] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -654,6 +658,8 @@ export function App() {
         onSelectSession={setSelectedSessionId}
         onNewSession={() => setNewModalOpen(true)}
         onOpenTeamConsole={() => setTeamConsoleOpen(true)}
+        onOpenAutomationConsole={() => setAutomationConsoleOpen(true)}
+        onOpenHubConsole={() => setHubConsoleOpen(true)}
         onToggleTheme={toggleTheme}
         onDisconnect={handleDisconnect}
         onCloseMobile={() => setMobileSidebarOpen(false)}
@@ -948,6 +954,27 @@ export function App() {
         principal={principal}
         onClose={() => setTeamConsoleOpen(false)}
         onPushStateChanged={setPushEnabled}
+      />
+
+      <AutomationConsole
+        open={automationConsoleOpen}
+        client={client}
+        principal={principal}
+        sessions={sessions}
+        activeSessionId={selectedSessionId}
+        onClose={() => setAutomationConsoleOpen(false)}
+        onRefreshSessions={async () => {
+          const list = await client.listSessions();
+          setSessions(list);
+        }}
+      />
+
+      <HubConsole
+        open={hubConsoleOpen}
+        client={client}
+        principal={principal}
+        workspaces={workspaces}
+        onClose={() => setHubConsoleOpen(false)}
       />
     </div>
   );

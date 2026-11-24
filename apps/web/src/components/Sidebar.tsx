@@ -1,6 +1,8 @@
 import {
+  CalendarClock,
   LogOut,
   Moon,
+  Plug,
   Plus,
   Search,
   Shield,
@@ -27,6 +29,8 @@ interface SidebarProps {
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onOpenTeamConsole: () => void;
+  onOpenAutomationConsole: () => void;
+  onOpenHubConsole: () => void;
   onToggleTheme: () => void;
   onDisconnect: () => void;
   onCloseMobile: () => void;
@@ -68,6 +72,8 @@ export function Sidebar({
   onSelectSession,
   onNewSession,
   onOpenTeamConsole,
+  onOpenAutomationConsole,
+  onOpenHubConsole,
   onToggleTheme,
   onDisconnect,
   onCloseMobile,
@@ -151,6 +157,29 @@ export function Sidebar({
             </button>
           </div>
         )}
+
+        <div className="phase4-nav-bar">
+          <button
+            type="button"
+            id="open-automation-console-btn"
+            className="btn btn-sm"
+            onClick={onOpenAutomationConsole}
+            title="Schedules 定时任务、Goals 目标循环与跨会话派发"
+          >
+            <CalendarClock size={12} />
+            <span>编排与定时</span>
+          </button>
+          <button
+            type="button"
+            id="open-hub-console-btn"
+            className="btn btn-sm"
+            onClick={onOpenHubConsole}
+            title="Space / Workspace 两级 MCP Hub 与 Skills 生命周期"
+          >
+            <Plug size={12} />
+            <span>MCP &amp; Skills</span>
+          </button>
+        </div>
 
         <div className="sidebar-controls">
           {canCreate ? (
