@@ -42,9 +42,7 @@ pub(crate) enum Command {
         reply: oneshot::Sender<CoreResult<()>>,
     },
     /// Server shutdown: terminate the live harness process without permanently closing the session.
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
+    Shutdown { reply: oneshot::Sender<()> },
     Send {
         member: Option<MemberId>,
         prompt: Prompt,
