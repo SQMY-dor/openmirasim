@@ -13,21 +13,37 @@ import {
   type AuditEntry,
   type ClearApprovalRulesResponse,
   type ClientMessage,
+  type CreateMcpServerRequest,
   type CreateSessionRequest,
+  type CreateSkillRequest,
   type DeviceTokenRecord,
+  type Dispatch,
+  type EffectiveHubResponse,
+  type Goal,
+  type GoalId,
   type HarnessDescriptor,
+  type HubScopeLevel,
   type IssuedToken,
   type ListApprovalRulesResponse,
   type ListAuditResponse,
+  type ListDispatchesResponse,
   type ListEventsResponse,
+  type ListGoalsResponse,
   type ListMembersResponse,
   type ListProvidersResponse,
+  type ListScheduleRunsResponse,
+  type ListSchedulesResponse,
   type ListSessionsResponse,
   type ListTokensResponse,
   type ListWorkspacesResponse,
   type ListWorktreeFilesResponse,
+  type McpProbeResult,
+  type McpServerRecord,
   type MemberId,
   type MemberRecord,
+  type NewDispatch,
+  type NewGoal,
+  type NewSchedule,
   type Principal,
   type ProviderInfo,
   type ProxyStats,
@@ -39,15 +55,22 @@ import {
   type RemoteScreenResponse,
   type ResolveApprovalRequest,
   type Role,
+  type Schedule,
+  type ScheduleId,
+  type ScheduleRun,
   type ServerInfo,
   type ServerMessage,
   type SessionEvent,
   type SessionId,
   type SessionSummary,
+  type SkillRecord,
   type SubmitMode,
   type SubmitOutcome,
   type SubmitPromptResponse,
   type TokenId,
+  type UpdateMcpServerRequest,
+  type UpdateSkillRequest,
+  type WorkspaceId,
   type WorkspaceSummary,
   type WorktreeDiff,
   type WorktreeEntry,
@@ -473,6 +496,191 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
       rows: String(rows),
     });
     return `${wsBase}/ws/pty/${encodeURIComponent(sessionId)}?${params.toString()}`;
+  }
+
+  // --- Phase 4: Schedules, Goals & Session-to-Session Dispatches ---
+
+  async listSchedules(): Promise<Schedule[]> {
+    const res = await this.request<ListSchedulesResponse>("/api/v1/schedules");
+    return res.schedules;
+  }
+
+  async createSchedule(req: NewSchedule): Promise<Schedule> {
+    return this.request<Schedule>("/api/v1/schedules", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  async setScheduleEnabled(
+    scheduleId: ScheduleId,
+    enabled: boolean
+  ): Promise<Schedule> {
+    return this.request<Schedule>(
+      `/api/v1/schedules/${encodeURIComponent(scheduleId)}/enabled`,
+      {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      }
+    );
+  }
+
+  async triggerSchedule(scheduleId: ScheduleId): Promise<ScheduleRun> {
+    return this.request<ScheduleRun>(
+      `/api/v1/schedules/${encodeURIComponent(scheduleId)}/trigger`,
+      { method: "POST" }
+    );
+  }
+
+  async listScheduleRuns(
+    scheduleId: ScheduleId,
+    limit = 30
+  ): Promise<ScheduleRun[]> {
+    const res = await this.request<ListScheduleRunsResponse>(
+      `/api/v1/schedules/${encodeURIComponent(scheduleId)}/runs?limit=${limit}`
+    );
+    return res.runs;
+  }
+
+  async deleteSchedule(scheduleId: ScheduleId): Promise<void> {
+    await this.request<void>(
+      `/api/v1/schedules/${encodeURIComponent(scheduleId)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  async listGoals(sessionId: SessionId): Promise<Goal[]> {
+    const res = await this.request<ListGoalsResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/goals`
+    );
+    return res.goals;
+  }
+
+  async setGoal(sessionId: SessionId, req: NewGoal): Promise<Goal> {
+    return this.request<Goal>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/goals`,
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      }
+    );
+  }
+
+  async stopGoal(goalId: GoalId): Promise<Goal> {
+    return this.request<Goal>(
+      `/api/v1/goals/${encodeURIComponent(goalId)}/stop`,
+      { method: "POST" }
+    );
+  }
+
+  async listDispatches(sessionId: SessionId, limit = 50): Promise<Dispatch[]> {
+    const res = await this.request<ListDispatchesResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/dispatches?limit=${limit}`
+    );
+    return res.dispatches;
+  }
+
+  async createDispatch(req: NewDispatch): Promise<Dispatch> {
+    return this.request<Dispatch>("/api/v1/dispatches", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  // --- Phase 4: Two-tier Space / Workspace MCP Hub & Skills Lifecycle ---
+
+  async listMcpServers(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<McpServerRecord[]> {
+    const params = new URLSearchParams();
+    if (scope) params.set("scope", scope);
+    if (workspaceId) params.set("workspace_id", workspaceId);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await this.request<{ servers: McpServerRecord[] }>(
+      `/api/v1/mcp/servers${qs}`
+    );
+    return res.servers;
+  }
+
+  async createMcpServer(req: CreateMcpServerRequest): Promise<McpServerRecord> {
+    return this.request<McpServerRecord>("/api/v1/mcp/servers", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  async updateMcpServer(
+    id: string,
+    req: UpdateMcpServerRequest
+  ): Promise<McpServerRecord> {
+    return this.request<McpServerRecord>(
+      `/api/v1/mcp/servers/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(req),
+      }
+    );
+  }
+
+  async deleteMcpServer(id: string): Promise<void> {
+    await this.request<void>(`/api/v1/mcp/servers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async probeMcpServer(id: string): Promise<McpProbeResult> {
+    return this.request<McpProbeResult>(
+      `/api/v1/mcp/servers/${encodeURIComponent(id)}/probe`,
+      { method: "POST" }
+    );
+  }
+
+  async listSkills(
+    scope?: HubScopeLevel,
+    workspaceId?: WorkspaceId
+  ): Promise<SkillRecord[]> {
+    const params = new URLSearchParams();
+    if (scope) params.set("scope", scope);
+    if (workspaceId) params.set("workspace_id", workspaceId);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await this.request<{ skills: SkillRecord[] }>(
+      `/api/v1/skills${qs}`
+    );
+    return res.skills;
+  }
+
+  async createSkill(req: CreateSkillRequest): Promise<SkillRecord> {
+    return this.request<SkillRecord>("/api/v1/skills", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  async updateSkill(
+    id: string,
+    req: UpdateSkillRequest
+  ): Promise<SkillRecord> {
+    return this.request<SkillRecord>(
+      `/api/v1/skills/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(req),
+      }
+    );
+  }
+
+  async deleteSkill(id: string): Promise<void> {
+    await this.request<void>(`/api/v1/skills/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async getEffectiveHub(workspaceId?: WorkspaceId): Promise<EffectiveHubResponse> {
+    const qs = workspaceId
+      ? `?workspace_id=${encodeURIComponent(workspaceId)}`
+      : "";
+    return this.request<EffectiveHubResponse>(`/api/v1/hub/effective${qs}`);
   }
 
   subscribeSession(

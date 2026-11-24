@@ -21,7 +21,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum TopCommand {
     /// Scriptable pure-JSON control plane for `om-server`.
-    Ctl(ctl::CtlArgs),
+    Ctl(Box<ctl::CtlArgs>),
     /// Interactive Ratatui multi-session dashboard with direct `/ws/pty` terminal attach.
     Tui(tui::TuiArgs),
 }
@@ -32,7 +32,7 @@ async fn main() -> ExitCode {
     match cli.command {
         TopCommand::Ctl(args) => {
             let pretty = args.pretty;
-            match ctl::run(args).await {
+            match ctl::run(*args).await {
                 Ok(val) => {
                     let rendered = if pretty {
                         serde_json::to_string_pretty(&val)
