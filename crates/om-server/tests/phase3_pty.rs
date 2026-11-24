@@ -363,6 +363,7 @@ async fn pty_binary_ws_ring_catchup_viewer_readonly_cast_recording_and_cleanup()
 #[tokio::test]
 async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
     use om_server::sandbox::BwrapSandbox;
+    use om_server::workspace::{WorkspaceConfig, WorkspaceManager};
 
     let bwrap = match BwrapSandbox::default().probe().await {
         Ok(b) => b,
@@ -376,8 +377,10 @@ async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
 
     let dir = tempfile::tempdir().unwrap();
     let work_dir = dir.path().join("work");
+    let data_dir = dir.path().join("data");
     let secret_dir = dir.path().join("host-secrets");
     std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&secret_dir).unwrap();
     let secret_file = secret_dir.join("secret.txt");
     std::fs::write(&secret_file, "TOP_SECRET_HOST_DATA").unwrap();
@@ -391,6 +394,7 @@ async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
         .unwrap()
         .unwrap();
 
+    let workspaces = WorkspaceManager::new(db.clone(), WorkspaceConfig::new(&data_dir)).unwrap();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness::instant()));
     let orchestrator = Orchestrator::new(
@@ -401,6 +405,7 @@ async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
             ..Default::default()
         },
     )
+    .with_workspaces(workspaces)
     .with_bwrap_sandbox(Arc::new(bwrap));
     let pty = PtyManager::new(PtyConfig::default());
 
@@ -467,8 +472,9 @@ async fn pty_bwrap_session_runs_inside_sandbox_and_isolates_host_files() {
         .unwrap()
         .unwrap();
 
+    // Split marker literals so terminal local-echo does not trigger the assertion early.
     let cmd = format!(
-        "cat {} 2>&1 || echo BLOCKED_SECRET; echo DONE_BWRAP_CHECK\n",
+        "cat {} 2>&1 || echo BLOCKED\"_\"SECRET; echo DONE\"_\"BWRAP_CHECK\n",
         secret_file.display()
     );
     pty_ws
