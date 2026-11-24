@@ -682,7 +682,11 @@ async fn failed_new_session_runs_close_their_session_and_changes_need_rights() {
             .update(
                 &s.id,
                 &bob,
-                new_schedule("hijack", every_minute(1_000), new_session_target("hold", "x")),
+                new_schedule(
+                    "hijack",
+                    every_minute(1_000),
+                    new_session_target("hold", "x")
+                ),
             )
             .await,
         Err(om_core::CoreError::Forbidden(_))

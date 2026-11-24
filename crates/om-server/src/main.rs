@@ -146,8 +146,7 @@ fn build_bwrap_config_from_env() -> Result<BwrapConfig, String> {
             }
         };
     }
-    let memory_max_bytes = env_u64("OM_MEMORY_MAX_MB")?
-        .map(|mb| mb.saturating_mul(1024 * 1024));
+    let memory_max_bytes = env_u64("OM_MEMORY_MAX_MB")?.map(|mb| mb.saturating_mul(1024 * 1024));
     let cpu_quota_percent = env_u64("OM_CPU_QUOTA_PERCENT")?
         .map(|v| u32::try_from(v).map_err(|_| "OM_CPU_QUOTA_PERCENT out of range".to_string()))
         .transpose()?;

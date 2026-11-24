@@ -529,6 +529,7 @@ impl PtyManager {
         let live_table = self.live.clone();
         let sid_owned = session_id.clone();
         let ctrl_on_eof = control_tx.clone();
+        let read_active = active_atom.clone();
         let read_killed = killed_atom.clone();
         let read_killer = killer.clone();
         if let Err(e) = std::thread::Builder::new()
@@ -552,7 +553,7 @@ impl PtyManager {
                         }
                     }
                 }
-                active_atom.store(false, Ordering::Release);
+                read_active.store(false, Ordering::Release);
                 read_killed.store(true, Ordering::Release);
                 let _ = ctrl_on_eof.try_send(PtyControl::Kill);
                 // Wait briefly for `pty-reap` to populate the child's exit code.
@@ -694,9 +695,8 @@ impl PtyManager {
             )));
         };
         let path = safe_cast_path(dir, session_id.as_str())?;
-        let meta = std::fs::symlink_metadata(&path).map_err(|_| {
-            CoreError::NotFound(format!("PTY recording for session {session_id}"))
-        })?;
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|_| CoreError::NotFound(format!("PTY recording for session {session_id}")))?;
         if !meta.is_file() {
             return Err(CoreError::NotFound(format!(
                 "PTY recording for session {session_id}"

@@ -166,13 +166,14 @@ impl Auth {
             return Err(denied(p, format!("add a {role:?}")));
         }
         // Checked again inside the write, against the actor's current role & token.
-        let auth = Authorize::with_token(p.member_id.clone(), p.token_id.clone(), move |actor, _| {
-            if actor.role.can_assign(role) {
-                Ok(())
-            } else {
-                Err(CoreError::Forbidden(format!("add a {role:?}")))
-            }
-        });
+        let auth =
+            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), move |actor, _| {
+                if actor.role.can_assign(role) {
+                    Ok(())
+                } else {
+                    Err(CoreError::Forbidden(format!("add a {role:?}")))
+                }
+            });
         self.db
             .create_member_checked(
                 &p.space_id,
@@ -198,12 +199,13 @@ impl Auth {
         if !self_owner && !(p.role.can_manage(target.role) && p.role.can_assign(role)) {
             return Err(denied(p, format!("change a {:?} to {role:?}", target.role)));
         }
-        let auth =
-            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), move |actor, target| {
+        let auth = Authorize::with_token(
+            p.member_id.clone(),
+            p.token_id.clone(),
+            move |actor, target| {
                 let target = target.expect("role change has a target");
                 let self_owner = target.id == actor.id && actor.role == Role::Owner;
-                if self_owner
-                    || (actor.role.can_manage(target.role) && actor.role.can_assign(role))
+                if self_owner || (actor.role.can_manage(target.role) && actor.role.can_assign(role))
                 {
                     Ok(())
                 } else {
@@ -212,7 +214,8 @@ impl Auth {
                         target.role
                     )))
                 }
-            });
+            },
+        );
         self.db
             .set_member_role_checked(member_id, role, Some(p.member_id.clone()), Some(auth))
             .await
@@ -230,8 +233,10 @@ impl Auth {
         if !self_owner && !p.role.can_manage(target.role) {
             return Err(denied(p, format!("disable a {:?}", target.role)));
         }
-        let auth =
-            Authorize::with_token(p.member_id.clone(), p.token_id.clone(), move |actor, target| {
+        let auth = Authorize::with_token(
+            p.member_id.clone(),
+            p.token_id.clone(),
+            move |actor, target| {
                 let target = target.expect("disable has a target");
                 let self_owner = target.id == actor.id && actor.role == Role::Owner;
                 if self_owner || actor.role.can_manage(target.role) {
@@ -239,7 +244,8 @@ impl Auth {
                 } else {
                     Err(CoreError::Forbidden(format!("disable a {:?}", target.role)))
                 }
-            });
+            },
+        );
         self.db
             .disable_member_checked(member_id, Some(p.member_id.clone()), Some(auth))
             .await

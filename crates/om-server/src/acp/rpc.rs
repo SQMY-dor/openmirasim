@@ -380,9 +380,7 @@ async fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::Sender<Incoming>)
             let _ = in_tx.send(Incoming::Request { id, method, params }).await;
         }
         (Some(method), None) => {
-            let _ = in_tx
-                .send(Incoming::Notification { method, params })
-                .await;
+            let _ = in_tx.send(Incoming::Notification { method, params }).await;
         }
         (None, Some(id)) => {
             let Some(num) = id.as_u64() else {
@@ -399,8 +397,9 @@ async fn dispatch(msg: Value, pending: &Pending, in_tx: &mpsc::Sender<Incoming>)
                     _ => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 // Through the channel, behind every earlier notification.
-                if let Err(mpsc::error::SendError(Incoming::Settle(s))) =
-                    in_tx.send(Incoming::Settle(Settlement { tx, result })).await
+                if let Err(mpsc::error::SendError(Incoming::Settle(s))) = in_tx
+                    .send(Incoming::Settle(Settlement { tx, result }))
+                    .await
                 {
                     s.complete();
                 }

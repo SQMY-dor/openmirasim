@@ -118,7 +118,9 @@ impl McpServerRecord {
     pub fn effective_owner(&self) -> Option<&MemberId> {
         match self.scope {
             HubScopeLevel::Space => None,
-            HubScopeLevel::Workspace => Some(self.owner_member_id.as_ref().unwrap_or(&self.created_by)),
+            HubScopeLevel::Workspace => {
+                Some(self.owner_member_id.as_ref().unwrap_or(&self.created_by))
+            }
         }
     }
 
@@ -409,9 +411,7 @@ fn validate_stdio_command(cmd: &str, is_admin: bool) -> CoreResult<String> {
         ));
     }
     let p = Path::new(trimmed);
-    if p.components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(CoreError::InvalidInput(
             "stdio MCP command must not contain `..` path traversal".into(),
         ));
@@ -498,9 +498,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 fn resolve_command_on_path(cmd: &str) -> Option<PathBuf> {
     let p = Path::new(cmd);
-    if p.components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return None;
     }
     if p.is_absolute() || cmd.contains('/') {
@@ -621,7 +619,8 @@ impl HubStore {
     ) -> CoreResult<McpServerRecord> {
         validate_scope(req.scope, &req.workspace_id)?;
         let name = validate_slug("mcp server", &req.name)?;
-        let (command, url) = validate_mcp_transport(req.transport, &req.command, &req.url, is_admin)?;
+        let (command, url) =
+            validate_mcp_transport(req.transport, &req.command, &req.url, is_admin)?;
         let args = validate_args(req.args)?;
         let env_keys = validate_env_keys(&req.env_keys)?;
         let description = validate_description(&req.description)?;
@@ -729,7 +728,9 @@ impl HubStore {
         let idx = guard
             .mcp_servers
             .iter()
-            .position(|s| &s.space_id == space_id && s.id == id && s.is_visible_to(caller, is_admin))
+            .position(|s| {
+                &s.space_id == space_id && s.id == id && s.is_visible_to(caller, is_admin)
+            })
             .ok_or_else(|| CoreError::NotFound(format!("mcp server {id}")))?;
         let mut updated = guard.mcp_servers[idx].clone();
 
@@ -837,7 +838,10 @@ impl HubStore {
                 if resolve_command_on_path(cmd).is_some() {
                     (true, "executable ready".into())
                 } else {
-                    (false, format!("command `{cmd}` not found or not executable"))
+                    (
+                        false,
+                        format!("command `{cmd}` not found or not executable"),
+                    )
                 }
             }
             McpTransport::Sse | McpTransport::StreamableHttp => {
@@ -1123,7 +1127,10 @@ impl HubStore {
             &sk.space_id == space_id
                 && sk.scope == HubScopeLevel::Space
                 && sk.enabled
-                && !matches!(sk.lifecycle, SkillLifecycle::Draft | SkillLifecycle::Archived)
+                && !matches!(
+                    sk.lifecycle,
+                    SkillLifecycle::Draft | SkillLifecycle::Archived
+                )
         }) {
             merged_skills.insert(
                 sk.name.to_ascii_lowercase(),
@@ -1142,7 +1149,10 @@ impl HubStore {
                 let key = sk.name.to_ascii_lowercase();
                 let had_space = merged_skills.contains_key(&key);
                 if sk.enabled
-                    && !matches!(sk.lifecycle, SkillLifecycle::Draft | SkillLifecycle::Archived)
+                    && !matches!(
+                        sk.lifecycle,
+                        SkillLifecycle::Draft | SkillLifecycle::Archived
+                    )
                 {
                     merged_skills.insert(
                         key,
@@ -1295,7 +1305,11 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(store.delete_mcp(&space, &alice_mcp.id, &bob, false).is_err());
+        assert!(
+            store
+                .delete_mcp(&space, &alice_mcp.id, &bob, false)
+                .is_err()
+        );
 
         // Sensitive env_keys (KEY=VALUE, OM_TOKEN, LD_PRELOAD, OPENAI_API_KEY) are rejected
         for bad_key in [
@@ -1349,10 +1363,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            store
-                .effective(&space, &alice, Some(&ws))
-                .skills
-                .is_empty(),
+            store.effective(&space, &alice, Some(&ws)).skills.is_empty(),
             "Draft skill must not appear in effective hub"
         );
         let active_skill = store
@@ -1400,13 +1411,17 @@ mod tests {
         );
         let admin_list = reloaded.list_mcp(&space, &admin, true, None, None);
         assert!(
-            admin_list.iter().any(|s| s.id == space_mcp.id && !s.global_available),
+            admin_list
+                .iter()
+                .any(|s| s.id == space_mcp.id && !s.global_available),
             "admin must still see unpublished Space MCP to manage it"
         );
         let eff_alice_after = reloaded.effective(&space, &alice, Some(&ws));
         assert!(!eff_alice_after.mcp_servers[0].overridden_space_default);
 
-        let probe = reloaded.probe_mcp(&space, &alice_mcp.id, &alice, false).unwrap();
+        let probe = reloaded
+            .probe_mcp(&space, &alice_mcp.id, &alice, false)
+            .unwrap();
         assert!(probe.reachable);
         assert!(
             !probe.detail.contains("/bin/sh"),

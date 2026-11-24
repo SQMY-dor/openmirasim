@@ -3,7 +3,7 @@
 use super::{Db, enum_str, parse_enum, storage};
 use om_core::approval::ApprovalOptionKind;
 use om_core::ids::{MemberId, SessionId, SpaceId};
-use om_core::{CoreResult, now_ms};
+use om_core::{CoreError, CoreResult, now_ms};
 use rusqlite::{Connection, params};
 
 /// One row of `audit_logs`.

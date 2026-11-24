@@ -515,11 +515,21 @@ impl Orchestrator {
             .native_session_id
             .clone()
             .filter(|_| harness.capabilities().resume);
+        let created_by = self
+            .db
+            .list_events(&summary.id, 0, 1)
+            .await
+            .ok()
+            .and_then(|page| page.events.into_iter().next())
+            .and_then(|ev| match ev.payload {
+                EventPayload::SessionCreated { created_by, .. } => created_by,
+                _ => None,
+            });
         self.spawn_actor(
             ActorSpec {
                 session_id: summary.id.clone(),
                 config: summary.config.clone(),
-                created_by: summary.created_by.clone(),
+                created_by,
                 status: summary.status,
                 resume_native_session_id: resume,
                 harness,

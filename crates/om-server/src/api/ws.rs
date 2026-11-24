@@ -109,12 +109,7 @@ async fn send_control(tx: &mpsc::Sender<ServerMessage>, msg: ServerMessage) -> b
         .is_ok_and(|r| r.is_ok())
 }
 
-async fn handle_socket(
-    socket: WebSocket,
-    state: AppState,
-    auth: Auth,
-    mut principal: Principal,
-) {
+async fn handle_socket(socket: WebSocket, state: AppState, auth: Auth, mut principal: Principal) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ServerMessage>(WS_CONTROL_QUEUE_CAPACITY);
     let (evt_tx, mut evt_rx) = mpsc::channel::<ServerMessage>(WS_EVENT_QUEUE_CAPACITY);

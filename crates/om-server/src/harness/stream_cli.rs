@@ -374,8 +374,7 @@ async fn run_cli_turn<A: StreamCliAdapter>(
                             tail.clear();
                             &chunk[n - MAX_STDERR_TAIL_BYTES..n]
                         } else {
-                            let excess =
-                                (tail.len() + n).saturating_sub(MAX_STDERR_TAIL_BYTES);
+                            let excess = (tail.len() + n).saturating_sub(MAX_STDERR_TAIL_BYTES);
                             if excess > 0 {
                                 tail.drain(..excess);
                             }
@@ -503,7 +502,9 @@ async fn run_cli_turn<A: StreamCliAdapter>(
             error = Some("agent emitted an oversized output line".into());
         }
     }
-    state.emit(HarnessEvent::TurnEnded { stop_reason, error }).await;
+    state
+        .emit(HarnessEvent::TurnEnded { stop_reason, error })
+        .await;
 }
 
 #[async_trait]

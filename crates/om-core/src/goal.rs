@@ -113,7 +113,8 @@ impl Goal {
         for raw in reply.lines() {
             let trimmed = raw.trim();
             if let Some(ch) = fence {
-                if trimmed.starts_with(ch) && trimmed.chars().take_while(|&c| c == ch).count() >= 3 {
+                if trimmed.starts_with(ch) && trimmed.chars().take_while(|&c| c == ch).count() >= 3
+                {
                     fence = None;
                 }
                 continue;

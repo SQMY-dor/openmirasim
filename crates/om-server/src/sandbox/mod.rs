@@ -386,9 +386,8 @@ impl Sandbox for BwrapSandbox {
         let mut seen = BTreeSet::new();
         for p in &spec.writable_paths {
             let s = absolute(p, "writable path")?;
-            let meta = std::fs::symlink_metadata(p).map_err(|_| {
-                CoreError::Sandbox(format!("writable path does not exist: {s}"))
-            })?;
+            let meta = std::fs::symlink_metadata(p)
+                .map_err(|_| CoreError::Sandbox(format!("writable path does not exist: {s}")))?;
             if meta.file_type().is_symlink() {
                 return Err(CoreError::Sandbox(format!(
                     "writable path must not be a symlink: {s}"
@@ -426,16 +425,11 @@ impl Sandbox for BwrapSandbox {
             let Ok(meta) = std::fs::symlink_metadata(p) else {
                 // Nothing to expose; but an overlay meant to protect part of a writable
                 // bind (or private home) must exist, or the path underneath would stay writable.
-                if spec
-                    .writable_paths
-                    .iter()
-                    .chain(spec.home.iter())
-                    .any(|w| {
-                        lexical(p)
-                            .zip(lexical(w))
-                            .is_some_and(|(p, w)| p.starts_with(w))
-                    })
-                {
+                if spec.writable_paths.iter().chain(spec.home.iter()).any(|w| {
+                    lexical(p)
+                        .zip(lexical(w))
+                        .is_some_and(|(p, w)| p.starts_with(w))
+                }) {
                     return Err(CoreError::Sandbox(format!(
                         "read-only overlay does not exist: {s}"
                     )));
@@ -457,9 +451,7 @@ impl Sandbox for BwrapSandbox {
 
         // Make sure the agent binary itself (and its symlink target) is visible.
         let program = self.resolve_program(&cmd.program, env.get("PATH").map(String::as_str))?;
-        let real_program = program
-            .canonicalize()
-            .unwrap_or_else(|_| program.clone());
+        let real_program = program.canonicalize().unwrap_or_else(|_| program.clone());
         if !self.is_covered(&program, &exposed) || !self.is_covered(&real_program, &exposed) {
             for b in program_binds(&program) {
                 if !self.is_covered(&b, &exposed) {

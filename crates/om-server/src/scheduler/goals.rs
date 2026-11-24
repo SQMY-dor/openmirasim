@@ -164,12 +164,7 @@ impl GoalRunner {
                 return Err(e);
             }
         };
-        let sub = match self
-            .inner
-            .orch
-            .subscribe(session_id, current_head)
-            .await
-        {
+        let sub = match self.inner.orch.subscribe(session_id, current_head).await {
             Ok(s) => s,
             Err(e) => {
                 self.end(&goal.id, GoalStatus::Failed, "subscribe_failed", None)
@@ -359,7 +354,8 @@ impl GoalRunner {
         let deadline = match goal.deadline_at {
             Some(d) => {
                 let left = d.saturating_sub(now_ms()).max(0) as u64;
-                match tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(left))
+                match tokio::time::Instant::now()
+                    .checked_add(std::time::Duration::from_millis(left))
                 {
                     Some(at) => Some(at),
                     None => {
@@ -464,9 +460,7 @@ impl GoalRunner {
                     if reply.len() + text.len() > MAX_REPLY_BYTES {
                         // Keep the tail so the completion marker at the end of a long
                         // response is still observed while bounding host RAM.
-                        let keep_from = reply
-                            .len()
-                            .saturating_sub(MAX_REPLY_BYTES / 2);
+                        let keep_from = reply.len().saturating_sub(MAX_REPLY_BYTES / 2);
                         let boundary = reply
                             .char_indices()
                             .find(|(idx, _)| *idx >= keep_from)

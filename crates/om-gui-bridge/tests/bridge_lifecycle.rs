@@ -271,5 +271,8 @@ async fn non_loopback_bind_requires_bridge_token() {
     cfg.bridge_token = None;
 
     let res = GuiBridge::start(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await;
-    assert!(res.is_err(), "non-loopback bind without token must fail closed");
+    assert!(
+        res.is_err(),
+        "non-loopback bind without token must fail closed"
+    );
 }

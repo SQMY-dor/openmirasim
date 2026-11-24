@@ -14,7 +14,6 @@
 use super::GatewayState;
 use super::auth::{authenticate_secret, extract_ws_token};
 use super::validate_ws_origin;
-use crate::auth::Principal;
 use crate::pty::PtyOutput;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
@@ -23,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use om_core::api::{ApiError, ApiErrorCode};
-use om_core::auth::Action;
+use om_core::auth::{Action, Principal};
 use om_core::ids::SessionId;
 use om_core::session::SessionStatus;
 use serde::{Deserialize, Serialize};
@@ -181,12 +180,7 @@ pub(super) async fn ws_pty_handler(
         _ => session.config.cwd.clone(),
     };
 
-    let sandbox = match gw
-        .app
-        .orchestrator
-        .pty_sandbox(&sid, &session.config)
-        .await
-    {
+    let sandbox = match gw.app.orchestrator.pty_sandbox(&sid, &session.config).await {
         Ok(sb) => sb,
         Err(err) => {
             let api = ApiError::from(&err);

@@ -60,9 +60,9 @@ pub(crate) fn is_safe_cli_arg_value(val: &str) -> bool {
     !val.is_empty()
         && val.len() <= 128
         && !val.starts_with('-')
-        && val
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'@'))
+        && val.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
+        })
 }
 
 /// Validates a single URL path segment (e.g. a bridge session ID) against traversal or query injection.

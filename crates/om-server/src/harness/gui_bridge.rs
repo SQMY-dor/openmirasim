@@ -434,7 +434,8 @@ impl Harness for GuiBridgeHarness {
                 "bridge returned an unsafe bridge_session_id".into(),
             ));
         }
-        let validated_takeover_url = validate_takeover_url(&info.takeover_url, &self.config.base_url)?;
+        let validated_takeover_url =
+            validate_takeover_url(&info.takeover_url, &self.config.base_url)?;
 
         let remote_info = RemoteScreenInfo {
             available: true,
@@ -636,10 +637,8 @@ impl HarnessSession for GuiBridgeSession {
         *self
             .active_turn
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ActiveGuiTurn {
-            finished,
-            handle,
-        });
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ActiveGuiTurn { finished, handle });
 
         Ok(())
     }

@@ -235,9 +235,7 @@ pub(crate) fn write_atomic_private_json(path: &std::path::Path, bytes: &[u8]) ->
     }
     let tmp_name = format!(
         ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("store"),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("store"),
         uuid::Uuid::now_v7().simple()
     );
     let tmp = path.with_file_name(tmp_name);
@@ -349,7 +347,10 @@ impl PushStore {
             .user_agent
             .map(|ua| ua.trim().to_string())
             .filter(|ua| !ua.is_empty());
-        if user_agent.as_ref().is_some_and(|ua| ua.len() > MAX_USER_AGENT_LEN) {
+        if user_agent
+            .as_ref()
+            .is_some_and(|ua| ua.len() > MAX_USER_AGENT_LEN)
+        {
             return Err(CoreError::InvalidInput(format!(
                 "user_agent exceeds {MAX_USER_AGENT_LEN} bytes"
             )));

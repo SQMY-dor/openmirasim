@@ -804,11 +804,7 @@ async fn spawn_x11_session(
             let mut vnc_cmd = Command::new("x11vnc");
             apply_minimal_child_env(&mut vnc_cmd);
             vnc_cmd
-                .args([
-                    "-display",
-                    &display,
-                    "-auth",
-                ])
+                .args(["-display", &display, "-auth"])
                 .arg(&xauth_path)
                 .args([
                     "-localhost",
@@ -1304,10 +1300,7 @@ fn apply_takeover_security_headers(mut res: Response) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(
-        header::X_FRAME_OPTIONS,
-        HeaderValue::from_static("DENY"),
-    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -1433,7 +1426,11 @@ async fn takeover_manual_input(
     let text = form.text.trim();
     if text.is_empty() || text.len() > MAX_MANUAL_INPUT_BYTES {
         return apply_takeover_security_headers(
-            (StatusCode::BAD_REQUEST, "Manual input must be 1..=8192 bytes").into_response(),
+            (
+                StatusCode::BAD_REQUEST,
+                "Manual input must be 1..=8192 bytes",
+            )
+                .into_response(),
         );
     }
 

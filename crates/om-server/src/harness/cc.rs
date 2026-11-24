@@ -377,8 +377,7 @@ impl NdjsonTurnParser for ClaudeNdjsonParser {
                         })
                         .filter(|s| !s.is_empty());
                     self.result_error = Some(
-                        errors_joined
-                            .unwrap_or_else(|| "claude returned an error result".into()),
+                        errors_joined.unwrap_or_else(|| "claude returned an error result".into()),
                     );
                 }
             }

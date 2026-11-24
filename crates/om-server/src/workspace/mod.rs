@@ -332,7 +332,11 @@ impl WorkspaceManager {
             [Component::Normal(first), Component::Normal(_)] if *first == "_anonymous"
         ) || matches!(
             comps.as_slice(),
-            [Component::Normal(_), Component::Normal(_), Component::Normal(_)]
+            [
+                Component::Normal(_),
+                Component::Normal(_),
+                Component::Normal(_)
+            ]
         );
         if !is_per_session {
             return;
@@ -655,7 +659,11 @@ impl WorkspaceManager {
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| CoreError::Workspace("corrupt session git alternates file".into()))?;
         let expected_objects = expected_common_dir.map(|c| Path::new(c).join("objects"));
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        for line in text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
             if let Some(ref exp) = expected_objects {
                 let p = Path::new(line);
                 let canon_line = p.canonicalize().ok();
@@ -760,11 +768,12 @@ impl WorkspaceManager {
         // Never invoke unsandboxed `git diff --no-index` on untracked paths (which follows
         // intermediate directory symlinks and can block on FIFOs). Read each file strictly
         // via component-wise `O_NOFOLLOW` + `O_NONBLOCK` and render the unified diff in-process.
+        let initial_len = patch.len();
         let (extra_patch, extra_truncated, extra_files) = tokio::task::spawn_blocking(move || {
             let mut out_patch = Vec::new();
             let mut out_truncated = truncated;
             let mut out_files = Vec::with_capacity(untracked.len());
-            let mut used = patch.len();
+            let mut used = initial_len;
             for path in untracked {
                 if out_truncated || used >= max {
                     if used >= max {
@@ -976,9 +985,7 @@ fn format_untracked_patch(path: &str, bytes: &[u8], file_truncated: bool) -> Vec
         return out;
     }
     if bytes.contains(&0) {
-        out.extend_from_slice(
-            format!("Binary files /dev/null and b/{path} differ\n").as_bytes(),
-        );
+        out.extend_from_slice(format!("Binary files /dev/null and b/{path} differ\n").as_bytes());
         return out;
     }
     let text = String::from_utf8_lossy(bytes);
@@ -989,9 +996,7 @@ fn format_untracked_patch(path: &str, bytes: &[u8], file_truncated: bool) -> Vec
     } else {
         format!("1,{count}")
     };
-    out.extend_from_slice(
-        format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +{range} @@\n").as_bytes(),
-    );
+    out.extend_from_slice(format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +{range} @@\n").as_bytes());
     for line in &lines {
         out.push(b'+');
         out.extend_from_slice(line.as_bytes());

@@ -365,13 +365,14 @@ pub(super) fn validate_ws_origin(
     {
         return Ok(());
     }
-    let parsed_origin = reqwest::Url::parse(origin)
-        .map_err(|_| "malformed WebSocket Origin header".to_string())?;
+    let parsed_origin =
+        reqwest::Url::parse(origin).map_err(|_| "malformed WebSocket Origin header".to_string())?;
     let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return Err("missing Host header for WebSocket Origin check".into());
     };
-    let host_url = reqwest::Url::parse(&format!("{}://{}", parsed_origin.scheme(), host_hdr.trim()))
-        .map_err(|_| "malformed Host header".to_string())?;
+    let host_url =
+        reqwest::Url::parse(&format!("{}://{}", parsed_origin.scheme(), host_hdr.trim()))
+            .map_err(|_| "malformed Host header".to_string())?;
     if parsed_origin.host_str() == host_url.host_str()
         && parsed_origin.port_or_known_default() == host_url.port_or_known_default()
     {
@@ -716,7 +717,7 @@ async fn remove_worktree(
     let sid = SessionId::from(id);
     ensure_session_in_space(&gw, &principal, &sid).await?;
     if gw.app.orchestrator.is_session_live(&sid) || gw.pty.is_active(&sid) {
-        return Err(HttpApiError::from(CoreError::Conflict(
+        return Err(HttpApiError::from(CoreError::InvalidInput(
             "cannot remove worktree while the session or PTY is still active; close it first"
                 .into(),
         )));
@@ -1221,22 +1222,22 @@ async fn get_pty_recording(
         const CHUNK_SIZE: usize = 64 * 1024;
         const MAX_STREAM_BYTES: u64 = crate::pty::cast::DEFAULT_MAX_CAST_BYTES;
         let Some(mut file) = file_opt else {
-            return Ok(None);
+            return Ok::<_, std::io::Error>(None);
         };
         if sent >= MAX_STREAM_BYTES {
             return Ok(None);
         }
         let to_read = (MAX_STREAM_BYTES - sent).min(CHUNK_SIZE as u64) as usize;
-        let res = tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
-            use std::io::Read;
-            let mut buf = vec![0u8; to_read];
-            let n = file.read(&mut buf)?;
-            buf.truncate(n);
-            Ok((file, buf))
-        })
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))??;
-        let (file, buf) = res;
+        let (file, buf) =
+            tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
+                use std::io::Read;
+                let mut buf = vec![0u8; to_read];
+                let n = file.read(&mut buf)?;
+                buf.truncate(n);
+                Ok((file, buf))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))??;
         if buf.is_empty() {
             Ok(None)
         } else {
