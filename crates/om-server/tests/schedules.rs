@@ -600,7 +600,7 @@ async fn background_loop_fires_on_time() {
 async fn editing_a_schedule_makes_the_editor_its_stored_owner() {
     let f = fixture().await;
     let bob =
-        f.db.create_member(&f.space, "bob", Role::Member, None)
+        f.db.create_member(&f.space, "bob", Role::Admin, None)
             .await
             .unwrap()
             .id;
@@ -675,6 +675,20 @@ async fn failed_new_session_runs_close_their_session_and_changes_need_rights() {
             .id;
     assert!(matches!(
         f.sched.set_enabled(&s.id, &bob, false).await,
+        Err(om_core::CoreError::Forbidden(_))
+    ));
+    assert!(matches!(
+        f.sched
+            .update(
+                &s.id,
+                &bob,
+                new_schedule("hijack", every_minute(1_000), new_session_target("hold", "x")),
+            )
+            .await,
+        Err(om_core::CoreError::Forbidden(_))
+    ));
+    assert!(matches!(
+        f.sched.trigger(&s.id, &bob).await,
         Err(om_core::CoreError::Forbidden(_))
     ));
     assert!(matches!(

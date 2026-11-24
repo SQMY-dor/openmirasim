@@ -23,7 +23,7 @@ use crate::approval::{ApprovalDecision, ApprovalOption};
 use crate::content::{ContentBlock, Prompt};
 use crate::error::{CoreError, CoreResult};
 use crate::event::{PlanEntry, ToolCallInfo, ToolCallUpdate, ToolKind};
-use crate::ids::SessionId;
+use crate::ids::{MemberId, SessionId};
 use crate::sandbox::Sandbox;
 use crate::session::{SessionConfig, StopReason};
 use async_trait::async_trait;
@@ -93,6 +93,8 @@ pub type HarnessEventStream = Pin<Box<dyn Stream<Item = HarnessEvent> + Send + '
 pub struct StartContext {
     pub session_id: SessionId,
     pub config: SessionConfig,
+    /// Member who created the session (when known), used for per-member isolation.
+    pub created_by: Option<MemberId>,
     /// Resume this native session instead of creating a new one.
     pub resume_native_session_id: Option<String>,
     /// Wraps the agent process according to `config.sandbox`.

@@ -12,7 +12,7 @@ use om_core::approval::{ApprovalDecision, ApprovalRecord, ApprovalStatus};
 use om_core::content::Prompt;
 use om_core::event::{EventPayload, SessionEvent, ToolKind};
 use om_core::harness::HarnessCapabilities;
-use om_core::harness::{Harness, HarnessEvent, HarnessEventStream, HarnessSession, StartContext};
+use om_core::harness::{Harness, HarnessEvent, HarnessSession, StartContext};
 use om_core::ids::{ApprovalId, MemberId, QueuedPromptId, SessionId, TurnId};
 use om_core::queue::{MAX_QUEUED_PROMPTS, QueueRemoval, QueuedPrompt, SubmitMode, SubmitOutcome};
 use om_core::sandbox::Sandbox;
@@ -73,6 +73,7 @@ pub(crate) enum Command {
 pub(crate) struct ActorSpec {
     pub session_id: SessionId,
     pub config: SessionConfig,
+    pub created_by: Option<MemberId>,
     pub status: SessionStatus,
     pub resume_native_session_id: Option<String>,
     pub harness: Arc<dyn Harness>,
@@ -416,11 +417,13 @@ impl Actor {
             .ok_or_else(|| CoreError::NotFound(format!("queued prompt {queued_id}")))?;
         let to = position.min(self.queue.len() - 1);
         if i != to {
-            let item = self.queue.remove(i).expect("index checked");
-            self.queue.insert(to, item);
-            let order = self.queue.iter().map(|q| q.id.clone()).collect();
+            let mut next_queue = self.queue.clone();
+            let item = next_queue.remove(i).expect("index checked");
+            next_queue.insert(to, item);
+            let order = next_queue.iter().map(|q| q.id.clone()).collect();
             self.append(vec![EventPayload::QueueReordered { order }])
                 .await?;
+            self.queue = next_queue;
         }
         Ok(self.queue.iter().cloned().collect())
     }
@@ -711,6 +714,10 @@ impl Actor {
             });
         }
         payloads.extend(self.drop_queue_payloads());
+        if self.paused {
+            self.paused = false;
+            payloads.push(EventPayload::QueuePaused { paused: false });
+        }
         payloads.extend(self.status_change(SessionStatus::Closed));
         self.append(payloads).await?;
         Ok(())
@@ -743,10 +750,12 @@ impl Actor {
                 }
             }
             HarnessEvent::ToolCall(tool_call) => {
-                self.tool_calls.insert(
-                    tool_call.tool_call_id.clone(),
-                    (tool_call.kind, tool_call.locations.clone()),
-                );
+                if self.tool_calls.len() < 1024 {
+                    self.tool_calls.insert(
+                        tool_call.tool_call_id.clone(),
+                        (tool_call.kind, tool_call.locations.clone()),
+                    );
+                }
                 if let Some(p) = turn_payload(&|turn_id| EventPayload::ToolCall {
                     turn_id,
                     tool_call: tool_call.clone(),
@@ -783,6 +792,7 @@ impl Actor {
             }
             HarnessEvent::TurnEnded { stop_reason, error } => {
                 self.cancel_pending_approvals().await;
+                self.tool_calls.clear();
                 let mut payloads = Vec::new();
                 if let Some(turn_id) = self.turn.take() {
                     payloads.push(EventPayload::TurnEnded {
@@ -810,6 +820,7 @@ impl Actor {
 
     async fn on_harness_gone(&mut self, error: Option<String>) {
         self.session = None;
+        self.tool_calls.clear();
         self.cancel_pending_approvals().await;
         let mut payloads = Vec::new();
         if let Some(turn_id) = self.turn.take() {
@@ -823,10 +834,24 @@ impl Actor {
             message: error.unwrap_or_else(|| "agent process exited".into()),
         });
         payloads.extend(self.drop_queue_payloads());
+        if self.paused {
+            self.paused = false;
+            payloads.push(EventPayload::QueuePaused { paused: false });
+        }
         if !self.status.is_terminal() {
             payloads.extend(self.status_change(SessionStatus::Failed));
         }
         self.record(payloads).await;
+    }
+}
+
+struct ExitGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for ExitGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
     }
 }
 
@@ -838,6 +863,8 @@ pub(crate) async fn run(
     mut commands: mpsc::Receiver<Command>,
     on_exit: impl FnOnce() + Send + 'static,
 ) {
+    // Always revoke KeyProxy grant and remove live slot, even on panic or cancellation.
+    let _exit_guard = ExitGuard(Some(on_exit));
     let mut actor = Actor {
         db,
         hub,
@@ -856,12 +883,41 @@ pub(crate) async fn run(
         paused: false,
     };
 
+    // Move non-Starting sessions into Starting before racing `harness.start` against
+    // `Command::Close`, so abandoning startup never leaves DB status out of sync with
+    // `actor.status`.
+    if actor.status != SessionStatus::Starting {
+        let from = actor.status;
+        if let Err(e) = actor
+            .append(vec![EventPayload::StatusChanged {
+                from,
+                to: SessionStatus::Starting,
+            }])
+            .await
+        {
+            tracing::warn!(session = %actor.id, error = %e, "could not transition to Starting");
+            commands.close();
+            while let Some(cmd) = commands.recv().await {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            return;
+        }
+    }
+
     // Starting can take a while (handshake timeouts): keep answering `Close` meanwhile
-    // (review P2-5). Other commands wait until the agent is up.
+    // (review P2-5). Other commands wait (bounded) until the agent is up.
+    const MAX_STARTUP_BUFFERED: usize = 64;
     let mut buffered = Vec::new();
     let mut close_reply = None;
-    let started = {
-        let start = start_harness(&mut actor, &spec);
+    let start_ctx = StartContext {
+        session_id: spec.session_id.clone(),
+        config: spec.config.clone(),
+        created_by: spec.created_by.clone(),
+        resume_native_session_id: spec.resume_native_session_id.clone(),
+        sandbox: spec.sandbox.clone(),
+    };
+    let start_result = {
+        let start = spec.harness.start(start_ctx);
         tokio::pin!(start);
         loop {
             tokio::select! {
@@ -871,20 +927,67 @@ pub(crate) async fn run(
                         close_reply = Some(reply);
                         break None;
                     }
-                    Some(other) => buffered.push(other),
+                    Some(other) => {
+                        if buffered.len() < MAX_STARTUP_BUFFERED {
+                            buffered.push(other);
+                        } else {
+                            reject(
+                                other,
+                                CoreError::LimitExceeded(
+                                    "too many commands queued while session is starting".into(),
+                                ),
+                            );
+                        }
+                    }
                     None => break None,
                 },
             }
         }
     };
-    let mut events = match started {
-        Some(Some(events)) => events,
-        Some(None) | None => {
-            if let Some(reply) = close_reply {
-                // The start was abandoned (dropping it stops the agent).
-                let _ = reply.send(actor.on_close().await);
+    let mut events = match start_result {
+        Some(Ok(started)) => {
+            let native = started.session.native_session_id();
+            actor.session = Some(started.session);
+            if let Err(e) = actor
+                .append(vec![
+                    EventPayload::HarnessReady {
+                        capabilities: spec.harness.capabilities(),
+                        native_session_id: native,
+                    },
+                    EventPayload::StatusChanged {
+                        from: SessionStatus::Starting,
+                        to: SessionStatus::Idle,
+                    },
+                ])
+                .await
+            {
+                tracing::error!(session = %actor.id, error = %e, "failed to persist HarnessReady");
+                if let Some(s) = actor.session.take() {
+                    let _ = s.shutdown().await;
+                }
+                commands.close();
+                for cmd in buffered {
+                    reject(cmd, CoreError::Harness("harness failed to start".into()));
+                }
+                while let Some(cmd) = commands.recv().await {
+                    reject(cmd, CoreError::Harness("harness failed to start".into()));
+                }
+                return;
             }
-            // Fail queued commands so callers do not hang.
+            started.events
+        }
+        Some(Err(e)) => {
+            actor
+                .record(vec![
+                    EventPayload::Error {
+                        message: format!("failed to start harness `{}`: {e}", spec.harness.id()),
+                    },
+                    EventPayload::StatusChanged {
+                        from: SessionStatus::Starting,
+                        to: SessionStatus::Failed,
+                    },
+                ])
+                .await;
             commands.close();
             for cmd in buffered {
                 reject(cmd, CoreError::Harness("harness failed to start".into()));
@@ -892,7 +995,25 @@ pub(crate) async fn run(
             while let Some(cmd) = commands.recv().await {
                 reject(cmd, CoreError::Harness("harness failed to start".into()));
             }
-            on_exit();
+            return;
+        }
+        None => {
+            if let Some(reply) = close_reply {
+                // Refresh from DB defensively in case a write already committed.
+                if let Ok(s) = actor.db.get_session(&actor.id).await {
+                    actor.status = s.status;
+                }
+                let _ = reply.send(actor.on_close().await);
+            } else if let Some(s) = actor.session.take() {
+                let _ = s.shutdown().await;
+            }
+            commands.close();
+            for cmd in buffered {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
+            while let Some(cmd) = commands.recv().await {
+                reject(cmd, CoreError::Harness("harness failed to start".into()));
+            }
             return;
         }
     };
@@ -908,7 +1029,6 @@ pub(crate) async fn run(
                     CoreError::InvalidInput("session is no longer running".into()),
                 );
             }
-            on_exit();
             return;
         }
     }
@@ -951,57 +1071,6 @@ pub(crate) async fn run(
             cmd,
             CoreError::InvalidInput("session is no longer running".into()),
         );
-    }
-    on_exit();
-}
-
-async fn start_harness(actor: &mut Actor, spec: &ActorSpec) -> Option<HarnessEventStream> {
-    if actor.status == SessionStatus::Failed {
-        actor
-            .record(vec![EventPayload::StatusChanged {
-                from: SessionStatus::Failed,
-                to: SessionStatus::Starting,
-            }])
-            .await;
-    }
-    let ctx = StartContext {
-        session_id: spec.session_id.clone(),
-        config: spec.config.clone(),
-        resume_native_session_id: spec.resume_native_session_id.clone(),
-        sandbox: spec.sandbox.clone(),
-    };
-    match spec.harness.start(ctx).await {
-        Ok(started) => {
-            let native = started.session.native_session_id();
-            actor.session = Some(started.session);
-            actor
-                .record(vec![
-                    EventPayload::HarnessReady {
-                        capabilities: spec.harness.capabilities(),
-                        native_session_id: native,
-                    },
-                    EventPayload::StatusChanged {
-                        from: SessionStatus::Starting,
-                        to: SessionStatus::Idle,
-                    },
-                ])
-                .await;
-            Some(started.events)
-        }
-        Err(e) => {
-            actor
-                .record(vec![
-                    EventPayload::Error {
-                        message: format!("failed to start harness `{}`: {e}", spec.harness.id()),
-                    },
-                    EventPayload::StatusChanged {
-                        from: SessionStatus::Starting,
-                        to: SessionStatus::Failed,
-                    },
-                ])
-                .await;
-            None
-        }
     }
 }
 

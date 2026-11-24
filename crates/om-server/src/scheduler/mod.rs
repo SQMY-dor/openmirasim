@@ -64,9 +64,9 @@ struct Inner {
     wake: Notify,
     stopped: AtomicBool,
     ready_timeout: Duration,
-    /// Schedules with a `NewSession` fire in progress (review P1-12): the overlap check
-    /// cannot rely on the recorded run, which only exists once the fire finishes.
-    starting: std::sync::Mutex<std::collections::HashSet<ScheduleId>>,
+    /// Schedules with a `NewSession` fire in progress (refcounted so concurrent
+    /// `OverlapPolicy::Allow` fires do not clear each other's mark early).
+    starting: std::sync::Mutex<std::collections::HashMap<ScheduleId, usize>>,
     /// Bounds fires running at once.
     fire_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -74,16 +74,24 @@ struct Inner {
 /// Fires running at once across all schedules; more wait for a slot.
 pub const MAX_CONCURRENT_FIRES: usize = 8;
 
-/// Marks a schedule as starting a session until dropped.
+/// Marks a schedule as starting a session until dropped (refcounted).
 struct StartingGuard<'a> {
-    set: &'a std::sync::Mutex<std::collections::HashSet<ScheduleId>>,
+    map: &'a std::sync::Mutex<std::collections::HashMap<ScheduleId, usize>>,
     id: ScheduleId,
 }
 
 impl Drop for StartingGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.set.lock() {
-            s.remove(&self.id);
+        let mut m = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = m.get_mut(&self.id) {
+            if *count <= 1 {
+                m.remove(&self.id);
+            } else {
+                *count -= 1;
+            }
         }
     }
 }
@@ -139,11 +147,13 @@ impl Scheduler {
             updated_at: now,
         };
         let s = self.db().create_schedule(s).await?;
+        self.audit(by, "schedule.created", &s).await;
         self.inner.wake.notify_one();
         Ok(s)
     }
 
-    /// Replaces a schedule's definition. The editor becomes its owner.
+    /// Replaces a schedule's definition. `by` must be the schedule's owner or an admin
+    /// of its space, and becomes its stored owner.
     pub async fn update(
         &self,
         id: &ScheduleId,
@@ -152,6 +162,7 @@ impl Scheduler {
     ) -> CoreResult<Schedule> {
         new.validate()?;
         let old = self.schedule_for(id, by).await?;
+        self.check_manages(&old, by).await?;
         self.check_owner(&old.space_id, by, &new.target).await?;
         let now = now_ms();
         let next_run_at = Self::first_fire(&new, now)?;
@@ -168,6 +179,7 @@ impl Scheduler {
             ..old
         };
         let s = self.db().update_schedule(s).await?;
+        self.audit(by, "schedule.updated", &s).await;
         self.inner.wake.notify_one();
         Ok(s)
     }
@@ -191,15 +203,7 @@ impl Scheduler {
             return Ok(old);
         }
         let now = now_ms();
-        let next = if enabled {
-            old.spec.next_after(now)
-        } else {
-            None
-        };
-        let s = self
-            .db()
-            .set_schedule_enabled(id, enabled, next, now)
-            .await?;
+        let s = self.db().set_schedule_enabled(id, enabled, now).await?;
         self.audit(
             by,
             if enabled {
@@ -277,10 +281,19 @@ impl Scheduler {
     }
 
     /// Fires a schedule now, outside its timetable, without moving its next slot. `by`
-    /// must be allowed to do what the schedule does; the run still acts as the owner.
+    /// must be the schedule's owner or an admin and allowed to do what the schedule does.
     pub async fn trigger(&self, id: &ScheduleId, by: &MemberId) -> CoreResult<ScheduleRun> {
         let s = self.schedule_for(id, by).await?;
+        self.check_manages(&s, by).await?;
         self.check_owner(&s.space_id, by, &s.target).await?;
+        let _slot = self
+            .inner
+            .fire_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CoreError::Harness("scheduler is shut down".into()))?;
+        self.audit(by, "schedule.triggered", &s).await;
         let now = now_ms();
         Ok(self.fire(s, now, true).await)
     }
@@ -328,12 +341,17 @@ impl Scheduler {
         let this = self.clone();
         tokio::spawn(async move {
             while !this.inner.stopped.load(Ordering::SeqCst) {
-                if let Err(e) = this.tick(now_ms()).await {
-                    tracing::warn!(error = %e, "schedule tick failed");
-                }
+                let tick_failed = match this.tick(now_ms()).await {
+                    Ok(_) => false,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "schedule tick failed");
+                        true
+                    }
+                };
                 let now = now_ms();
+                let min_wait = if tick_failed { 1_000 } else { 0 };
                 let wait = match this.db().next_schedule_due().await {
-                    Ok(Some(at)) => (at - now).clamp(0, MAX_SLEEP_MS),
+                    Ok(Some(at)) => (at - now).clamp(min_wait, MAX_SLEEP_MS),
                     Ok(None) => MAX_SLEEP_MS,
                     Err(e) => {
                         tracing::warn!(error = %e, "reading next schedule failed");
@@ -410,7 +428,40 @@ impl Scheduler {
     }
 
     async fn fire(&self, s: Schedule, slot: i64, manual: bool) -> ScheduleRun {
-        let outcome = self.outcome(&s).await;
+        // Hold the refcounted starting guard across `outcome()` AND `self.record(run)` so
+        // a concurrent `OverlapPolicy::Skip` fire cannot sneak in between creating the
+        // session and persisting the `schedule_runs` row.
+        let mut _starting = None;
+        let outcome = if matches!(s.target, ScheduleTarget::NewSession { .. }) {
+            let guard = {
+                let mut map = self
+                    .inner
+                    .starting
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let count = map.entry(s.id.clone()).or_insert(0);
+                if *count > 0 && s.overlap == OverlapPolicy::Skip {
+                    None
+                } else {
+                    *count += 1;
+                    Some(StartingGuard {
+                        map: &self.inner.starting,
+                        id: s.id.clone(),
+                    })
+                }
+            };
+            match guard {
+                Some(g) => {
+                    _starting = Some(g);
+                    self.outcome(&s).await
+                }
+                None => RunOutcome::Skipped {
+                    reason: SkipReason::PreviousRunActive,
+                },
+            }
+        } else {
+            self.outcome(&s).await
+        };
         let run = ScheduleRun {
             id: ScheduleRunId::new(),
             schedule_id: s.id.clone(),
@@ -469,22 +520,6 @@ impl Scheduler {
                 }
             }
             ScheduleTarget::NewSession { config, prompt } => {
-                // Claim the "starting" mark first, atomically, so two fires of one
-                // schedule cannot both pass the overlap check.
-                let _starting = {
-                    let mut set = self
-                        .inner
-                        .starting
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !set.insert(s.id.clone()) && s.overlap == OverlapPolicy::Skip {
-                        return skipped(SkipReason::PreviousRunActive);
-                    }
-                    StartingGuard {
-                        set: &self.inner.starting,
-                        id: s.id.clone(),
-                    }
-                };
                 if s.overlap == OverlapPolicy::Skip && self.previous_run_active(&s.id).await {
                     return skipped(SkipReason::PreviousRunActive);
                 }
@@ -528,13 +563,10 @@ impl Scheduler {
     }
 
     async fn previous_run_active(&self, id: &ScheduleId) -> bool {
-        let Ok(Some(prev)) = self.db().last_schedule_session(id).await else {
-            return false;
-        };
-        matches!(
-            self.db().get_session(&prev).await.map(|s| s.status),
-            Ok(SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval)
-        )
+        self.db()
+            .has_active_schedule_session(id)
+            .await
+            .unwrap_or(false)
     }
 }
 

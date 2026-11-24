@@ -173,6 +173,16 @@ impl Db {
     pub async fn approval_rules(&self, session_id: &SessionId) -> CoreResult<Vec<ApprovalRule>> {
         let session_id = session_id.clone();
         self.read(move |conn| {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    [session_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?;
+            if !exists {
+                return Err(CoreError::NotFound(format!("session {session_id}")));
+            }
             let mut stmt = conn
                 .prepare(
                     "SELECT rule_key, allow, option_kind, created_by, created_at
@@ -209,6 +219,16 @@ impl Db {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(storage)?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    [session_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(storage)?;
+            if !exists {
+                return Err(CoreError::NotFound(format!("session {session_id}")));
+            }
             let n = tx
                 .execute(
                     "DELETE FROM approval_rules WHERE session_id = ?1",

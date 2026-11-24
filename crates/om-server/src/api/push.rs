@@ -6,11 +6,16 @@
 use om_core::ids::MemberId;
 use om_core::{CoreError, CoreResult, now_ms};
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const MAX_SUBSCRIPTIONS_PER_MEMBER: usize = 10;
+const MAX_URL_LEN: usize = 2048;
+const MAX_P256DH_LEN: usize = 256;
+const MAX_AUTH_LEN: usize = 128;
+const MAX_USER_AGENT_LEN: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushKeys {
@@ -53,80 +58,208 @@ pub struct ListPushSubscriptionsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushTestResponse {
     pub delivered: usize,
+    #[serde(default)]
+    pub registered: usize,
     pub mode: String,
     pub message: String,
 }
 
-/// Validates a Web Push endpoint URL to prevent SSRF against internal/link-local addresses.
-pub fn validate_push_endpoint(raw: &str, allow_loopback_http: bool) -> CoreResult<String> {
+fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    let is_zero_net = oct[0] == 0;
+    let is_cgnat = oct[0] == 100 && (oct[1] & 0xc0) == 64; // 100.64.0.0/10
+    let is_benchmark = oct[0] == 198 && (oct[1] & 0xfe) == 18; // 198.18.0.0/15
+    let is_reserved = oct[0] >= 240; // 240.0.0.0/4 + 255.255.255.255
+    v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+        || is_zero_net
+        || is_cgnat
+        || is_benchmark
+        || is_reserved
+}
+
+fn is_disallowed_ipv6(v6: Ipv6Addr) -> bool {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return mapped.is_loopback() || is_disallowed_ipv4(mapped);
+    }
+    #[allow(deprecated)]
+    if let Some(compat) = v6.to_ipv4() {
+        return compat.is_loopback() || is_disallowed_ipv4(compat);
+    }
+    let seg0 = v6.segments()[0];
+    let is_unique_local = (seg0 & 0xfe00) == 0xfc00; // fc00::/7
+    let is_link_local = (seg0 & 0xffc0) == 0xfe80; // fe80::/10
+    let is_site_local = (seg0 & 0xffc0) == 0xfec0; // fec0::/10 (deprecated)
+    let is_doc = seg0 == 0x2001 && v6.segments()[1] == 0x0db8; // 2001:db8::/32
+    v6.is_unspecified()
+        || v6.is_multicast()
+        || is_unique_local
+        || is_link_local
+        || is_site_local
+        || is_doc
+}
+
+/// Validates an external HTTP(S) URL against SSRF to loopback, link-local, metadata,
+/// private, CGNAT, or IPv6-mapped internal destinations.
+pub(crate) fn validate_external_url(
+    raw: &str,
+    label: &str,
+    require_https: bool,
+    allow_loopback_http: bool,
+) -> CoreResult<String> {
     let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_URL_LEN {
+        return Err(CoreError::InvalidInput(format!(
+            "{label} must be 1..={MAX_URL_LEN} characters"
+        )));
+    }
     let url = reqwest::Url::parse(trimmed)
-        .map_err(|e| CoreError::InvalidInput(format!("invalid push endpoint URL: {e}")))?;
+        .map_err(|e| CoreError::InvalidInput(format!("invalid {label}: {e}")))?;
 
     let scheme = url.scheme();
     let Some(host) = url.host_str() else {
-        return Err(CoreError::InvalidInput(
-            "push endpoint URL must include a host".into(),
-        ));
+        return Err(CoreError::InvalidInput(format!(
+            "{label} must include a host"
+        )));
     };
 
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(CoreError::InvalidInput(
-            "push endpoint URL must not include embedded credentials".into(),
-        ));
+        return Err(CoreError::InvalidInput(format!(
+            "{label} must not include embedded credentials"
+        )));
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let is_loopback = ip.is_loopback();
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    // Strip any IPv6 zone index (`%25eth0` / `%eth0`) before parsing.
+    let ip_candidate = unbracketed.split('%').next().unwrap_or(unbracketed);
+
+    if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
+        let is_loopback = match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|m| m.is_loopback())
+            }
+        };
         if is_loopback {
             if !allow_loopback_http {
-                return Err(CoreError::InvalidInput(
-                    "loopback push endpoints are disabled".into(),
-                ));
+                return Err(CoreError::InvalidInput(format!(
+                    "loopback {label} destinations are disabled"
+                )));
             }
             if scheme != "http" && scheme != "https" {
-                return Err(CoreError::InvalidInput(
-                    "push endpoint must use https (or loopback http in dev/test)".into(),
-                ));
+                return Err(CoreError::InvalidInput(format!(
+                    "{label} must use http or https"
+                )));
             }
             return Ok(trimmed.to_string());
         }
-        // Reject private, link-local (including cloud metadata 169.254.169.254), unspecified, multicast.
         let disallowed = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-            }
-            IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast() || v6.is_unique_local(),
+            IpAddr::V4(v4) => is_disallowed_ipv4(v4),
+            IpAddr::V6(v6) => is_disallowed_ipv6(v6),
         };
         if disallowed {
-            return Err(CoreError::InvalidInput(
-                "push endpoint IP address is not a public destination".into(),
-            ));
+            return Err(CoreError::InvalidInput(format!(
+                "{label} IP address is not a public destination"
+            )));
         }
-    } else if host.eq_ignore_ascii_case("localhost") {
-        if !allow_loopback_http {
-            return Err(CoreError::InvalidInput(
-                "localhost push endpoints are disabled".into(),
-            ));
+    } else if host.starts_with('[') || host.ends_with(']') {
+        return Err(CoreError::InvalidInput(format!(
+            "invalid IPv6 host in {label}"
+        )));
+    } else {
+        let domain = host.trim_end_matches('.').to_ascii_lowercase();
+        if domain == "localhost" || domain.ends_with(".localhost") {
+            if !allow_loopback_http {
+                return Err(CoreError::InvalidInput(format!(
+                    "localhost {label} destinations are disabled"
+                )));
+            }
+            if scheme != "http" && scheme != "https" {
+                return Err(CoreError::InvalidInput(format!(
+                    "{label} must use http or https"
+                )));
+            }
+            return Ok(trimmed.to_string());
         }
-        if scheme != "http" && scheme != "https" {
-            return Err(CoreError::InvalidInput(
-                "push endpoint must use https".into(),
-            ));
+        if domain.ends_with(".internal")
+            || domain.ends_with(".local")
+            || domain == "metadata"
+            || domain == "metadata.google.internal"
+        {
+            return Err(CoreError::InvalidInput(format!(
+                "{label} host `{domain}` is not a public destination"
+            )));
         }
-        return Ok(trimmed.to_string());
     }
 
-    if scheme != "https" {
-        return Err(CoreError::InvalidInput(
-            "push endpoint URL must use https".into(),
-        ));
+    if require_https {
+        if scheme != "https" {
+            return Err(CoreError::InvalidInput(format!("{label} must use https")));
+        }
+    } else if scheme != "http" && scheme != "https" {
+        return Err(CoreError::InvalidInput(format!(
+            "{label} must use http or https"
+        )));
     }
     Ok(trimmed.to_string())
+}
+
+/// Validates a Web Push endpoint URL to prevent SSRF against internal/link-local addresses.
+pub fn validate_push_endpoint(raw: &str, allow_loopback_http: bool) -> CoreResult<String> {
+    validate_external_url(raw, "push endpoint URL", true, allow_loopback_http)
+}
+
+pub(crate) fn write_atomic_private_json(path: &std::path::Path, bytes: &[u8]) -> CoreResult<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            if !parent.exists() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp_name = format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("store"),
+        uuid::Uuid::now_v7().simple()
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::Io(e));
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::Io(e));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -156,27 +289,23 @@ impl PushStore {
         }
     }
 
-    fn persist_locked(&self, records: &[PushSubscriptionRecord]) {
+    fn persist_snapshot(&self, records: &[PushSubscriptionRecord]) -> CoreResult<()> {
         let Some(path) = &self.file_path else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(records) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, bytes).is_ok() {
-                let _ = std::fs::rename(tmp, path);
-            }
-        }
+        let bytes = serde_json::to_vec_pretty(records)
+            .map_err(|e| CoreError::Storage(format!("serialize push store: {e}")))?;
+        write_atomic_private_json(path, &bytes)
     }
 
     pub fn config_for(&self, member_id: &MemberId) -> PushConfigResponse {
         let count = self
             .inner
             .lock()
-            .map(|list| list.iter().filter(|r| &r.member_id == member_id).count())
-            .unwrap_or(0);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|r| &r.member_id == member_id)
+            .count();
         PushConfigResponse {
             enabled: true,
             vapid_public_key: self.vapid_public_key.clone(),
@@ -184,16 +313,19 @@ impl PushStore {
         }
     }
 
+    /// Returns a member's subscriptions with `keys.auth` redacted.
     pub fn list_for(&self, member_id: &MemberId) -> Vec<PushSubscriptionRecord> {
         self.inner
             .lock()
-            .map(|list| {
-                list.iter()
-                    .filter(|r| &r.member_id == member_id)
-                    .cloned()
-                    .collect()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|r| &r.member_id == member_id)
+            .cloned()
+            .map(|mut rec| {
+                rec.keys.auth.clear();
+                rec
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     pub fn register(
@@ -202,30 +334,51 @@ impl PushStore {
         req: RegisterPushSubscriptionRequest,
     ) -> CoreResult<PushSubscriptionRecord> {
         let endpoint = validate_push_endpoint(&req.endpoint, self.allow_loopback_http)?;
-        if req.keys.p256dh.trim().is_empty() || req.keys.auth.trim().is_empty() {
+        let p256dh = req.keys.p256dh.trim();
+        let auth = req.keys.auth.trim();
+        if p256dh.is_empty()
+            || auth.is_empty()
+            || p256dh.len() > MAX_P256DH_LEN
+            || auth.len() > MAX_AUTH_LEN
+        {
             return Err(CoreError::InvalidInput(
-                "push subscription keys (p256dh, auth) are required".into(),
+                "push subscription keys (p256dh, auth) are required and bounded".into(),
             ));
+        }
+        let user_agent = req
+            .user_agent
+            .map(|ua| ua.trim().to_string())
+            .filter(|ua| !ua.is_empty());
+        if user_agent.as_ref().is_some_and(|ua| ua.len() > MAX_USER_AGENT_LEN) {
+            return Err(CoreError::InvalidInput(format!(
+                "user_agent exceeds {MAX_USER_AGENT_LEN} bytes"
+            )));
         }
 
         let mut list = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = list.clone();
 
         // Upsert by (member_id, endpoint)
-        if let Some(existing) = list
+        if let Some(existing) = next
             .iter_mut()
             .find(|r| &r.member_id == member_id && r.endpoint == endpoint)
         {
-            existing.keys = req.keys;
-            existing.user_agent = req.user_agent;
-            let cloned = existing.clone();
-            self.persist_locked(&list);
-            return Ok(cloned);
+            existing.keys = PushKeys {
+                p256dh: p256dh.to_string(),
+                auth: auth.to_string(),
+            };
+            existing.user_agent = user_agent;
+            let mut returned = existing.clone();
+            self.persist_snapshot(&next)?;
+            *list = next;
+            returned.keys.auth.clear();
+            return Ok(returned);
         }
 
-        let current_count = list.iter().filter(|r| &r.member_id == member_id).count();
+        let current_count = next.iter().filter(|r| &r.member_id == member_id).count();
         if current_count >= MAX_SUBSCRIPTIONS_PER_MEMBER {
             return Err(CoreError::LimitExceeded(format!(
                 "member already has {MAX_SUBSCRIPTIONS_PER_MEMBER} push subscriptions"
@@ -236,13 +389,19 @@ impl PushStore {
             id: format!("push-{}", uuid::Uuid::now_v7()),
             member_id: member_id.clone(),
             endpoint,
-            keys: req.keys,
-            user_agent: req.user_agent,
+            keys: PushKeys {
+                p256dh: p256dh.to_string(),
+                auth: auth.to_string(),
+            },
+            user_agent,
             created_at: now_ms(),
         };
-        list.push(record.clone());
-        self.persist_locked(&list);
-        Ok(record)
+        next.push(record.clone());
+        self.persist_snapshot(&next)?;
+        *list = next;
+        let mut returned = record;
+        returned.keys.auth.clear();
+        Ok(returned)
     }
 
     pub fn delete(&self, member_id: &MemberId, sub_id: &str) -> CoreResult<()> {
@@ -250,12 +409,14 @@ impl PushStore {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = list.len();
-        list.retain(|r| !(&r.member_id == member_id && r.id == sub_id));
-        if list.len() == before {
+        let mut next = list.clone();
+        let before = next.len();
+        next.retain(|r| !(&r.member_id == member_id && r.id == sub_id));
+        if next.len() == before {
             return Err(CoreError::NotFound(format!("push subscription {sub_id}")));
         }
-        self.persist_locked(&list);
+        self.persist_snapshot(&next)?;
+        *list = next;
         Ok(())
     }
 }

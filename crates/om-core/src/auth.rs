@@ -136,11 +136,20 @@ impl DeviceTokenRecord {
 }
 
 /// A freshly issued token. `secret` is returned exactly once and never stored.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct IssuedToken {
     pub token: DeviceTokenRecord,
     pub secret: String,
+}
+
+impl std::fmt::Debug for IssuedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedToken")
+            .field("token", &self.token)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Who a request runs as, resolved from its bearer token.

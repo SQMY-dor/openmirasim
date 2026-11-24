@@ -185,6 +185,10 @@ fn token_detail(token: &DeviceTokenRecord) -> serde_json::Value {
 /// or disablement committed in between cannot be bypassed.
 pub struct Authorize {
     pub actor: MemberId,
+    /// The caller's device token, when authenticated with a DB-backed token (not the
+    /// static bootstrap token). Re-checked inside the write transaction so a just-revoked
+    /// or expired token cannot commit mutations or mint fresh tokens.
+    pub token_id: Option<TokenId>,
     /// `(actor now, target now)`; the target is `None` when the change has none yet.
     #[allow(clippy::type_complexity)]
     pub check: Box<dyn FnOnce(&MemberRecord, Option<&MemberRecord>) -> CoreResult<()> + Send>,
@@ -197,29 +201,74 @@ impl Authorize {
     ) -> Self {
         Self {
             actor,
+            token_id: None,
+            check: Box::new(check),
+        }
+    }
+
+    pub fn with_token(
+        actor: MemberId,
+        token_id: TokenId,
+        check: impl FnOnce(&MemberRecord, Option<&MemberRecord>) -> CoreResult<()> + Send + 'static,
+    ) -> Self {
+        let token_id = if token_id.as_str() == "static-bootstrap" {
+            None
+        } else {
+            Some(token_id)
+        };
+        Self {
+            actor,
+            token_id,
             check: Box::new(check),
         }
     }
 }
 
-/// Runs `auth` against the actor's current row: it must be active and in the target's
-/// space (other spaces look like `NotFound`).
+/// Runs `auth` against the actor's current row (and optional device token): it must be
+/// active, usable, and in the target's space (other spaces look like `NotFound`).
+/// Returns the caller's token expiry ceiling when authenticated via a device token.
 fn authorize_in(
     conn: &Connection,
     auth: Option<Authorize>,
     space: &SpaceId,
     target: Option<&MemberRecord>,
-) -> CoreResult<()> {
+) -> CoreResult<Option<i64>> {
     let Some(auth) = auth else {
-        return Ok(());
+        return Ok(None);
     };
-    let actor = get_member_in(conn, &auth.actor)
-        .map_err(|_| CoreError::Forbidden(format!("member {} is not active", auth.actor)))?;
+    let actor = match get_member_in(conn, &auth.actor) {
+        Ok(m) => m,
+        Err(CoreError::NotFound(_)) => {
+            return Err(CoreError::Forbidden(format!(
+                "member {} is not active",
+                auth.actor
+            )));
+        }
+        Err(e) => return Err(e),
+    };
     if !actor.is_active() {
         return Err(CoreError::Forbidden(format!(
             "member {} is not active",
             auth.actor
         )));
+    }
+    let mut caller_expires_at = None;
+    if let Some(ref tid) = auth.token_id {
+        let tok = match get_token_in(conn, tid) {
+            Ok(t) => t,
+            Err(CoreError::NotFound(_)) => {
+                return Err(CoreError::Unauthenticated(
+                    "token is expired or revoked".into(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if tok.member_id != actor.id || !tok.is_usable(now_ms()) {
+            return Err(CoreError::Unauthenticated(
+                "token is expired or revoked".into(),
+            ));
+        }
+        caller_expires_at = tok.expires_at;
     }
     if &actor.space_id != space {
         return Err(CoreError::NotFound(match target {
@@ -227,7 +276,8 @@ fn authorize_in(
             None => "space".into(),
         }));
     }
-    (auth.check)(&actor, target)
+    (auth.check)(&actor, target)?;
+    Ok(caller_expires_at)
 }
 
 impl Db {
@@ -476,14 +526,20 @@ impl Db {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(storage)?;
             let member = get_member_in(&tx, &member_id)?;
-            authorize_in(&tx, auth, &member.space_id.clone(), Some(&member))?;
+            let caller_exp = authorize_in(&tx, auth, &member.space_id.clone(), Some(&member))?;
+            let effective_expires_at = match (expires_at, caller_exp) {
+                (Some(req_exp), Some(own_exp)) => Some(req_exp.min(own_exp)),
+                (None, Some(own_exp)) => Some(own_exp),
+                (req, None) => req,
+            };
             if let Some(max) = max_live_tokens {
+                let now = now_ms();
                 let live: i64 = tx
                     .query_row(
                         "SELECT COUNT(*) FROM device_tokens
                          WHERE member_id = ?1 AND revoked_at IS NULL
                            AND (expires_at IS NULL OR expires_at > ?2)",
-                        params![member_id.as_str(), now_ms()],
+                        params![member_id.as_str(), now],
                         |r| r.get(0),
                     )
                     .map_err(storage)?;
@@ -492,8 +548,33 @@ impl Db {
                         "member already has {live} live tokens (max {max})"
                     )));
                 }
+                // Cap total stored tokens per member (including revoked/expired) so a
+                // Viewer cannot flood `device_tokens` and `audit_logs` by looping
+                // issue+revoke.
+                let total: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM device_tokens WHERE member_id = ?1",
+                        params![member_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage)?;
+                let max_total = i64::from(max).saturating_mul(10).max(500);
+                if total >= max_total {
+                    // Prune oldest revoked/expired rows first so legitimate rotation keeps working.
+                    tx.execute(
+                        "DELETE FROM device_tokens WHERE id IN (
+                             SELECT id FROM device_tokens
+                             WHERE member_id = ?1
+                               AND (revoked_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?2))
+                             ORDER BY created_at ASC, id ASC
+                             LIMIT 50
+                         )",
+                        params![member_id.as_str(), now],
+                    )
+                    .map_err(storage)?;
+                }
             }
-            let token = insert_token(&tx, &member, &token_hash, &label, expires_at)?;
+            let token = insert_token(&tx, &member, &token_hash, &label, effective_expires_at)?;
             audit::insert(
                 &tx,
                 actor.as_ref(),
@@ -519,7 +600,8 @@ impl Db {
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {TOKEN_COLS} FROM device_tokens WHERE member_id = ?1
-                     ORDER BY created_at DESC, id DESC"
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 500"
                 ))
                 .map_err(storage)?;
             stmt.query_map([member_id.as_str()], token_from_row)

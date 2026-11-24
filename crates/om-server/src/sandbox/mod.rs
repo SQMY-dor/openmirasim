@@ -155,12 +155,10 @@ impl BwrapSandbox {
         }
         if self.config.disable_nested_userns && err.contains("disable-userns") {
             self.config.disable_nested_userns = false;
-            if run(attempt(&self)?).await.is_ok() {
-                tracing::warn!(
-                    "bubblewrap lacks --disable-userns; nested user namespaces stay possible"
-                );
-                return Ok(self);
-            }
+            tracing::warn!(
+                "bubblewrap lacks --disable-userns; nested user namespaces stay possible"
+            );
+            return Box::pin(self.probe()).await;
         }
         Err(CoreError::Sandbox(probe_hint(&err)))
     }
@@ -198,6 +196,7 @@ impl BwrapSandbox {
             .or_else(|| std::env::var("PATH").ok())
             .unwrap_or_default();
         std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(program))
             .find(|c| c.is_file())
             .ok_or_else(|| CoreError::Sandbox(format!("`{program}` not found on PATH")))
@@ -344,12 +343,11 @@ impl Sandbox for BwrapSandbox {
     }
 
     fn wrap(&self, spec: &SandboxSpec, cmd: CommandSpec) -> CoreResult<CommandSpec> {
-        let mut args: Vec<String> = vec![
-            "--die-with-parent".into(),
-            "--new-session".into(),
-            "--unshare-all".into(),
-            "--unshare-user".into(),
-        ];
+        let mut args: Vec<String> = vec!["--die-with-parent".into()];
+        if !spec.keep_session {
+            args.push("--new-session".into());
+        }
+        args.extend(["--unshare-all".into(), "--unshare-user".into()]);
         if self.config.disable_nested_userns {
             args.push("--disable-userns".into());
         }
@@ -372,6 +370,7 @@ impl Sandbox for BwrapSandbox {
         self.system_binds(&mut args);
 
         // Environment: explicit allowlist, never the server's full environment.
+        // Strip host XDG_* paths so agents use the sandbox's private HOME instead.
         let mut env = std::collections::BTreeMap::new();
         for key in &self.config.env_passthrough {
             if let Ok(v) = std::env::var(key) {
@@ -379,14 +378,20 @@ impl Sandbox for BwrapSandbox {
             }
         }
         env.extend(cmd.env.clone());
+        for xdg in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] {
+            env.remove(xdg);
+        }
 
         let mut exposed: Vec<PathBuf> = Vec::new();
         let mut seen = BTreeSet::new();
         for p in &spec.writable_paths {
             let s = absolute(p, "writable path")?;
-            if !p.exists() {
+            let meta = std::fs::symlink_metadata(p).map_err(|_| {
+                CoreError::Sandbox(format!("writable path does not exist: {s}"))
+            })?;
+            if meta.file_type().is_symlink() {
                 return Err(CoreError::Sandbox(format!(
-                    "writable path does not exist: {s}"
+                    "writable path must not be a symlink: {s}"
                 )));
             }
             args.extend(["--bind".into(), s.clone(), s]);
@@ -395,8 +400,12 @@ impl Sandbox for BwrapSandbox {
         let home = match &spec.home {
             Some(h) => {
                 let s = absolute(h, "home")?;
-                if !h.exists() {
-                    return Err(CoreError::Sandbox(format!("home does not exist: {s}")));
+                let meta = std::fs::symlink_metadata(h)
+                    .map_err(|_| CoreError::Sandbox(format!("home does not exist: {s}")))?;
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::Sandbox(format!(
+                        "home must not be a symlink: {s}"
+                    )));
                 }
                 args.extend(["--bind".into(), s.clone(), s.clone()]);
                 exposed.push(h.clone());
@@ -410,22 +419,33 @@ impl Sandbox for BwrapSandbox {
         // Read-only paths go last so they can overlay parts of writable binds
         // (e.g. `.git/config` inside a writable `.git`).
         // Explicit read-only paths are bound with `--ro-bind` (fail closed), never
-        // `--ro-bind-try`.
+        // `--ro-bind-try`, and must never be symlinks (a symlink inside a writable dir
+        // could otherwise trick bwrap into bind-mounting an arbitrary host target).
         for p in &spec.readonly_paths {
             let s = absolute(p, "read-only path")?;
-            if std::fs::symlink_metadata(p).is_err() {
+            let Ok(meta) = std::fs::symlink_metadata(p) else {
                 // Nothing to expose; but an overlay meant to protect part of a writable
-                // bind must exist, or the path underneath would stay writable.
-                if spec.writable_paths.iter().any(|w| {
-                    lexical(p)
-                        .zip(lexical(w))
-                        .is_some_and(|(p, w)| p.starts_with(w))
-                }) {
+                // bind (or private home) must exist, or the path underneath would stay writable.
+                if spec
+                    .writable_paths
+                    .iter()
+                    .chain(spec.home.iter())
+                    .any(|w| {
+                        lexical(p)
+                            .zip(lexical(w))
+                            .is_some_and(|(p, w)| p.starts_with(w))
+                    })
+                {
                     return Err(CoreError::Sandbox(format!(
                         "read-only overlay does not exist: {s}"
                     )));
                 }
                 continue;
+            };
+            if meta.file_type().is_symlink() {
+                return Err(CoreError::Sandbox(format!(
+                    "read-only path must not be a symlink: {s}"
+                )));
             }
             if seen.insert(s.clone()) {
                 args.extend(["--ro-bind".into(), s.clone(), s]);
@@ -435,9 +455,12 @@ impl Sandbox for BwrapSandbox {
         env.insert("HOME".into(), home);
         env.insert("TMPDIR".into(), "/tmp".into());
 
-        // Make sure the agent binary itself is visible.
+        // Make sure the agent binary itself (and its symlink target) is visible.
         let program = self.resolve_program(&cmd.program, env.get("PATH").map(String::as_str))?;
-        if !self.is_covered(&program, &exposed) {
+        let real_program = program
+            .canonicalize()
+            .unwrap_or_else(|_| program.clone());
+        if !self.is_covered(&program, &exposed) || !self.is_covered(&real_program, &exposed) {
             for b in program_binds(&program) {
                 if !self.is_covered(&b, &exposed) {
                     let d = b.to_string_lossy().into_owned();
@@ -456,6 +479,9 @@ impl Sandbox for BwrapSandbox {
             }
             args.extend(["--chdir".into(), s]);
         }
+        // Lock the synthetic root tmpfs read-only so sandboxed agents cannot fill `/`
+        // to bypass `--size` on `/tmp` and `/run` and OOM the host.
+        args.extend(["--remount-ro".into(), "/".into()]);
         let mut full = self.cgroup_prefix(&spec.limits)?;
         // `systemd-run --user` needs the user manager's runtime dir and bus; hand them to
         // systemd-run but strip them before the agent starts.

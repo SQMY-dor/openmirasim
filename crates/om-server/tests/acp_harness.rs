@@ -32,6 +32,7 @@ fn ctx(resume: Option<&str>) -> StartContext {
             sandbox: SandboxMode::Direct,
             title: None,
         },
+        created_by: None,
         resume_native_session_id: resume.map(str::to_owned),
         sandbox: Arc::new(DirectSandbox),
     }

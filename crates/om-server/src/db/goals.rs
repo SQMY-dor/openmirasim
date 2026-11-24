@@ -85,9 +85,15 @@ impl Db {
             )
             .map_err(|e| match e {
                 rusqlite::Error::SqliteFailure(f, _)
-                    if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                        || f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
                 {
                     CoreError::InvalidInput("the session already has an active goal".into())
+                }
+                rusqlite::Error::SqliteFailure(f, _)
+                    if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+                {
+                    CoreError::NotFound("referenced space or session".into())
                 }
                 other => storage(other),
             })?;
@@ -271,23 +277,25 @@ impl Db {
     }
 
     /// Reserves a dispatch row before its prompt is sent, so its depth counts at once,
-    /// and enforces the fan-out cap: at most `max_fanout` dispatches from the source
-    /// session since `since` (its current turn's start). Complete it with
+    /// and enforces the per-turn fan-out cap keyed by `from_turn_id` (immune to wall-clock
+    /// adjustments and separate from manual dispatches). Complete it with
     /// [`Db::complete_dispatch`] or drop it with [`Db::delete_dispatch`].
     pub async fn reserve_dispatch(
         &self,
         d: Dispatch,
-        fanout: Option<(i64, u32)>,
+        fanout: Option<(TurnId, u32)>,
     ) -> CoreResult<Dispatch> {
         self.write(move |conn| {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(storage)?;
-            if let Some((since, max)) = fanout {
+            let from_turn = fanout.as_ref().map(|(tid, _)| tid.as_str().to_owned());
+            if let Some((ref tid, max)) = fanout {
                 let n: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM dispatches WHERE from_session = ?1 AND created_at >= ?2",
-                        params![d.from_session.as_str(), since],
+                        "SELECT COUNT(*) FROM dispatches
+                         WHERE from_session = ?1 AND from_turn_id = ?2",
+                        params![d.from_session.as_str(), tid.as_str()],
                         |r| r.get(0),
                     )
                     .map_err(storage)?;
@@ -299,8 +307,8 @@ impl Db {
             }
             tx.execute(
                 "INSERT INTO dispatches (id, space_id, from_session, to_session, member_id, depth,
-                                         created_session, submit, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'null', ?8)",
+                                         created_session, submit, created_at, from_turn_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'null', ?8, ?9)",
                 params![
                     d.id.as_str(),
                     d.space_id.as_str(),
@@ -309,7 +317,8 @@ impl Db {
                     d.member_id.as_str(),
                     d.depth,
                     d.created_session,
-                    d.created_at
+                    d.created_at,
+                    from_turn
                 ],
             )
             .map_err(storage)?;
@@ -322,11 +331,15 @@ impl Db {
     /// Records how a reserved dispatch's prompt was taken.
     pub async fn complete_dispatch(&self, d: Dispatch) -> CoreResult<Dispatch> {
         self.write(move |conn| {
-            conn.execute(
-                "UPDATE dispatches SET submit = ?2 WHERE id = ?1",
-                params![d.id.as_str(), to_json(&d.submit).map_err(storage)?],
-            )
-            .map_err(storage)?;
+            let n = conn
+                .execute(
+                    "UPDATE dispatches SET submit = ?2 WHERE id = ?1",
+                    params![d.id.as_str(), to_json(&d.submit).map_err(storage)?],
+                )
+                .map_err(storage)?;
+            if n == 0 {
+                return Err(CoreError::NotFound(format!("dispatch {}", d.id)));
+            }
             Ok(d)
         })
         .await
@@ -377,6 +390,7 @@ impl Db {
         limit: usize,
     ) -> CoreResult<Vec<Dispatch>> {
         let session_id = session_id.clone();
+        let clamped = i64::try_from(limit).unwrap_or(500).clamp(1, 500);
         self.read(move |conn| {
             let mut stmt = conn
                 .prepare(&format!(
@@ -385,7 +399,7 @@ impl Db {
                      ORDER BY created_at DESC, id DESC LIMIT ?2"
                 ))
                 .map_err(storage)?;
-            stmt.query_map(params![session_id.as_str(), limit as i64], row_to_dispatch)
+            stmt.query_map(params![session_id.as_str(), clamped], row_to_dispatch)
                 .map_err(storage)?
                 .collect::<Result<_, _>>()
                 .map_err(storage)

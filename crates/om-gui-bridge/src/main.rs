@@ -59,13 +59,36 @@ struct Cli {
     #[arg(long, env = "OM_ANTIGRAVITY_GUI_BIN", default_value = "antigravity")]
     gui_binary: String,
 
-    /// Optional shared Bearer token required on `/v1/*` bridge control endpoints.
+    /// Shared Bearer token required on `/v1/*` bridge control endpoints (mandatory for X11 and non-loopback binds).
     #[arg(long, env = "OM_GUI_BRIDGE_TOKEN")]
     token: Option<String>,
 
     /// Optional public base URL advertised in noVNC takeover links.
     #[arg(long, env = "OM_GUI_PUBLIC_URL")]
     public_url: Option<String>,
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 #[tokio::main]
@@ -88,7 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bridge, handle) = GuiBridge::start(cfg, cli.bind).await?;
     tracing::info!(addr = %bridge.addr(), "om-gui-bridge listening");
 
-    tokio::signal::ctrl_c().await?;
+    shutdown_signal().await;
+    tracing::info!("shutting down om-gui-bridge and reaping active GUI sessions");
+    bridge.shutdown_all().await;
     handle.abort();
     tracing::info!("om-gui-bridge stopped");
     Ok(())

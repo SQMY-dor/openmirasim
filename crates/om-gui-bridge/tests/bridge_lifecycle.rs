@@ -163,8 +163,12 @@ async fn per_member_profile_isolation_concurrency_cap_and_takeover_flow() {
     .await;
     assert!(gated.takeover_required);
     assert_eq!(gated.status, "awaiting_human_takeover");
+    assert!(
+        !gated.reply.contains("?k="),
+        "takeover secret token must not be embedded in shared reply text"
+    );
 
-    // 7. Takeover URL requires its secret token and serves interactive HTML
+    // 7. Takeover URL requires its secret token and serves interactive HTML with security headers
     let unauthorized_takeover = http
         .get(format!("{base}/takeover/{}", s1.bridge_session_id))
         .send()
@@ -175,14 +179,29 @@ async fn per_member_profile_isolation_concurrency_cap_and_takeover_flow() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 
-    let html = http
-        .get(&s1.takeover_url)
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
+    let takeover_resp = http.get(&s1.takeover_url).send().await.unwrap();
+    assert_eq!(
+        takeover_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        takeover_resp
+            .headers()
+            .get("referrer-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        takeover_resp
+            .headers()
+            .get("x-frame-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    let html = takeover_resp.text().await.unwrap();
     assert!(html.contains("Antigravity GUI 远程人工接管"));
     assert!(html.contains("member-alice"));
 
@@ -242,4 +261,15 @@ async fn idle_reaper_evicts_inactive_gui_sessions() {
         "expected idle reaper to reclaim inactive GUI session"
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn non_loopback_bind_requires_bridge_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = BridgeConfig::new(dir.path().join("profiles"));
+    cfg.driver = DriverKind::Simulated;
+    cfg.bridge_token = None;
+
+    let res = GuiBridge::start(cfg, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await;
+    assert!(res.is_err(), "non-loopback bind without token must fail closed");
 }

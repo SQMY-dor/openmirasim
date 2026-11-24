@@ -1,12 +1,14 @@
 //! Codex CLI (`codexcli`) `--json` headless adapter and probe (W1-4).
 //!
-//! Invokes `codex exec --json` (or `codex exec resume <thread_id> --json` on subsequent turns)
-//! inside the session sandbox, parsing Codex NDJSON events into [`HarnessEvent`]s.
+//! Invokes `codex exec --json -- <prompt>` (or `codex exec resume <thread_id> --json -- <prompt>`
+//! on subsequent turns) inside the session sandbox, parsing Codex NDJSON events into
+//! [`HarnessEvent`]s.
 
-use super::probe::{CliProbe, apply_safe_base_env, env_binary_or, probe_cli_version};
+use super::probe::{
+    CliProbe, apply_safe_base_env, env_binary_or, is_safe_cli_arg_value, probe_cli_version,
+};
 use super::stream_cli::{NdjsonTurnParser, StreamCliAdapter, start_stream_cli};
 use async_trait::async_trait;
-use om_core::CoreResult;
 use om_core::content::ContentBlock;
 use om_core::event::{
     PlanEntry, PlanEntryStatus, ToolCallInfo, ToolCallStatus, ToolCallUpdate, ToolKind,
@@ -14,7 +16,9 @@ use om_core::event::{
 use om_core::harness::{Harness, HarnessCapabilities, HarnessEvent, StartContext, StartedSession};
 use om_core::sandbox::CommandSpec;
 use om_core::session::StopReason;
+use om_core::{CoreError, CoreResult};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,7 +33,7 @@ const FORWARDED_PROVIDER_ENV: &[&str] = &["OPENAI_API_KEY", "OPENAI_BASE_URL", "
 pub struct CodexCliConfig {
     /// Executable name or absolute path (default `"codex"`).
     pub binary: String,
-    /// Extra CLI arguments appended before the prompt.
+    /// Extra CLI arguments appended before `-- <prompt>`.
     pub extra_args: Vec<String>,
     /// Explicit environment variables injected into the agent process.
     pub env: Vec<(String, String)>,
@@ -124,24 +128,34 @@ impl StreamCliAdapter for CodexCliAdapter {
         cwd: &Path,
         model: Option<&str>,
         native_session_id: Option<&str>,
-    ) -> CommandSpec {
+    ) -> CoreResult<CommandSpec> {
         let mut spec = apply_safe_base_env(CommandSpec::new(&self.cfg.binary)).cwd(cwd);
         if let Some(thread_id) = native_session_id {
+            if !is_safe_cli_arg_value(thread_id) {
+                return Err(CoreError::InvalidInput(
+                    "unsafe thread_id for codex exec resume".into(),
+                ));
+            }
             spec = spec.args(["exec", "resume", thread_id, "--json"]);
         } else {
             spec = spec.args(["exec", "--json"]);
         }
         if let Some(m) = model {
+            if !is_safe_cli_arg_value(m) {
+                return Err(CoreError::InvalidInput(
+                    "unsafe model identifier for codex --model".into(),
+                ));
+            }
             spec = spec.args(["--model", m]);
         }
         for arg in &self.cfg.extra_args {
             spec = spec.arg(arg);
         }
-        spec = spec.arg(prompt_text);
+        spec = spec.arg("--").arg(prompt_text);
         for (k, v) in &self.cfg.env {
             spec = spec.env(k, v);
         }
-        spec
+        Ok(spec)
     }
 
     fn new_parser(&self) -> Box<dyn NdjsonTurnParser> {
@@ -152,6 +166,7 @@ impl StreamCliAdapter for CodexCliAdapter {
 #[derive(Default)]
 struct CodexNdjsonParser {
     turn_error: Option<String>,
+    started_items: HashSet<String>,
 }
 
 fn item_status(item: &Value, completed_event: bool) -> ToolCallStatus {
@@ -181,6 +196,7 @@ impl NdjsonTurnParser for CodexNdjsonParser {
             "thread.started" => {
                 if let Some(tid) = value.get("thread_id").and_then(Value::as_str)
                     && !tid.is_empty()
+                    && is_safe_cli_arg_value(tid)
                 {
                     out.push(HarnessEvent::NativeSessionId(tid.to_string()));
                 }
@@ -219,16 +235,17 @@ impl NdjsonTurnParser for CodexNdjsonParser {
                             .get("command")
                             .and_then(Value::as_str)
                             .unwrap_or("command");
-                        if kind == "item.started" {
+                        if kind == "item.started" || self.started_items.insert(item_id.clone()) {
                             out.push(HarnessEvent::ToolCall(ToolCallInfo {
-                                tool_call_id: item_id,
+                                tool_call_id: item_id.clone(),
                                 title: cmd.to_string(),
                                 kind: ToolKind::Execute,
                                 status: ToolCallStatus::InProgress,
                                 raw_input: Some(serde_json::json!({ "command": cmd })),
                                 locations: Vec::new(),
                             }));
-                        } else {
+                        }
+                        if kind != "item.started" {
                             let output = item
                                 .get("aggregated_output")
                                 .and_then(Value::as_str)
@@ -258,16 +275,17 @@ impl NdjsonTurnParser for CodexNdjsonParser {
                                     .collect()
                             })
                             .unwrap_or_default();
-                        if kind == "item.started" {
+                        if kind == "item.started" || self.started_items.insert(item_id.clone()) {
                             out.push(HarnessEvent::ToolCall(ToolCallInfo {
-                                tool_call_id: item_id,
+                                tool_call_id: item_id.clone(),
                                 title: "Edit files".into(),
                                 kind: ToolKind::Edit,
                                 status: ToolCallStatus::InProgress,
                                 raw_input: item.get("changes").cloned(),
-                                locations: paths,
+                                locations: paths.clone(),
                             }));
-                        } else {
+                        }
+                        if kind != "item.started" {
                             out.push(HarnessEvent::ToolCallUpdate(ToolCallUpdate {
                                 tool_call_id: item_id,
                                 status: Some(item_status(item, is_completed)),
@@ -287,16 +305,17 @@ impl NdjsonTurnParser for CodexNdjsonParser {
                             .get("tool")
                             .and_then(Value::as_str)
                             .unwrap_or("mcp_tool");
-                        if kind == "item.started" {
+                        if kind == "item.started" || self.started_items.insert(item_id.clone()) {
                             out.push(HarnessEvent::ToolCall(ToolCallInfo {
-                                tool_call_id: item_id,
+                                tool_call_id: item_id.clone(),
                                 title: tool_name.to_string(),
                                 kind: ToolKind::Other,
                                 status: ToolCallStatus::InProgress,
                                 raw_input: item.get("arguments").cloned(),
                                 locations: Vec::new(),
                             }));
-                        } else {
+                        }
+                        if kind != "item.started" {
                             out.push(HarnessEvent::ToolCallUpdate(ToolCallUpdate {
                                 tool_call_id: item_id,
                                 status: Some(item_status(item, is_completed)),

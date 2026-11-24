@@ -271,7 +271,10 @@ async fn sandbox_paths_overlay_git_config_read_only() {
     let common = f.repo.join(".git");
     let gd = PathBuf::from(wt.git_dir.clone().unwrap());
     assert!(gd.starts_with(f.mgr.root().join("gitdirs")));
-    assert_eq!(p.writable, vec![PathBuf::from(&wa.path), gd.clone()]);
+    assert_eq!(
+        p.writable,
+        vec![PathBuf::from(&wa.path), gd.clone(), gd.join("objects")]
+    );
     assert!(
         !p.writable.iter().any(|w| w.starts_with(&common)),
         "the repository's .git is never writable"
@@ -281,6 +284,7 @@ async fn sandbox_paths_overlay_git_config_read_only() {
         "hooks",
         "info",
         "commondir",
+        "objects/info",
         "objects/info/alternates",
     ] {
         assert!(
@@ -297,7 +301,28 @@ async fn sandbox_paths_overlay_git_config_read_only() {
         p.readonly
     );
     let home = p.home.unwrap();
-    assert!(home.ends_with(format!("homes/{}/alice", f.space)));
+    let expected_prefix = f
+        .mgr
+        .root()
+        .join("homes")
+        .join(f.space.as_str())
+        .join("alice");
+    assert!(
+        home.starts_with(&expected_prefix) && home != expected_prefix,
+        "expected per-session home under {}, got {}",
+        expected_prefix.display(),
+        home.display()
+    );
+    // Two sessions by the same member receive distinct private HOME directories.
+    let (b, _) = checkout(&f, &ws).await;
+    let home_b = f
+        .mgr
+        .sandbox_paths(&f.mgr.worktree(&b).await.unwrap())
+        .await
+        .unwrap()
+        .home
+        .unwrap();
+    assert_ne!(home, home_b);
     let _ = a;
 }
 
@@ -554,6 +579,9 @@ async fn sandboxed_agent_cannot_reach_the_repository_git_dir() {
          echo x >> {gd}/config 2>/dev/null && echo WROTE-CONFIG; \
          touch {gd}/hooks/pre-commit 2>/dev/null && echo WROTE-HOOK; \
          echo x > {gd}/objects/info/alternates 2>/dev/null && echo WROTE-ALTERNATES; \
+         mv {gd}/objects/info {gd}/objects/info.bak 2>/dev/null && echo MOVED-OBJECTS-INFO; \
+         mv {gd}/objects {gd}/objects.bak 2>/dev/null && echo MOVED-OBJECTS; \
+         echo x > /root-fill-test 2>/dev/null && echo WROTE-ROOT; \
          ls {common}/HEAD >/dev/null 2>&1 && echo SEES-REPO-HEAD; \
          touch {common}/objects/x 2>/dev/null && echo WROTE-REPO-OBJECTS; true",
         wt = wa.path,
@@ -592,9 +620,56 @@ async fn sandboxed_agent_cannot_reach_the_repository_git_dir() {
         "WROTE-CONFIG",
         "WROTE-HOOK",
         "WROTE-ALTERNATES",
+        "MOVED-OBJECTS-INFO",
+        "MOVED-OBJECTS",
+        "WROTE-ROOT",
         "SEES-REPO-HEAD",
         "WROTE-REPO-OBJECTS",
     ] {
         assert!(!stdout.contains(bad), "{bad}: {stdout}");
     }
+}
+
+#[tokio::test]
+async fn diff_and_list_files_do_not_follow_intermediate_dir_symlinks() {
+    let f = fx().await;
+    let ws = f
+        .mgr
+        .register(f.space.clone(), "app", &f.repo.to_string_lossy())
+        .await
+        .unwrap();
+    let (a, wa) = checkout(&f, &ws).await;
+    let pa = PathBuf::from(&wa.path);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("host_secret.txt"), "TOP_SECRET_HOST\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), pa.join("linkdir")).unwrap();
+
+    // Stage a fake path under `linkdir` in the index to simulate TOCTOU/symlink oracle.
+    let hash = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(&pa)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let oid = String::from_utf8(hash.stdout).unwrap().trim().to_string();
+    let _ = Command::new("git")
+        .args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{oid},linkdir/host_secret.txt"),
+        ])
+        .current_dir(&pa)
+        .status();
+
+    let d = f.mgr.diff(&a).await.unwrap();
+    assert!(
+        !d.patch.contains("TOP_SECRET_HOST"),
+        "diff must never read host files through intermediate symlinks"
+    );
+    let listed = f.mgr.list_files(&a).await.unwrap();
+    assert!(
+        !listed.iter().any(|e| e.path == "linkdir/host_secret.txt"),
+        "list_files must not stat through intermediate symlinks"
+    );
 }

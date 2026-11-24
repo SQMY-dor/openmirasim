@@ -18,12 +18,14 @@ use crate::orchestrator::Orchestrator;
 use crate::pty::{PtyConfig, PtyManager, PtyStatus};
 use crate::scheduler::{Dispatcher, GoalRunner, Scheduler};
 use auth::{authenticate_secret, extract_bearer_token};
+use axum::body::Body;
 use axum::extract::{Extension, FromRef, Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use hub::{
     CreateMcpServerRequest, CreateSkillRequest, EffectiveHubResponse, HubScopeLevel, HubStore,
     ListMcpServersResponse, ListSkillsResponse, McpProbeResult, McpServerRecord, SkillRecord,
@@ -55,7 +57,8 @@ use push::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -96,6 +99,11 @@ pub struct AppState {
     pub config: ApiConfig,
 }
 
+/// Cache TTL for `GET /api/v1/harnesses/probe` to prevent subprocess fork-bomb DoS.
+const HARNESS_PROBE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+type ProbeCache = Arc<tokio::sync::Mutex<Option<(Instant, Vec<HarnessProbeReport>)>>>;
+
 #[derive(Clone)]
 pub(super) struct GatewayState {
     pub(super) app: AppState,
@@ -107,6 +115,7 @@ pub(super) struct GatewayState {
     pub(super) goals: GoalRunner,
     pub(super) dispatcher: Dispatcher,
     pub(super) hub: HubStore,
+    pub(super) probe_cache: ProbeCache,
 }
 
 impl FromRef<GatewayState> for AppState {
@@ -177,6 +186,7 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
         goals,
         dispatcher,
         hub,
+        probe_cache: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     let api_routes = Router::new()
@@ -308,7 +318,67 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
         )
     });
 
-    router.layer(trace).with_state(gw)
+    router
+        .layer(middleware::from_fn(apply_security_headers))
+        .layer(trace)
+        .with_state(gw)
+}
+
+async fn apply_security_headers(req: Request, next: Next) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    if is_api {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    res
+}
+
+/// Validates browser `Origin` headers on WebSocket upgrade requests to prevent cross-site
+/// WebSocket hijacking (CSWSH). Non-browser clients (CLI, Tauri) omitting `Origin` are allowed.
+pub(super) fn validate_ws_origin(
+    headers: &HeaderMap,
+    allow_cors_origin: Option<&str>,
+) -> Result<(), String> {
+    let Some(origin_raw) = headers.get(header::ORIGIN) else {
+        return Ok(());
+    };
+    let Ok(origin) = origin_raw.to_str() else {
+        return Err("invalid Origin header".into());
+    };
+    let origin = origin.trim();
+    if let Some(allowed) = allow_cors_origin
+        && allowed.trim() == origin
+    {
+        return Ok(());
+    }
+    let parsed_origin = reqwest::Url::parse(origin)
+        .map_err(|_| "malformed WebSocket Origin header".to_string())?;
+    let Some(host_hdr) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return Err("missing Host header for WebSocket Origin check".into());
+    };
+    let host_url = reqwest::Url::parse(&format!("{}://{}", parsed_origin.scheme(), host_hdr.trim()))
+        .map_err(|_| "malformed Host header".to_string())?;
+    if parsed_origin.host_str() == host_url.host_str()
+        && parsed_origin.port_or_known_default() == host_url.port_or_known_default()
+    {
+        Ok(())
+    } else {
+        Err("WebSocket Origin does not match server Host".into())
+    }
 }
 
 async fn require_auth(State(gw): State<GatewayState>, mut req: Request, next: Next) -> Response {
@@ -474,7 +544,23 @@ async fn probe_harnesses(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<ProbeHarnessesResponse>> {
     gw.auth.require(&principal, Action::ViewSessions)?;
-    let probes = probe_registered_harnesses(gw.app.orchestrator.registry()).await;
+    let mut probes = {
+        let mut cache = gw.probe_cache.lock().await;
+        if let Some((at, cached)) = cache.as_ref()
+            && at.elapsed() < HARNESS_PROBE_CACHE_TTL
+        {
+            cached.clone()
+        } else {
+            let fresh = probe_registered_harnesses(gw.app.orchestrator.registry()).await;
+            *cache = Some((Instant::now(), fresh.clone()));
+            fresh
+        }
+    };
+    if !principal.can(Action::ManageWorkspaces) {
+        for report in &mut probes {
+            report.binary_path = None;
+        }
+    }
     Ok(Json(ProbeHarnessesResponse { probes }))
 }
 
@@ -531,7 +617,17 @@ async fn get_remote_screen(
     gw.auth.require(&principal, Action::ViewSessions)?;
     let sid = SessionId::from(id);
     ensure_session_in_space(&gw, &principal, &sid).await?;
-    let screen = gw.remote_screens.get(&sid);
+    // Viewers (lacking `PromptSession`) must never receive secret-bearing GUI takeover URLs.
+    if !principal.can(Action::PromptSession) {
+        return Ok(Json(RemoteScreenResponse {
+            available: false,
+            screen: None,
+        }));
+    }
+    let screen = gw.remote_screens.get(&sid).map(|mut info| {
+        info.profile_dir.clear();
+        info
+    });
     Ok(Json(RemoteScreenResponse {
         available: screen.is_some(),
         screen,
@@ -619,6 +715,12 @@ async fn remove_worktree(
     let mgr = require_workspaces(&gw)?;
     let sid = SessionId::from(id);
     ensure_session_in_space(&gw, &principal, &sid).await?;
+    if gw.app.orchestrator.is_session_live(&sid) || gw.pty.is_active(&sid) {
+        return Err(HttpApiError::from(CoreError::Conflict(
+            "cannot remove worktree while the session or PTY is still active; close it first"
+                .into(),
+        )));
+    }
     mgr.remove_worktree(&sid).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -917,7 +1019,14 @@ async fn resolve_approval(
     gw.auth.require(&principal, Action::ResolveApproval)?;
     let aid = ApprovalId::from(id);
     let stored = gw.app.orchestrator.db().get_approval(&aid).await?;
-    ensure_session_in_space(&gw, &principal, &stored.record.session_id).await?;
+    if ensure_session_in_space(&gw, &principal, &stored.record.session_id)
+        .await
+        .is_err()
+    {
+        return Err(HttpApiError::from(CoreError::NotFound(format!(
+            "approval {aid}"
+        ))));
+    }
     let record = gw
         .app
         .orchestrator
@@ -1042,16 +1151,20 @@ async fn test_push(
 ) -> Json<PushTestResponse> {
     let subs = gw.push.list_for(&principal.member_id);
     Json(PushTestResponse {
-        delivered: subs.len(),
+        delivered: 0,
+        registered: subs.len(),
         mode: if subs.is_empty() {
             "service_worker_local".into()
         } else {
-            "web_push_registered".into()
+            "web_push_registered_dry_run".into()
         },
         message: if subs.is_empty() {
-            "已启用本地 PWA Service Worker 审批通知".into()
+            "已启用本地 PWA Service Worker 审批通知（服务端 VAPID 主动推送尚未配置）".into()
         } else {
-            format!("已检测到 {} 个已注册的 Web Push 订阅端", subs.len())
+            format!(
+                "已登记 {} 个 Web Push 订阅端；服务端 VAPID 远端投递暂未启用（dry-run，实际投递 0）",
+                subs.len()
+            )
         },
     })
 }
@@ -1089,14 +1202,56 @@ async fn get_pty_recording(
     gw.auth.require(&principal, Action::ViewSessions)?;
     let sid = SessionId::from(id);
     ensure_session_in_space(&gw, &principal, &sid).await?;
-    let bytes = gw.pty.read_recording(&sid)?;
+    let path = gw.pty.recording_path(&sid)?;
+    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        opts.open(path)
+    })
+    .await
+    .map_err(|e| HttpApiError::from(CoreError::Io(std::io::Error::other(e.to_string()))))?
+    .map_err(|e| HttpApiError::from(CoreError::Io(e)))?;
+
+    let stream = futures::stream::try_unfold((Some(file), 0u64), |(file_opt, sent)| async move {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        const MAX_STREAM_BYTES: u64 = crate::pty::cast::DEFAULT_MAX_CAST_BYTES;
+        let Some(mut file) = file_opt else {
+            return Ok(None);
+        };
+        if sent >= MAX_STREAM_BYTES {
+            return Ok(None);
+        }
+        let to_read = (MAX_STREAM_BYTES - sent).min(CHUNK_SIZE as u64) as usize;
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, Vec<u8>)> {
+            use std::io::Read;
+            let mut buf = vec![0u8; to_read];
+            let n = file.read(&mut buf)?;
+            buf.truncate(n);
+            Ok((file, buf))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
+        let (file, buf) = res;
+        if buf.is_empty() {
+            Ok(None)
+        } else {
+            let next_sent = sent.saturating_add(buf.len() as u64);
+            Ok(Some((Bytes::from(buf), (Some(file), next_sent))))
+        }
+    });
+
     Ok((
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/x-asciicast; charset=utf-8"),
         )],
-        bytes,
+        Body::from_stream(stream),
     )
         .into_response())
 }
@@ -1336,9 +1491,14 @@ async fn list_mcp_servers(
     if let Some(ref wid) = ws {
         ensure_workspace_in_space(&gw, &principal, wid).await?;
     }
-    let servers = gw
-        .hub
-        .list_mcp(&principal.space_id, query.scope, ws.as_ref());
+    let is_admin = principal.can(Action::ManageWorkspaces);
+    let servers = gw.hub.list_mcp(
+        &principal.space_id,
+        &principal.member_id,
+        is_admin,
+        query.scope,
+        ws.as_ref(),
+    );
     Ok(Json(ListMcpServersResponse { servers }))
 }
 
@@ -1348,9 +1508,11 @@ async fn create_mcp_server(
     Json(body): Json<CreateMcpServerRequest>,
 ) -> ApiResult<(StatusCode, Json<McpServerRecord>)> {
     require_hub_write(&gw, &principal, body.scope, body.workspace_id.as_ref()).await?;
+    let is_admin = principal.can(Action::ManageWorkspaces);
     let record = gw.hub.create_mcp(
         principal.space_id.clone(),
         principal.member_id.clone(),
+        is_admin,
         body,
     )?;
     let _ = gw
@@ -1365,6 +1527,8 @@ async fn create_mcp_server(
                 "name": record.name,
                 "scope": record.scope,
                 "workspace_id": record.workspace_id,
+                "owner_member_id": record.owner_member_id,
+                "global_available": record.global_available,
                 "transport": record.transport,
             }),
         )
@@ -1378,7 +1542,12 @@ async fn update_mcp_server(
     Path(id): Path<String>,
     Json(body): Json<UpdateMcpServerRequest>,
 ) -> ApiResult<Json<McpServerRecord>> {
-    let existing = gw.hub.get_mcp(&principal.space_id, &id)?;
+    // Check baseline write capability before existence lookup (prevents Viewer ID oracle).
+    gw.auth.require(&principal, Action::CreateSession)?;
+    let is_admin = principal.can(Action::ManageWorkspaces);
+    let existing = gw
+        .hub
+        .get_mcp(&principal.space_id, &id, &principal.member_id, is_admin)?;
     require_hub_write(
         &gw,
         &principal,
@@ -1386,7 +1555,13 @@ async fn update_mcp_server(
         existing.workspace_id.as_ref(),
     )
     .await?;
-    let updated = gw.hub.update_mcp(&principal.space_id, &id, body)?;
+    let updated = gw.hub.update_mcp(
+        &principal.space_id,
+        &id,
+        &principal.member_id,
+        is_admin,
+        body,
+    )?;
     let _ = gw
         .app
         .orchestrator
@@ -1395,7 +1570,11 @@ async fn update_mcp_server(
             Some(principal.member_id.clone()),
             "mcp.updated",
             &updated.id,
-            serde_json::json!({ "name": updated.name, "enabled": updated.enabled }),
+            serde_json::json!({
+                "name": updated.name,
+                "enabled": updated.enabled,
+                "global_available": updated.global_available,
+            }),
         )
         .await;
     Ok(Json(updated))
@@ -1406,7 +1585,14 @@ async fn delete_mcp_server(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let existing = gw.hub.get_mcp(&principal.space_id, &id)?;
+    gw.auth.require(&principal, Action::CreateSession)?;
+    let is_admin = principal.can(Action::ManageWorkspaces);
+    let existing = if is_admin {
+        gw.hub.get_mcp_for_admin(&principal.space_id, &id)?
+    } else {
+        gw.hub
+            .get_mcp(&principal.space_id, &id, &principal.member_id, false)?
+    };
     require_hub_write(
         &gw,
         &principal,
@@ -1414,7 +1600,9 @@ async fn delete_mcp_server(
         existing.workspace_id.as_ref(),
     )
     .await?;
-    let removed = gw.hub.delete_mcp(&principal.space_id, &id)?;
+    let removed = gw
+        .hub
+        .delete_mcp(&principal.space_id, &id, &principal.member_id, is_admin)?;
     let _ = gw
         .app
         .orchestrator
@@ -1435,7 +1623,10 @@ async fn probe_mcp_server(
     Path(id): Path<String>,
 ) -> ApiResult<Json<McpProbeResult>> {
     gw.auth.require(&principal, Action::ViewSessions)?;
-    let result = gw.hub.probe_mcp(&principal.space_id, &id)?;
+    let is_admin = principal.can(Action::ManageWorkspaces);
+    let result = gw
+        .hub
+        .probe_mcp(&principal.space_id, &id, &principal.member_id, is_admin)?;
     Ok(Json(result))
 }
 
@@ -1495,6 +1686,7 @@ async fn update_skill(
     Path(id): Path<String>,
     Json(body): Json<UpdateSkillRequest>,
 ) -> ApiResult<Json<SkillRecord>> {
+    gw.auth.require(&principal, Action::CreateSession)?;
     let existing = gw.hub.get_skill(&principal.space_id, &id)?;
     require_hub_write(
         &gw,
@@ -1528,6 +1720,7 @@ async fn delete_skill(
     Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    gw.auth.require(&principal, Action::CreateSession)?;
     let existing = gw.hub.get_skill(&principal.space_id, &id)?;
     require_hub_write(
         &gw,
@@ -1565,6 +1758,8 @@ async fn get_effective_hub(
     if let Some(ref wid) = ws {
         ensure_workspace_in_space(&gw, &principal, wid).await?;
     }
-    let resolved = gw.hub.effective(&principal.space_id, ws.as_ref());
+    let resolved = gw
+        .hub
+        .effective(&principal.space_id, &principal.member_id, ws.as_ref());
     Ok(Json(resolved))
 }

@@ -25,6 +25,7 @@ fn start_ctx(harness_id: &str, resume_id: Option<&str>) -> StartContext {
             sandbox: SandboxMode::Direct,
             title: Some("test".into()),
         },
+        created_by: None,
         resume_native_session_id: resume_id.map(ToOwned::to_owned),
         sandbox: Arc::new(DirectSandbox),
     }
@@ -297,6 +298,7 @@ echo '{"type":"result","subtype":"success","session_id":"cc-sess-99","is_error":
                 sandbox: SandboxMode::Direct,
                 title: None,
             },
+            created_by: None,
             resume_native_session_id: None,
             sandbox: Arc::new(DirectSandbox),
         })
@@ -404,6 +406,7 @@ printf '{"type":"item.completed","item":{"id":"msg1","type":"agent_message","tex
                 sandbox: SandboxMode::Direct,
                 title: None,
             },
+            created_by: None,
             resume_native_session_id: None,
             sandbox: Arc::new(DirectSandbox),
         })

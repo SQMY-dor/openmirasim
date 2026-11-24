@@ -6,9 +6,9 @@
 //!   [`ByteRingBuffer`] (default 512 KiB) and an append-only capped `.cast` file.
 //! - Output fan-out uses a bounded `tokio::sync::broadcast` channel so slow `/ws/pty`
 //!   clients experience controlled lag without stalling the PTY reader or `/ws/events`.
-//! - Child processes run with a cleared minimal environment (never inheriting `OM_TOKEN` or
-//!   upstream provider API keys) and are always reaped by a dedicated waiter thread to prevent
-//!   zombie processes.
+//! - Child shells execute inside the session's configured [`Sandbox`] (with `keep_session = true`
+//!   so `bwrap` preserves the controlling TTY while isolating namespaces, filesystem, and env),
+//!   with a cleared minimal environment and dedicated process-group reaping.
 
 pub mod cast;
 pub mod ring;
@@ -16,15 +16,17 @@ pub mod ring;
 use bytes::Bytes;
 use cast::{CastWriter, DEFAULT_MAX_CAST_BYTES, safe_cast_path};
 use om_core::ids::SessionId;
+use om_core::sandbox::{CommandSpec, DirectSandbox, Sandbox, SandboxSpec};
 use om_core::{CoreError, CoreResult};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use ring::{ByteRingBuffer, DEFAULT_RING_CAPACITY};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 const READ_CHUNK_BYTES: usize = 4096;
@@ -93,11 +95,32 @@ struct LivePty {
     cols: Arc<AtomicU16>,
     rows: Arc<AtomicU16>,
     active: Arc<AtomicBool>,
+    killed: Arc<AtomicBool>,
     recording_bytes: Arc<AtomicU64>,
     ring: Arc<Mutex<ByteRingBuffer>>,
     output_tx: broadcast::Sender<PtyOutput>,
     control_tx: mpsc::Sender<PtyControl>,
     killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    child_pid: Option<u32>,
+}
+
+fn terminate_pty_child(
+    killer: &Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    child_pid: Option<u32>,
+) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid
+        && pid > 0
+        && let Ok(pgid) = i32::try_from(pid)
+    {
+        unsafe {
+            libc::kill(-pgid, libc::SIGHUP);
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    if let Ok(mut k) = killer.lock() {
+        let _ = k.kill();
+    }
 }
 
 /// Client write/resize control handle split from [`PtyAttachment`].
@@ -129,7 +152,7 @@ impl PtyWriter {
     }
 }
 
-/// Client handle returned by [`PtyManager::attach_or_spawn`].
+/// Client handle returned by [`PtyManager::attach_or_spawn_in_sandbox`].
 pub struct PtyAttachment {
     pub cols: u16,
     pub rows: u16,
@@ -151,28 +174,58 @@ impl PtyAttachment {
     }
 }
 
+#[derive(Default)]
+struct LiveTable {
+    entries: HashMap<SessionId, Arc<LivePty>>,
+    spawning: HashSet<SessionId>,
+}
+
+struct SpawnReservation {
+    table: Arc<Mutex<LiveTable>>,
+    session_id: SessionId,
+    committed: bool,
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut guard = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.spawning.remove(&self.session_id);
+        }
+    }
+}
+
 /// Thread-safe supervisor for per-session native PTYs and `.cast` recordings.
 #[derive(Clone)]
 pub struct PtyManager {
     config: Arc<PtyConfig>,
-    live: Arc<Mutex<HashMap<SessionId, Arc<LivePty>>>>,
+    live: Arc<Mutex<LiveTable>>,
 }
 
 impl PtyManager {
     pub fn new(config: PtyConfig) -> Self {
         if let Some(dir) = &config.recordings_dir {
-            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::create_dir_all(dir);
+            }
         }
         Self {
             config: Arc::new(config),
-            live: Arc::new(Mutex::new(HashMap::new())),
+            live: Arc::new(Mutex::new(LiveTable::default())),
         }
     }
 
-    /// Attaches to an existing live PTY for `session_id` or spawns a new one inside `cwd`.
-    ///
-    /// When `allow_spawn` is `false` (e.g. `Viewer` role), attaches read-only only if a PTY
-    /// is already live, returning `NotFound` otherwise.
+    /// Attaches to an existing live PTY for `session_id` or spawns a new one inside `cwd`
+    /// using `DirectSandbox` (prefer [`Self::attach_or_spawn_in_sandbox`] in API handlers).
     pub fn attach_or_spawn(
         &self,
         session_id: &SessionId,
@@ -181,58 +234,119 @@ impl PtyManager {
         rows: u16,
         allow_spawn: bool,
     ) -> CoreResult<PtyAttachment> {
+        self.attach_or_spawn_in_sandbox(
+            session_id,
+            cwd,
+            Arc::new(DirectSandbox),
+            cols,
+            rows,
+            allow_spawn,
+        )
+    }
+
+    /// Attaches to an existing live PTY for `session_id` or spawns a new sandboxed shell in `cwd`.
+    ///
+    /// When `allow_spawn` is `false` (e.g. `Viewer` role), attaches read-only only if a PTY
+    /// is already live, returning `NotFound` otherwise.
+    pub fn attach_or_spawn_in_sandbox(
+        &self,
+        session_id: &SessionId,
+        cwd: &str,
+        sandbox: Arc<dyn Sandbox>,
+        cols: u16,
+        rows: u16,
+        allow_spawn: bool,
+    ) -> CoreResult<PtyAttachment> {
         let cols = cols.clamp(20, 500);
         let rows = rows.clamp(5, 200);
 
-        let mut map = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // Drop stale exited entries before deciding whether to attach or spawn.
-        if let Some(existing) = map.get(session_id)
-            && !existing.active.load(Ordering::Acquire)
+        // Phase 1: check existing live PTY or reserve a spawn slot without holding the mutex
+        // across `openpty` / `fork` / `exec`.
         {
-            map.remove(session_id);
+            let mut table = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+
+            if let Some(existing) = table.entries.get(session_id)
+                && !existing.active.load(Ordering::Acquire)
+            {
+                table.entries.remove(session_id);
+            }
+
+            if let Some(existing) = table.entries.get(session_id) {
+                // Hold `ring` lock across snapshot + subscribe so the client observes an exact
+                // gap-free, duplicate-free handoff into live broadcast chunks.
+                let ring_guard = existing.ring.lock().unwrap_or_else(PoisonError::into_inner);
+                let snapshot = Bytes::from(ring_guard.snapshot());
+                let rx = existing.output_tx.subscribe();
+                drop(ring_guard);
+                return Ok(PtyAttachment {
+                    cols: existing.cols.load(Ordering::Relaxed),
+                    rows: existing.rows.load(Ordering::Relaxed),
+                    snapshot,
+                    has_recording: self.config.recordings_dir.is_some(),
+                    rx,
+                    control_tx: existing.control_tx.clone(),
+                });
+            }
+
+            if !allow_spawn {
+                return Err(CoreError::NotFound(format!(
+                    "no active PTY for session {session_id}"
+                )));
+            }
+
+            if table.spawning.contains(session_id) {
+                return Err(CoreError::InvalidInput(format!(
+                    "PTY for session {session_id} is already starting"
+                )));
+            }
+
+            let total = table.entries.len() + table.spawning.len();
+            if total >= self.config.max_sessions {
+                return Err(CoreError::LimitExceeded(format!(
+                    "maximum concurrent PTY sessions reached ({})",
+                    self.config.max_sessions
+                )));
+            }
+
+            table.spawning.insert(session_id.clone());
         }
 
-        if let Some(existing) = map.get(session_id) {
-            let snapshot = Bytes::from(
-                existing
-                    .ring
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .snapshot(),
-            );
-            return Ok(PtyAttachment {
-                cols: existing.cols.load(Ordering::Relaxed),
-                rows: existing.rows.load(Ordering::Relaxed),
-                snapshot,
-                has_recording: self.config.recordings_dir.is_some(),
-                rx: existing.output_tx.subscribe(),
-                control_tx: existing.control_tx.clone(),
-            });
-        }
-
-        if !allow_spawn {
-            return Err(CoreError::NotFound(format!(
-                "no active PTY for session {session_id}"
-            )));
-        }
-
-        if map.len() >= self.config.max_sessions {
-            return Err(CoreError::LimitExceeded(format!(
-                "maximum concurrent PTY sessions reached ({})",
-                self.config.max_sessions
-            )));
-        }
+        let mut reservation = SpawnReservation {
+            table: self.live.clone(),
+            session_id: session_id.clone(),
+            committed: false,
+        };
 
         let workdir = PathBuf::from(cwd);
-        let effective_cwd = if !cwd.is_empty() && workdir.is_dir() {
-            workdir
-        } else {
-            std::env::temp_dir()
+        if cwd.trim().is_empty() || !workdir.is_absolute() || !workdir.is_dir() {
+            return Err(CoreError::InvalidInput(format!(
+                "session working directory is missing or not absolute: {cwd}"
+            )));
+        }
+
+        let mut base_cmd = CommandSpec::new(&self.config.default_shell).cwd(&workdir);
+        base_cmd.clear_env = true;
+        base_cmd = base_cmd
+            .env(
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| {
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin".into()
+                }),
+            )
+            .env("HOME", workdir.to_string_lossy().as_ref())
+            .env("TERM", "xterm-256color")
+            .env("COLORTERM", "truecolor")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("PS1", "openmirasim$ ");
+
+        let sb_spec = SandboxSpec {
+            writable_paths: vec![workdir.clone()],
+            network: false,
+            keep_session: true,
+            ..SandboxSpec::default()
         };
+        let wrapped = sandbox.wrap(&sb_spec, base_cmd)?;
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -244,45 +358,41 @@ impl PtyManager {
             })
             .map_err(|e| CoreError::Io(std::io::Error::other(format!("openpty failed: {e}"))))?;
 
-        let mut cmd = CommandBuilder::new(&self.config.default_shell);
-        cmd.cwd(&effective_cwd);
-        // Clear server environment so OM_TOKEN, DB paths, and upstream API keys NEVER leak into PTY.
-        cmd.env_clear();
-        cmd.env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| {
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin".into()
-            }),
-        );
-        cmd.env("HOME", effective_cwd.to_string_lossy().as_ref());
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("LANG", "C.UTF-8");
-        cmd.env("LC_ALL", "C.UTF-8");
-        cmd.env("PS1", "openmirasim$ ");
+        let mut cmd = CommandBuilder::new(&wrapped.program);
+        for arg in &wrapped.args {
+            cmd.arg(arg);
+        }
+        if wrapped.clear_env {
+            cmd.env_clear();
+        }
+        for (k, v) in &wrapped.env {
+            cmd.env(k, v);
+        }
+        if let Some(dir) = &wrapped.cwd {
+            cmd.cwd(dir);
+        } else {
+            cmd.cwd(&workdir);
+        }
 
         let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
             CoreError::Io(std::io::Error::other(format!(
-                "spawn PTY shell `{}` failed: {e}",
-                self.config.default_shell
+                "spawn PTY `{}` failed: {e}",
+                wrapped.program
             )))
         })?;
         // CRITICAL: close slave FD in parent so master reader sees EOF when child exits.
         drop(pair.slave);
 
+        let child_pid = child.process_id();
         let killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>> =
             Arc::new(Mutex::new(child.clone_killer()));
         let mut reader = pair.master.try_clone_reader().map_err(|e| {
-            if let Ok(mut k) = killer.lock() {
-                let _ = k.kill();
-            }
+            terminate_pty_child(&killer, child_pid);
             let _ = child.wait();
             CoreError::Io(std::io::Error::other(format!("clone PTY reader: {e}")))
         })?;
         let mut writer = pair.master.take_writer().map_err(|e| {
-            if let Ok(mut k) = killer.lock() {
-                let _ = k.kill();
-            }
+            terminate_pty_child(&killer, child_pid);
             let _ = child.wait();
             CoreError::Io(std::io::Error::other(format!("take PTY writer: {e}")))
         })?;
@@ -290,9 +400,7 @@ impl PtyManager {
 
         let mut cast_writer = if let Some(dir) = &self.config.recordings_dir {
             let cast_path = safe_cast_path(dir, session_id.as_str()).inspect_err(|_| {
-                if let Ok(mut k) = killer.lock() {
-                    let _ = k.kill();
-                }
+                terminate_pty_child(&killer, child_pid);
                 let _ = child.wait();
             })?;
             Some(
@@ -304,9 +412,7 @@ impl PtyManager {
                     self.config.max_cast_bytes,
                 )
                 .inspect_err(|_| {
-                    if let Ok(mut k) = killer.lock() {
-                        let _ = k.kill();
-                    }
+                    terminate_pty_child(&killer, child_pid);
                     let _ = child.wait();
                 })?,
             )
@@ -317,6 +423,7 @@ impl PtyManager {
         let cols_atom = Arc::new(AtomicU16::new(cols));
         let rows_atom = Arc::new(AtomicU16::new(rows));
         let active_atom = Arc::new(AtomicBool::new(true));
+        let killed_atom = Arc::new(AtomicBool::new(false));
         let rec_bytes = Arc::new(AtomicU64::new(
             cast_writer
                 .as_ref()
@@ -331,35 +438,47 @@ impl PtyManager {
             cols: cols_atom.clone(),
             rows: rows_atom.clone(),
             active: active_atom.clone(),
+            killed: killed_atom.clone(),
             recording_bytes: rec_bytes.clone(),
             ring: ring.clone(),
             output_tx: output_tx.clone(),
             control_tx: control_tx.clone(),
             killer: killer.clone(),
+            child_pid,
         });
-        map.insert(session_id.clone(), live_entry);
 
         // 1. Dedicated child reaper thread (prevents zombie processes unconditionally).
-        let exit_code_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
-        let exit_code_writer = exit_code_slot.clone();
-        std::thread::Builder::new()
+        let exit_sync: Arc<(Mutex<Option<Option<u32>>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let exit_sync_writer = exit_sync.clone();
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-reap-{}", session_id.as_str()))
             .spawn(move || {
                 let code = child.wait().ok().map(|s| s.exit_code());
-                if let Ok(mut slot) = exit_code_writer.lock() {
-                    *slot = code;
-                }
+                let (lock, cvar) = &*exit_sync_writer;
+                *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+                cvar.notify_all();
             })
-            .ok();
+        {
+            terminate_pty_child(&killer, child_pid);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "failed to spawn pty-reap thread: {e}"
+            ))));
+        }
 
         // 2. Dedicated writer/resize/kill control thread.
         let ctrl_cols = cols_atom.clone();
         let ctrl_rows = rows_atom.clone();
         let ctrl_killer = killer.clone();
-        std::thread::Builder::new()
+        let ctrl_killed = killed_atom.clone();
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-ctrl-{}", session_id.as_str()))
             .spawn(move || {
                 while let Some(cmd) = control_rx.blocking_recv() {
+                    if ctrl_killed.load(Ordering::Acquire) {
+                        terminate_pty_child(&ctrl_killer, child_pid);
+                        break;
+                    }
                     match cmd {
                         PtyControl::Write(bytes) => {
                             if writer.write_all(&bytes).is_err() {
@@ -382,9 +501,7 @@ impl PtyManager {
                             }
                         }
                         PtyControl::Kill => {
-                            if let Ok(mut k) = ctrl_killer.lock() {
-                                let _ = k.kill();
-                            }
+                            terminate_pty_child(&ctrl_killer, child_pid);
                             break;
                         }
                     }
@@ -392,13 +509,29 @@ impl PtyManager {
                 drop(writer);
                 drop(master);
             })
-            .ok();
+        {
+            killed_atom.store(true, Ordering::Release);
+            terminate_pty_child(&killer, child_pid);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "failed to spawn pty-ctrl thread: {e}"
+            ))));
+        }
+
+        // Commit entry before starting the reader thread so it can safely remove itself on EOF.
+        {
+            let mut table = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            table.spawning.remove(session_id);
+            table.entries.insert(session_id.clone(), live_entry);
+            reservation.committed = true;
+        }
 
         // 3. Dedicated master reader thread: ring buffer + .cast + broadcast fan-out.
-        let live_map = self.live.clone();
+        let live_table = self.live.clone();
         let sid_owned = session_id.clone();
         let ctrl_on_eof = control_tx.clone();
-        std::thread::Builder::new()
+        let read_killed = killed_atom.clone();
+        let read_killer = killer.clone();
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("pty-read-{}", session_id.as_str()))
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK_BYTES];
@@ -407,30 +540,58 @@ impl PtyManager {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let slice = &buf[..n];
-                            if let Ok(mut guard) = ring.lock() {
-                                guard.push(slice);
-                            }
                             if let Some(cw) = cast_writer.as_mut() {
                                 cw.record_output(slice);
                                 rec_bytes.store(cw.bytes_written(), Ordering::Relaxed);
                             }
+                            // Hold `ring` lock across push + broadcast send so late subscribers
+                            // never miss or duplicate chunks between snapshot and stream.
+                            let mut guard = ring.lock().unwrap_or_else(PoisonError::into_inner);
+                            guard.push(slice);
                             let _ = output_tx.send(PtyOutput::Chunk(Bytes::copy_from_slice(slice)));
                         }
                     }
                 }
                 active_atom.store(false, Ordering::Release);
+                read_killed.store(true, Ordering::Release);
                 let _ = ctrl_on_eof.try_send(PtyControl::Kill);
-                let code = exit_code_slot.lock().ok().and_then(|g| *g);
+                // Wait briefly for `pty-reap` to populate the child's exit code.
+                let code = {
+                    let (lock, cvar) = &*exit_sync;
+                    let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(c) = *guard {
+                        c
+                    } else {
+                        let (g, _) = cvar
+                            .wait_timeout_while(guard, Duration::from_millis(200), |s| s.is_none())
+                            .unwrap_or_else(PoisonError::into_inner);
+                        g.flatten()
+                    }
+                };
                 let _ = output_tx.send(PtyOutput::Exited(code));
-                if let Ok(mut guard) = live_map.lock()
-                    && guard
-                        .get(&sid_owned)
-                        .is_some_and(|e| !e.active.load(Ordering::Acquire))
+                let mut table = live_table.lock().unwrap_or_else(PoisonError::into_inner);
+                if table
+                    .entries
+                    .get(&sid_owned)
+                    .is_some_and(|e| !e.active.load(Ordering::Acquire))
                 {
-                    guard.remove(&sid_owned);
+                    table.entries.remove(&sid_owned);
                 }
             })
-            .ok();
+        {
+            killed_atom.store(true, Ordering::Release);
+            active_atom.store(false, Ordering::Release);
+            terminate_pty_child(&read_killer, child_pid);
+            let _ = control_tx.try_send(PtyControl::Kill);
+            self.live
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entries
+                .remove(session_id);
+            return Err(CoreError::Io(std::io::Error::other(format!(
+                "failed to spawn pty-read thread: {e}"
+            ))));
+        }
 
         Ok(PtyAttachment {
             cols,
@@ -442,18 +603,28 @@ impl PtyManager {
         })
     }
 
+    /// Returns whether a live PTY is currently active or starting for `session_id`.
+    pub fn is_active(&self, session_id: &SessionId) -> bool {
+        let table = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        table.spawning.contains(session_id)
+            || table
+                .entries
+                .get(session_id)
+                .is_some_and(|e| e.active.load(Ordering::Acquire))
+    }
+
     /// Terminates a live PTY for `session_id` (keeps any `.cast` recording on disk).
     pub fn kill(&self, session_id: &SessionId) -> bool {
         let entry = self
             .live
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .remove(session_id);
         if let Some(pty) = entry {
             pty.active.store(false, Ordering::Release);
-            if let Ok(mut k) = pty.killer.lock() {
-                let _ = k.kill();
-            }
+            pty.killed.store(true, Ordering::Release);
+            terminate_pty_child(&pty.killer, pty.child_pid);
             let _ = pty.control_tx.try_send(PtyControl::Kill);
             true
         } else {
@@ -464,17 +635,13 @@ impl PtyManager {
     /// Terminates every active PTY (called on graceful server shutdown).
     pub fn shutdown_all(&self) {
         let drained: Vec<Arc<LivePty>> = {
-            let mut map = self
-                .live
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.drain().map(|(_, v)| v).collect()
+            let mut table = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            table.entries.drain().map(|(_, v)| v).collect()
         };
         for pty in drained {
             pty.active.store(false, Ordering::Release);
-            if let Ok(mut k) = pty.killer.lock() {
-                let _ = k.kill();
-            }
+            pty.killed.store(true, Ordering::Release);
+            terminate_pty_child(&pty.killer, pty.child_pid);
             let _ = pty.control_tx.try_send(PtyControl::Kill);
         }
     }
@@ -482,11 +649,8 @@ impl PtyManager {
     /// Returns status and recording metadata for `session_id`.
     pub fn status(&self, session_id: &SessionId) -> PtyStatus {
         let (active, cols, rows, clients, live_bytes) = {
-            let map = self
-                .live
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(pty) = map.get(session_id)
+            let table = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(pty) = table.entries.get(session_id)
                 && pty.active.load(Ordering::Acquire)
             {
                 (
@@ -506,7 +670,8 @@ impl PtyManager {
             .recordings_dir
             .as_deref()
             .and_then(|dir| safe_cast_path(dir, session_id.as_str()).ok())
-            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|p| std::fs::symlink_metadata(p).ok())
+            .filter(|m| m.is_file())
             .map(|m| m.len())
             .unwrap_or(0);
 
@@ -521,19 +686,28 @@ impl PtyManager {
         }
     }
 
-    /// Reads the asciicast v2 (`.cast`) recording bytes for `session_id`.
-    pub fn read_recording(&self, session_id: &SessionId) -> CoreResult<Vec<u8>> {
+    /// Resolves and validates the `.cast` recording path for `session_id`.
+    pub fn recording_path(&self, session_id: &SessionId) -> CoreResult<PathBuf> {
         let Some(dir) = &self.config.recordings_dir else {
             return Err(CoreError::NotFound(format!(
                 "PTY recording for session {session_id}"
             )));
         };
         let path = safe_cast_path(dir, session_id.as_str())?;
-        if !path.is_file() {
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| {
+            CoreError::NotFound(format!("PTY recording for session {session_id}"))
+        })?;
+        if !meta.is_file() {
             return Err(CoreError::NotFound(format!(
                 "PTY recording for session {session_id}"
             )));
         }
+        Ok(path)
+    }
+
+    /// Reads the asciicast v2 (`.cast`) recording bytes for `session_id`.
+    pub fn read_recording(&self, session_id: &SessionId) -> CoreResult<Vec<u8>> {
+        let path = self.recording_path(session_id)?;
         Ok(std::fs::read(path)?)
     }
 }

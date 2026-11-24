@@ -89,6 +89,9 @@ pub struct SandboxSpec {
     pub home: Option<PathBuf>,
     /// Whether outbound network is allowed.
     pub network: bool,
+    /// Keep the child's controlling session (e.g. a dedicated fresh PTY slave) instead of
+    /// detaching with `--new-session`. Must only be enabled when spawning on an isolated PTY.
+    pub keep_session: bool,
     pub limits: ResourceLimits,
 }
 

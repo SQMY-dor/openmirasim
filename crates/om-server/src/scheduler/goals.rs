@@ -9,7 +9,7 @@ use crate::orchestrator::{Orchestrator, Subscription};
 use om_core::auth::Action;
 use om_core::content::{ContentBlock, Prompt};
 use om_core::event::EventPayload;
-use om_core::goal::{DEFAULT_DONE_MARKER, Goal, GoalStatus, NewGoal};
+use om_core::goal::{Goal, GoalStatus, NewGoal};
 use om_core::ids::{GoalId, MemberId, QueuedPromptId, SessionId, TurnId};
 use om_core::queue::{QueueRemoval, SubmitMode, SubmitOutcome};
 use om_core::session::{SessionStatus, StopReason};
@@ -123,6 +123,7 @@ impl GoalRunner {
                 "role does not allow prompting sessions".into(),
             ));
         }
+        let done_marker = random_done_marker()?;
         let goal = self
             .db()
             .create_goal(Goal {
@@ -130,7 +131,7 @@ impl GoalRunner {
                 space_id: session.space_id.clone(),
                 session_id: session_id.clone(),
                 objective: new.objective.trim().to_owned(),
-                done_marker: DEFAULT_DONE_MARKER.to_owned(),
+                done_marker,
                 max_turns,
                 turns_used: 0,
                 deadline_at: new.deadline_at,
@@ -153,11 +154,20 @@ impl GoalRunner {
         )
         .await;
 
-        // Subscribe before prompting so the driver sees the goal's first turn.
+        // Subscribe at the current head_seq right before prompting so historical Failed
+        // transitions published prior to `goal.set` are not replayed as session failure.
+        let current_head = match self.db().get_session(session_id).await {
+            Ok(s) => s.head_seq,
+            Err(e) => {
+                self.end(&goal.id, GoalStatus::Failed, "subscribe_failed", None)
+                    .await;
+                return Err(e);
+            }
+        };
         let sub = match self
             .inner
             .orch
-            .subscribe(session_id, session.head_seq)
+            .subscribe(session_id, current_head)
             .await
         {
             Ok(s) => s,
@@ -171,16 +181,24 @@ impl GoalRunner {
         self.inner
             .stops
             .lock()
-            .expect("goal stops lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(goal.id.clone(), stop.clone());
         // A stop that landed before the driver was registered must not be lost.
-        if !self.db().get_goal(&goal.id).await?.status.is_active() {
-            self.inner
-                .stops
-                .lock()
-                .expect("goal stops lock")
-                .remove(&goal.id);
-            return self.db().get_goal(&goal.id).await;
+        match self.db().get_goal(&goal.id).await {
+            Ok(latest) if !latest.status.is_active() => {
+                self.inner
+                    .stops
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&goal.id);
+                return Ok(latest);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.end(&goal.id, GoalStatus::Failed, "internal_error", None)
+                    .await;
+                return Err(e);
+            }
         }
         // The driver sends the opening prompt itself, so it knows which queued prompt /
         // turn is the goal's before it reads any event of it.
@@ -257,7 +275,13 @@ impl GoalRunner {
                 false
             }
         };
-        if let Some(n) = self.inner.stops.lock().expect("goal stops lock").remove(id) {
+        if let Some(n) = self
+            .inner
+            .stops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+        {
             n.notify_one();
         }
         if ended {
@@ -313,6 +337,54 @@ impl GoalRunner {
         stop: Arc<Notify>,
         opened: tokio::sync::oneshot::Sender<CoreResult<()>>,
     ) {
+        struct StopsGuard<'a> {
+            stops: &'a std::sync::Mutex<HashMap<GoalId, Arc<Notify>>>,
+            id: GoalId,
+        }
+        impl Drop for StopsGuard<'_> {
+            fn drop(&mut self) {
+                self.stops
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&self.id);
+            }
+        }
+        let _stops_guard = StopsGuard {
+            stops: &self.inner.stops,
+            id: goal.id.clone(),
+        };
+
+        // Compute the deadline safely BEFORE signaling `opened` so an overflow can never
+        // panic after returning `201 Created` and wedge `goals_one_active`.
+        let deadline = match goal.deadline_at {
+            Some(d) => {
+                let left = d.saturating_sub(now_ms()).max(0) as u64;
+                match tokio::time::Instant::now().checked_add(std::time::Duration::from_millis(left))
+                {
+                    Some(at) => Some(at),
+                    None => {
+                        self.finish(&goal.id, GoalStatus::Failed, "invalid_deadline")
+                            .await;
+                        let _ = opened.send(Err(CoreError::InvalidInput(
+                            "deadline_at exceeds runtime timer range".into(),
+                        )));
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // Re-check goal liveness right before sending the opening prompt so a concurrent
+        // `stop_goal` never dispatches an unwanted turn.
+        if !matches!(
+            self.db().get_goal(&goal.id).await,
+            Ok(ref g) if g.status.is_active()
+        ) {
+            let _ = opened.send(Ok(()));
+            return;
+        }
+
         let opening = self
             .inner
             .orch
@@ -335,11 +407,7 @@ impl GoalRunner {
                 return;
             }
         };
-        // The deadline ends the goal even while a turn runs (review P1-13).
-        let deadline = goal.deadline_at.map(|d| {
-            let left = (d - now_ms()).max(0) as u64;
-            tokio::time::Instant::now() + std::time::Duration::from_millis(left)
-        });
+        const MAX_REPLY_BYTES: usize = 256 * 1024;
         let mut reply = String::new();
         loop {
             let ev = tokio::select! {
@@ -392,7 +460,22 @@ impl GoalRunner {
                 EventPayload::AgentMessageChunk {
                     turn_id,
                     content: ContentBlock::Text { text },
-                } if expect == Some(Expect::Turn(turn_id.clone())) => reply.push_str(&text),
+                } if expect == Some(Expect::Turn(turn_id.clone())) => {
+                    if reply.len() + text.len() > MAX_REPLY_BYTES {
+                        // Keep the tail so the completion marker at the end of a long
+                        // response is still observed while bounding host RAM.
+                        let keep_from = reply
+                            .len()
+                            .saturating_sub(MAX_REPLY_BYTES / 2);
+                        let boundary = reply
+                            .char_indices()
+                            .find(|(idx, _)| *idx >= keep_from)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(reply.len());
+                        reply.drain(..boundary);
+                    }
+                    reply.push_str(&text);
+                }
                 EventPayload::StatusChanged {
                     to: SessionStatus::Failed | SessionStatus::Closed,
                     ..
@@ -443,14 +526,14 @@ impl GoalRunner {
         if !self.db().bump_goal_turns(id, turns_used).await? {
             return Ok(Next::End(GoalStatus::Stopped, "already_ended"));
         }
-        if goal.is_met_by(reply) {
-            return Ok(Next::End(GoalStatus::Achieved, "done_marker"));
-        }
         match stop_reason {
             StopReason::Cancelled => return Ok(Next::End(GoalStatus::Stopped, "turn_cancelled")),
             StopReason::Refusal => return Ok(Next::End(GoalStatus::Stopped, "agent_refused")),
             StopReason::Failed => return Ok(Next::End(GoalStatus::Failed, "turn_failed")),
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests => {}
+        }
+        if goal.is_met_by(reply) {
+            return Ok(Next::End(GoalStatus::Achieved, "done_marker"));
         }
         if turns_used >= goal.max_turns {
             return Ok(Next::End(GoalStatus::Exhausted, "max_turns"));
@@ -496,4 +579,18 @@ impl GoalRunner {
             }
         }
     }
+}
+
+/// Generates an unpredictable per-goal completion marker so untrusted workspace content
+/// cannot spoof the fixed default marker to terminate a goal loop prematurely.
+fn random_done_marker() -> CoreResult<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| CoreError::Storage(format!("goal marker entropy failed: {e}")))?;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    Ok(format!("[[goal:done:{hex}]]"))
 }

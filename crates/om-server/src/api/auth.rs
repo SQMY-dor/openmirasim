@@ -142,7 +142,15 @@ pub async fn authenticate_secret(
     }
 
     if trimmed.starts_with(TOKEN_PREFIX) {
-        return auth.authenticate(trimmed).await;
+        match auth.authenticate(trimmed).await {
+            Ok(p) => return Ok(p),
+            Err(err) => {
+                if !static_token.is_empty() && constant_time_eq(trimmed, static_token) {
+                    return resolve_static_owner_principal(auth, db, space_id).await;
+                }
+                return Err(err);
+            }
+        }
     }
 
     if !static_token.is_empty() && constant_time_eq(trimmed, static_token) {

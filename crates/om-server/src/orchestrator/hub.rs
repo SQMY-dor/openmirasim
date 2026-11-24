@@ -11,7 +11,7 @@ use om_core::CoreResult;
 use om_core::event::SessionEvent;
 use om_core::ids::SessionId;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::broadcast;
 
 /// Page size used when replaying from SQLite.
@@ -66,6 +66,16 @@ impl EventHub {
         }
     }
 
+    pub(crate) fn prune_if_idle(&self, id: &SessionId) {
+        let mut map = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(id).is_some_and(|tx| tx.receiver_count() == 0) {
+            map.remove(id);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn channels(&self) -> usize {
         self.senders.lock().map(|m| m.len()).unwrap_or(0)
@@ -75,17 +85,29 @@ impl EventHub {
 /// A gapless, ordered stream of one session's events starting after `last_seq`.
 pub struct Subscription {
     db: Db,
+    hub: Weak<EventHub>,
     session_id: SessionId,
-    rx: broadcast::Receiver<SessionEvent>,
+    rx: Option<broadcast::Receiver<SessionEvent>>,
     backlog: VecDeque<SessionEvent>,
+    has_more_backlog: bool,
     last_seq: u64,
     head_seq: u64,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // Drop the receiver before pruning so `receiver_count()` reflects its removal.
+        self.rx.take();
+        if let Some(hub) = self.hub.upgrade() {
+            hub.prune_if_idle(&self.session_id);
+        }
+    }
 }
 
 impl Subscription {
     pub(crate) async fn open(
         db: Db,
-        hub: &EventHub,
+        hub: &Arc<EventHub>,
         session_id: SessionId,
         last_seq: u64,
     ) -> CoreResult<Self> {
@@ -93,13 +115,15 @@ impl Subscription {
         let rx = hub.subscribe(&session_id);
         let mut sub = Self {
             db,
+            hub: Arc::downgrade(hub),
             session_id,
-            rx,
+            rx: Some(rx),
             backlog: VecDeque::new(),
+            has_more_backlog: false,
             last_seq,
             head_seq: 0,
         };
-        sub.refill().await?;
+        sub.refill_page().await?;
         if last_seq > sub.head_seq {
             // The client claims events this session never had (another server, a reset
             // database). Accepting it would silently skip every event up to `last_seq`.
@@ -125,23 +149,18 @@ impl Subscription {
         &self.session_id
     }
 
-    /// Re-reads everything after `last_seq` from SQLite into the backlog.
-    async fn refill(&mut self) -> CoreResult<()> {
-        let mut after = self.backlog.back().map(|e| e.seq).unwrap_or(self.last_seq);
-        loop {
-            let page = self
-                .db
-                .list_events(&self.session_id, after, REPLAY_PAGE)
-                .await?;
-            self.head_seq = self.head_seq.max(page.head_seq);
-            if let Some(last) = page.events.last() {
-                after = last.seq;
-            }
-            self.backlog.extend(page.events);
-            if !page.has_more {
-                return Ok(());
-            }
-        }
+    /// Reads at most one page after the buffered frontier from SQLite so large histories
+    /// stream with bounded memory instead of loading every row into RAM at once.
+    async fn refill_page(&mut self) -> CoreResult<()> {
+        let after = self.backlog.back().map(|e| e.seq).unwrap_or(self.last_seq);
+        let page = self
+            .db
+            .list_events(&self.session_id, after, REPLAY_PAGE)
+            .await?;
+        self.head_seq = self.head_seq.max(page.head_seq);
+        self.has_more_backlog = page.has_more;
+        self.backlog.extend(page.events);
+        Ok(())
     }
 
     /// Next event in seq order. `Ok(None)` once the hub is gone (server shutdown).
@@ -154,7 +173,14 @@ impl Subscription {
                 self.last_seq = ev.seq;
                 return Ok(Some(ev));
             }
-            match self.rx.recv().await {
+            if self.has_more_backlog {
+                self.refill_page().await?;
+                continue;
+            }
+            let Some(rx) = self.rx.as_mut() else {
+                return Ok(None);
+            };
+            match rx.recv().await {
                 Ok(ev) if ev.seq <= self.last_seq => continue,
                 Ok(ev) if ev.seq == self.last_seq + 1 => {
                     self.last_seq = ev.seq;
@@ -162,12 +188,14 @@ impl Subscription {
                 }
                 Ok(ev) => {
                     // Defensive: a gap should be impossible, but heal it from storage.
-                    self.refill().await?;
-                    self.backlog.push_back(ev);
+                    self.refill_page().await?;
+                    if !self.has_more_backlog {
+                        self.backlog.push_back(ev);
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::debug!(session = %self.session_id, skipped, "subscriber lagged; replaying from storage");
-                    self.refill().await?;
+                    self.refill_page().await?;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(None),
             }

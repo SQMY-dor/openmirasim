@@ -9,6 +9,8 @@ description = "Isolated external Antigravity GUI bridge process (Xvfb + per-memb
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+getrandom.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
