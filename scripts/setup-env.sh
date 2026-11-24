@@ -13,6 +13,9 @@ set -euo pipefail
 #   --android  Install Phase 4 Android NDK and Rust Android cross-compilation targets.
 
 NDK_VERSION="28.2.13676358"
+BINSTALL_VERSION="1.28.0"
+BINSTALL_SHA256_X86_64="dad3d904258f50b0cc5ac34e6a6e8cefbada8bf65ab3da063faa1d6b534ad28a"
+BINSTALL_SHA256_AARCH64="a2fc44f58416eecd6091eb55b21bda968283fc7cae7712679cbb4f490c8a1489"
 CLOUD_MODE=0
 WITH_DESKTOP=0
 WITH_ANDROID=0
@@ -36,25 +39,57 @@ done
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-  SUDO="sudo"
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "ERROR: non-root execution requires 'sudo' to install system packages." >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$HOME/.local/bin"
 
-add_bashrc_line() {
-  local line="$1"
-  grep -qxF "$line" "$HOME/.bashrc" || echo "$line" >> "$HOME/.bashrc"
+add_env_line() {
+  local file="$1"
+  local line="$2"
+  touch "$file"
+  grep -qxF "$line" "$file" || echo "$line" >> "$file"
+}
+
+prepend_bashrc_block() {
+  local marker="# >>> openmirasim cloud env >>>"
+  local end_marker="# <<< openmirasim cloud env <<<"
+  local file="$HOME/.bashrc"
+  touch "$file"
+  if grep -qxF "$marker" "$file"; then
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "$marker"
+    echo 'export PATH="$HOME/.local/bin:$PATH"'
+    if [ "$WITH_ANDROID" -eq 1 ]; then
+      echo 'export ANDROID_HOME="${ANDROID_HOME:-/opt/android-sdk}"'
+      echo "export NDK_HOME=\"\$ANDROID_HOME/ndk/${NDK_VERSION}\""
+      echo 'export ANDROID_NDK_HOME="$NDK_HOME"'
+    fi
+    echo "$end_marker"
+    cat "$file"
+  } > "$tmp"
+  mv "$tmp" "$file"
 }
 
 # 1. Cloud VM non-interactive shell PATH persistence (opt-in via --cloud only).
+# Prepend a guarded block above any interactive-only guard in ~/.bashrc (and mirror in ~/.profile)
+# instead of destructively deleting existing bashrc guards.
 if [ "$CLOUD_MODE" -eq 1 ]; then
-  touch "$HOME/.bashrc"
-  sed -i '/case \$- in/,/esac/d' "$HOME/.bashrc" 2>/dev/null || true
-  add_bashrc_line 'export PATH="$HOME/.local/bin:$PATH"'
+  prepend_bashrc_block
+  add_env_line "$HOME/.profile" 'export PATH="$HOME/.local/bin:$PATH"'
   if [ "$WITH_ANDROID" -eq 1 ]; then
-    add_bashrc_line 'export ANDROID_HOME="${ANDROID_HOME:-/opt/android-sdk}"'
-    add_bashrc_line "export NDK_HOME=\"\$ANDROID_HOME/ndk/${NDK_VERSION}\""
-    add_bashrc_line 'export ANDROID_NDK_HOME="$NDK_HOME"'
+    add_env_line "$HOME/.profile" 'export ANDROID_HOME="${ANDROID_HOME:-/opt/android-sdk}"'
+    add_env_line "$HOME/.profile" "export NDK_HOME=\"\$ANDROID_HOME/ndk/${NDK_VERSION}\""
+    add_env_line "$HOME/.profile" 'export ANDROID_NDK_HOME="$NDK_HOME"'
   fi
 fi
 
@@ -83,6 +118,7 @@ if [ "$WITH_DESKTOP" -eq 1 ]; then
     libayatana-appindicator3-dev
     librsvg2-dev
     libxdo-dev
+    libdbus-1-dev
     patchelf
     xvfb
   )
@@ -137,23 +173,35 @@ if ! version_ge "$PNPM_VER" "10.0.0"; then
   exit 1
 fi
 
-# 4. Optional Phase 3: Tauri v2 CLI (architecture-aware cargo-binstall).
+# 4. Optional Phase 3: Tauri v2 CLI (pinned, SHA-256 verified cargo-binstall).
 if [ "$WITH_DESKTOP" -eq 1 ]; then
   if ! command -v cargo-binstall >/dev/null 2>&1; then
     ARCH="$(uname -m)"
     case "$ARCH" in
-      x86_64)  BINSTALL_TRIPLE="x86_64-unknown-linux-musl" ;;
-      aarch64) BINSTALL_TRIPLE="aarch64-unknown-linux-musl" ;;
+      x86_64)
+        BINSTALL_TRIPLE="x86_64-unknown-linux-musl"
+        BINSTALL_SHA256="$BINSTALL_SHA256_X86_64"
+        ;;
+      aarch64)
+        BINSTALL_TRIPLE="aarch64-unknown-linux-musl"
+        BINSTALL_SHA256="$BINSTALL_SHA256_AARCH64"
+        ;;
       *)
         echo "ERROR: Unsupported architecture for cargo-binstall: $ARCH" >&2
         exit 1
         ;;
     esac
     TMP_DIR="$(mktemp -d)"
-    curl -fsSL "https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-${BINSTALL_TRIPLE}.tgz" \
-      | tar -xz -C "$TMP_DIR"
-    mv -f "$TMP_DIR/cargo-binstall" "$HOME/.local/bin/cargo-binstall"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    ARCHIVE="$TMP_DIR/cargo-binstall.tgz"
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      "https://github.com/cargo-bins/cargo-binstall/releases/download/v${BINSTALL_VERSION}/cargo-binstall-${BINSTALL_TRIPLE}.tgz" \
+      -o "$ARCHIVE"
+    printf '%s  %s\n' "$BINSTALL_SHA256" "$ARCHIVE" | sha256sum -c -
+    tar -xzf "$ARCHIVE" -C "$TMP_DIR"
+    install -m 0755 "$TMP_DIR/cargo-binstall" "$HOME/.local/bin/cargo-binstall"
     rm -rf "$TMP_DIR"
+    trap - EXIT
   fi
 
   if ! command -v cargo-tauri >/dev/null 2>&1; then
