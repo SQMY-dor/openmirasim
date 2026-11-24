@@ -1166,7 +1166,7 @@ mod tests {
                 approval: ApprovalRecord {
                     id: ApprovalId::from("appr-1"),
                     session_id: sid.clone(),
-                    tool_call_id: "tc-1".into(),
+                    tool_call_id: Some("tc-1".into()),
                     tool_kind: None,
                     locations: vec![],
                     title: "Run cargo test".into(),
