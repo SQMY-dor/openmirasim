@@ -1,0 +1,11 @@
+{
+  "name": "@openmirasim/tauri",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenMirasim cross-platform Tauri v2 desktop thin shell (Linux / macOS / Windows)",
+  "scripts": {
+    "dev": "cargo tauri dev",
+    "build": "pnpm --filter @openmirasim/web build && cargo tauri build",
+    "typecheck": "node -e \"const fs=require('fs'); for (const f of ['src-tauri/tauri.conf.json','src-tauri/capabilities/default.json']) JSON.parse(fs.readFileSync(f,'utf8')); console.log('tauri configs valid');\""
+  }
+}

@@ -5,7 +5,9 @@ import {
   BellRing,
   GitCompare,
   Menu,
+  MessageSquare,
   Monitor,
+  Terminal as TermIcon,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -17,7 +19,12 @@ import { NewSessionModal } from "./components/NewSessionModal";
 import { SessionStream } from "./components/SessionStream";
 import { sessionDisplayTitle, Sidebar } from "./components/Sidebar";
 import { TeamConsole } from "./components/TeamConsole";
+import { TerminalView } from "./components/TerminalView";
 import { WorktreeDrawer } from "./components/WorktreeDrawer";
+import {
+  sendNativeDesktopNotification,
+  updateTrayBadge,
+} from "./desktop/tauriBridge";
 import type { OpenMirasimClient } from "./protocol/client";
 import { HttpOpenMirasimClient } from "./protocol/httpClient";
 import { MockOpenMirasimClient } from "./protocol/mockClient";
@@ -143,6 +150,7 @@ export function App() {
   const [simulatingDrop, setSimulatingDrop] = useState(false);
   const [remoteScreen, setRemoteScreen] = useState<RemoteScreenInfo | null>(null);
   const [pushEnabled, setPushEnabled] = useState<boolean>(readPushPreference);
+  const [stageView, setStageView] = useState<"chat" | "terminal">("chat");
 
   const lastSeqRef = useRef(0);
   const liveConnectedRef = useRef(false);
@@ -394,6 +402,10 @@ export function App() {
         liveConnectedRef.current
       ) {
         void notifyPendingApproval(record.session_id, record.payload.approval);
+        void sendNativeDesktopNotification(
+          "OpenMirasim 审批请求",
+          record.payload.approval.title
+        );
       }
 
       setSessions((prev) =>
@@ -589,6 +601,15 @@ export function App() {
     }
   }, [client, selectedSessionId, simulatingDrop]);
 
+  useEffect(() => {
+    const pending =
+      projection?.items.reduce((acc, it) => {
+        if (it.kind !== "assistant") return acc;
+        return acc + it.approvals.filter((a) => a.status === "pending").length;
+      }, 0) ?? 0;
+    void updateTrayBadge(pending);
+  }, [projection]);
+
   if (!client || !serverInfo) {
     const saved = readSavedAuth();
     const defaultUrl =
@@ -676,6 +697,33 @@ export function App() {
               <span className="chip warn" id="active-goal-chip">
                 目标 {projection.goal.turns_used}/{projection.goal.max_turns}
               </span>
+            )}
+
+            {selectedSession && (
+              <div className="view-switch" role="tablist" aria-label="视图切换">
+                <button
+                  type="button"
+                  role="tab"
+                  id="view-mode-chat"
+                  aria-selected={stageView === "chat"}
+                  className={`view-switch-btn ${stageView === "chat" ? "active" : ""}`}
+                  onClick={() => setStageView("chat")}
+                >
+                  <MessageSquare size={12} />
+                  <span>对话流</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  id="view-mode-terminal"
+                  aria-selected={stageView === "terminal"}
+                  className={`view-switch-btn ${stageView === "terminal" ? "active" : ""}`}
+                  onClick={() => setStageView("terminal")}
+                >
+                  <TermIcon size={12} />
+                  <span>终端 (PTY)</span>
+                </button>
+              </div>
             )}
 
             {remoteScreen && remoteScreen.available && (
@@ -802,35 +850,44 @@ export function App() {
         )}
 
         {selectedSession ? (
-          <>
-            <SessionStream
-              harnessId={selectedSession.config.harness_id}
-              items={projection?.items ?? []}
-              onResolveApproval={handleResolveApproval}
+          stageView === "terminal" ? (
+            <TerminalView
+              sessionId={selectedSession.id}
+              client={client}
+              theme={theme}
+              writable={canPrompt && activeStatus !== "closed"}
             />
-            {canPrompt ? (
-              <Composer
-                status={activeStatus}
-                disabled={
-                  connectionState === "disconnected" || activeStatus === "closed"
-                }
-                queue={projection?.queue ?? []}
-                queuePaused={projection?.queuePaused ?? false}
-                onSend={handleSendPrompt}
-                onCancel={handleCancel}
-                onWithdrawQueued={handleWithdrawQueued}
-                onMoveQueued={handleMoveQueued}
-                onResumeQueue={handleResumeQueue}
+          ) : (
+            <>
+              <SessionStream
+                harnessId={selectedSession.config.harness_id}
+                items={projection?.items ?? []}
+                onResolveApproval={handleResolveApproval}
               />
-            ) : (
-              <div className="composer-wrap">
-                <div className="viewer-composer-banner" id="viewer-composer-banner">
-                  当前角色为 <strong>Viewer（只读观察者）</strong>
-                  ：可实时同步查看会话流式输出、文件树与 Git Diff，无法发送指令或操作审批。
+              {canPrompt ? (
+                <Composer
+                  status={activeStatus}
+                  disabled={
+                    connectionState === "disconnected" || activeStatus === "closed"
+                  }
+                  queue={projection?.queue ?? []}
+                  queuePaused={projection?.queuePaused ?? false}
+                  onSend={handleSendPrompt}
+                  onCancel={handleCancel}
+                  onWithdrawQueued={handleWithdrawQueued}
+                  onMoveQueued={handleMoveQueued}
+                  onResumeQueue={handleResumeQueue}
+                />
+              ) : (
+                <div className="composer-wrap">
+                  <div className="viewer-composer-banner" id="viewer-composer-banner">
+                    当前角色为 <strong>Viewer（只读观察者）</strong>
+                    ：可实时同步查看会话流式输出、文件树与 Git Diff，无法发送指令或操作审批。
+                  </div>
                 </div>
-              </div>
-            )}
-          </>
+              )}
+            </>
+          )
         ) : (
           <div className="empty-stage">
             <h2>欢迎来到 OpenMirasim</h2>

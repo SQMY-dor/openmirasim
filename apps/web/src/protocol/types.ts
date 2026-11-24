@@ -194,6 +194,24 @@ export interface PushTestResponse {
   message: string;
 }
 
+/** Matches `GET /api/v1/sessions/:id/pty` (Phase 3 native PTY runtime). */
+export interface PtyStatus {
+  active: boolean;
+  cols: number;
+  rows: number;
+  has_recording: boolean;
+  recording_bytes: number;
+  clients: number;
+}
+
+/** Saved server connection profile (shared by Web and Tauri v2 desktop shell). */
+export interface ServerProfile {
+  id: string;
+  name: string;
+  serverUrl: string;
+  lastUsedAt: number;
+}
+
 const ROLE_RANK: Record<Role, number> = {
   viewer: 0,
   member: 1,

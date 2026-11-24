@@ -27,6 +27,7 @@ use om_server::harness::{
 };
 use om_server::orchestrator::{Orchestrator, OrchestratorConfig};
 use om_server::proxy::{KeyProxy, ProviderConfig, ProxyConfig};
+use om_server::pty::{PtyConfig, PtyManager};
 use om_server::sandbox::BwrapSandbox;
 use om_server::workspace::{WorkspaceConfig, WorkspaceManager};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -259,11 +260,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_cors_origin,
         },
     };
+    let pty_manager = PtyManager::new(PtyConfig {
+        recordings_dir: Some(data_dir.join("pty")),
+        ..Default::default()
+    });
     let extensions = ApiExtensions {
         remote_screens,
         push_store_path: Some(data_dir.join("push-subscriptions.json")),
         vapid_public_key,
         allow_loopback_push: bind_addr.ip().is_loopback(),
+        pty: Some(pty_manager.clone()),
     };
 
     let app = build_router_with_extensions(state, extensions);
@@ -284,6 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    pty_manager.shutdown_all();
     if let Some(task) = proxy_task {
         task.abort();
     }

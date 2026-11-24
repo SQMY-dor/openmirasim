@@ -435,6 +435,46 @@ export class HttpOpenMirasimClient implements OpenMirasimClient {
     return res.cleared;
   }
 
+  async getPtyStatus(
+    sessionId: SessionId
+  ): Promise<import("./types").PtyStatus> {
+    return this.request<import("./types").PtyStatus>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/pty`
+    );
+  }
+
+  async killPty(sessionId: SessionId): Promise<void> {
+    await this.request<void>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/pty`,
+      { method: "DELETE" }
+    );
+  }
+
+  async fetchPtyRecording(sessionId: SessionId): Promise<string> {
+    const res = await fetch(
+      `${this.serverUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/pty/recording`,
+      {
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+        },
+      }
+    );
+    if (!res.ok) {
+      throw new Error(`获取终端录制失败 (HTTP ${res.status})`);
+    }
+    return await res.text();
+  }
+
+  buildPtyWsUrl(sessionId: SessionId, cols: number, rows: number): string {
+    const wsBase = this.serverUrl.replace(/^http(s?):\/\//i, "ws$1://");
+    const params = new URLSearchParams({
+      token: this.token,
+      cols: String(cols),
+      rows: String(rows),
+    });
+    return `${wsBase}/ws/pty/${encodeURIComponent(sessionId)}?${params.toString()}`;
+  }
+
   subscribeSession(
     sessionId: SessionId,
     getLastSeq: () => number,

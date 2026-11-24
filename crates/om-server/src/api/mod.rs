@@ -4,6 +4,7 @@
 //! [`crate::workspace::WorkspaceManager`], and [`crate::db::Db`].
 
 pub mod auth;
+pub mod pty_ws;
 pub mod push;
 pub mod ws;
 
@@ -13,6 +14,7 @@ use crate::harness::{
     probe_registered_harnesses,
 };
 use crate::orchestrator::Orchestrator;
+use crate::pty::{PtyConfig, PtyManager, PtyStatus};
 use auth::{authenticate_secret, extract_bearer_token};
 use axum::extract::{Extension, FromRef, Path, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -60,13 +62,14 @@ pub struct ApiConfig {
     pub allow_cors_origin: Option<String>,
 }
 
-/// Optional Phase 2 gateway extensions (remote GUI screen registry and PWA Web Push).
+/// Optional Phase 2/3 gateway extensions (remote GUI screen registry, PWA Web Push, PTY runtime).
 #[derive(Clone, Default)]
 pub struct ApiExtensions {
     pub remote_screens: RemoteScreenRegistry,
     pub push_store_path: Option<PathBuf>,
     pub vapid_public_key: Option<String>,
     pub allow_loopback_push: bool,
+    pub pty: Option<PtyManager>,
 }
 
 /// Shared Axum router state.
@@ -77,11 +80,12 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
-struct GatewayState {
-    app: AppState,
-    auth: Auth,
-    push: PushStore,
-    remote_screens: RemoteScreenRegistry,
+pub(super) struct GatewayState {
+    pub(super) app: AppState,
+    pub(super) auth: Auth,
+    pub(super) push: PushStore,
+    pub(super) remote_screens: RemoteScreenRegistry,
+    pub(super) pty: PtyManager,
 }
 
 impl FromRef<GatewayState> for AppState {
@@ -114,13 +118,13 @@ impl IntoResponse for HttpApiError {
 
 type ApiResult<T> = Result<T, HttpApiError>;
 
-/// Builds the complete Axum router with default Phase 2 extensions.
+/// Builds the complete Axum router with default Phase 2/3 extensions.
 pub fn build_router(state: AppState) -> Router {
     build_router_with_extensions(state, ApiExtensions::default())
 }
 
-/// Builds the complete Axum router with explicit Phase 2 extensions (remote GUI screen
-/// registry, persistent PWA push store, and optional VAPID key).
+/// Builds the complete Axum router with explicit Phase 2/3 extensions (remote GUI screen
+/// registry, persistent PWA push store, optional VAPID key, and native PTY supervisor).
 pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Router {
     let auth = Auth::new(state.orchestrator.db().clone());
     let push = PushStore::new(
@@ -128,11 +132,15 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
         ext.vapid_public_key,
         ext.allow_loopback_push,
     );
+    let pty = ext
+        .pty
+        .unwrap_or_else(|| PtyManager::new(PtyConfig::default()));
     let gw = GatewayState {
         app: state.clone(),
         auth,
         push,
         remote_screens: ext.remote_screens,
+        pty,
     };
 
     let api_routes = Router::new()
@@ -164,6 +172,9 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
         .route("/sessions/{id}/cancel", post(cancel_turn))
         .route("/sessions/{id}/proxy/stats", get(get_session_proxy_stats))
         .route("/sessions/{id}/remote-screen", get(get_remote_screen))
+        // Native PTY status, termination, and asciicast v2 recording (Phase 3)
+        .route("/sessions/{id}/pty", get(get_pty_status).delete(kill_pty))
+        .route("/sessions/{id}/pty/recording", get(get_pty_recording))
         // Queue & Steer (W2-3)
         .route("/sessions/{id}/queue", get(list_queue))
         .route("/sessions/{id}/queue/resume", post(resume_queue))
@@ -198,6 +209,7 @@ pub fn build_router_with_extensions(state: AppState, ext: ApiExtensions) -> Rout
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/ws/events", get(ws::ws_events_handler))
+        .route("/ws/pty/{id}", get(pty_ws::ws_pty_handler))
         .nest("/api/v1", api_routes);
 
     if let Some(dir) = &state.config.static_dir {
@@ -674,6 +686,7 @@ async fn close_session(
     gw.auth.require(&principal, Action::CreateSession)?;
     let sid = SessionId::from(id);
     ensure_session_in_space(&gw, &principal, &sid).await?;
+    gw.pty.kill(&sid);
     gw.app.orchestrator.close_session(&sid).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -977,4 +990,49 @@ async fn test_push(
             format!("已检测到 {} 个已注册的 Web Push 订阅端", subs.len())
         },
     })
+}
+
+// ----------------------------------------------------------------- native PTY
+
+async fn get_pty_status(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<PtyStatus>> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    Ok(Json(gw.pty.status(&sid)))
+}
+
+async fn kill_pty(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    gw.auth.require(&principal, Action::CreateSession)?;
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    gw.pty.kill(&sid);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_pty_recording(
+    State(gw): State<GatewayState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    gw.auth.require(&principal, Action::ViewSessions)?;
+    let sid = SessionId::from(id);
+    ensure_session_in_space(&gw, &principal, &sid).await?;
+    let bytes = gw.pty.read_recording(&sid)?;
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-asciicast; charset=utf-8"),
+        )],
+        bytes,
+    )
+        .into_response())
 }
