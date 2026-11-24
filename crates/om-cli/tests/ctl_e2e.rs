@@ -224,6 +224,20 @@ async fn ctl_drives_workspaces_sessions_prompts_approvals_diff_and_queue() {
     let probe = run_ctl(&base_url, &["mcp", "probe", &mcp_id]).await;
     assert_eq!(probe["reachable"], true);
 
+    // Regression P1-24: `--enabled false` and `--enabled true` must parse via ArgAction::Set.
+    let disabled_mcp = run_ctl(
+        &base_url,
+        &["mcp", "set-enabled", &mcp_id, "--enabled", "false"],
+    )
+    .await;
+    assert_eq!(disabled_mcp["enabled"], false);
+    let enabled_mcp = run_ctl(
+        &base_url,
+        &["mcp", "set-enabled", &mcp_id, "--enabled", "true"],
+    )
+    .await;
+    assert_eq!(enabled_mcp["enabled"], true);
+
     let skill = run_ctl(
         &base_url,
         &[
@@ -261,6 +275,33 @@ async fn ctl_drives_workspaces_sessions_prompts_approvals_diff_and_queue() {
     )
     .await;
     assert_eq!(sched["name"], "CLI Schedule");
+    let sched_id = sched["id"].as_str().unwrap().to_string();
+    let paused_sched = run_ctl(
+        &base_url,
+        &["schedules", "set-enabled", &sched_id, "--enabled", "false"],
+    )
+    .await;
+    assert_eq!(paused_sched["enabled"], false);
+
+    // Regression P1-21: path traversal IDs must fail locally before hitting the server.
+    let traversal = tokio::process::Command::new(OM_CLI)
+        .arg("ctl")
+        .args([
+            "--server",
+            &base_url,
+            "--token",
+            TEST_TOKEN,
+            "sessions",
+            "get",
+            "../members/admin#",
+        ])
+        .output()
+        .await
+        .expect("failed to execute om-cli");
+    assert!(
+        !traversal.status.success(),
+        "path traversal session ID must be rejected"
+    );
 
     // 7. Query audit logs & close session
     let audit = run_ctl(&base_url, &["audit", "--limit", "10"]).await;

@@ -1,6 +1,6 @@
 //! Pure-JSON HTTP control plane client (`om-cli ctl`, W1-6).
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Subcommand, ValueEnum};
 use om_core::approval::ApprovalDecision;
 use om_core::auth::Role;
 use om_core::content::Prompt;
@@ -9,19 +9,26 @@ use om_core::queue::SubmitMode;
 use om_core::sandbox::SandboxMode;
 use om_core::session::SessionConfig;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, Url};
 use serde_json::{Value, json};
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct CtlArgs {
     /// Central `om-server` base URL.
     #[arg(long, env = "OM_SERVER_URL", default_value = "http://127.0.0.1:4939")]
     pub server: String,
 
     /// Bearer access token (`omt_...` device token or static bootstrap token).
+    /// Prefer `OM_TOKEN` env var or `--token-file` over passing secrets on argv.
     #[arg(long, env = "OM_TOKEN", default_value = "")]
     pub token: String,
+
+    /// Optional path to a file containing the bearer token (trimmed; used when `--token` / `OM_TOKEN` is empty).
+    #[arg(long)]
+    pub token_file: Option<PathBuf>,
 
     /// Pretty-print JSON output (default: compact single-line JSON for scripting/jq).
     #[arg(long, global = true)]
@@ -29,6 +36,25 @@ pub struct CtlArgs {
 
     #[command(subcommand)]
     pub command: CtlCommand,
+}
+
+impl fmt::Debug for CtlArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CtlArgs")
+            .field("server", &self.server)
+            .field(
+                "token",
+                if self.token.trim().is_empty() {
+                    &""
+                } else {
+                    &"<redacted>"
+                },
+            )
+            .field("token_file", &self.token_file)
+            .field("pretty", &self.pretty)
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,7 +267,7 @@ pub enum SessionCmd {
         workspace: Option<String>,
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, value_enum, default_value_t = CliSandboxMode::Direct)]
+        #[arg(long, value_enum, default_value_t = CliSandboxMode::Bwrap)]
         sandbox: CliSandboxMode,
         #[arg(long)]
         title: Option<String>,
@@ -291,7 +317,7 @@ pub enum QueueCmd {
     Move {
         session_id: String,
         queued_id: String,
-        position: usize,
+        position: u32,
     },
     /// Resume a paused queue.
     Resume { session_id: String },
@@ -334,10 +360,10 @@ pub enum ScheduleCmd {
         #[arg(long)]
         prompt: String,
     },
-    /// Enable or pause a schedule.
+    /// Enable or pause a schedule (`--enabled true|false`).
     SetEnabled {
         schedule_id: String,
-        #[arg(long)]
+        #[arg(long, action = ArgAction::Set)]
         enabled: bool,
     },
     /// Manually trigger a schedule immediately.
@@ -418,12 +444,21 @@ pub enum McpCmd {
         env_keys: Vec<String>,
         #[arg(long, default_value = "")]
         description: String,
+        /// Admin-only flag controlling whether a Space MCP is globally available (`true|false`).
+        #[arg(long, action = ArgAction::Set)]
+        global_available: Option<bool>,
     },
-    /// Enable or disable an MCP server.
+    /// Enable or disable an MCP server (`--enabled true|false`).
     SetEnabled {
         id: String,
-        #[arg(long)]
+        #[arg(long, action = ArgAction::Set)]
         enabled: bool,
+    },
+    /// Control whether a Space MCP server is globally available to all members (Admin/Owner).
+    SetGlobal {
+        id: String,
+        #[arg(long, action = ArgAction::Set)]
+        global_available: bool,
     },
     /// Probe command/endpoint readiness for an MCP server.
     Probe { id: String },
@@ -462,7 +497,7 @@ pub enum SkillCmd {
         id: String,
         #[arg(long)]
         lifecycle: Option<String>,
-        #[arg(long)]
+        #[arg(long, action = ArgAction::Set)]
         enabled: Option<bool>,
     },
     /// Delete a skill.
@@ -478,22 +513,72 @@ pub enum HubCmd {
     },
 }
 
+#[derive(Debug)]
 pub struct CtlError {
     pub status: Option<u16>,
     pub message: String,
     pub body: Option<Value>,
 }
 
+fn validate_path_segment<'a>(label: &str, value: &'a str) -> Result<&'a str, CtlError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '\0') || c.is_control())
+    {
+        return Err(CtlError {
+            status: None,
+            message: format!("invalid {label}: path separators and control characters are forbidden"),
+            body: None,
+        });
+    }
+    Ok(value)
+}
+
+fn resolve_token(inline: &str, token_file: Option<&Path>) -> Result<String, CtlError> {
+    let trimmed = inline.trim();
+    if !trimmed.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    if let Some(path) = token_file {
+        let content = std::fs::read_to_string(path).map_err(|e| CtlError {
+            status: None,
+            message: format!("failed to read --token-file {}: {e}", path.display()),
+            body: None,
+        })?;
+        return Ok(content.trim().to_string());
+    }
+    Ok(String::new())
+}
+
 struct ApiClient {
-    base: String,
+    base_url: Url,
     token: String,
     http: Client,
 }
 
 impl ApiClient {
     fn new(server: &str, token: &str) -> Result<Self, CtlError> {
+        let base_url = Url::parse(server.trim()).map_err(|e| CtlError {
+            status: None,
+            message: format!("invalid server URL: {e}"),
+            body: None,
+        })?;
+        match base_url.scheme() {
+            "http" | "https" if base_url.host_str().is_some() => {}
+            _ => {
+                return Err(CtlError {
+                    status: None,
+                    message: "server URL must use http:// or https:// with a valid host".into(),
+                    body: None,
+                });
+            }
+        }
         let http = Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| CtlError {
                 status: None,
@@ -501,25 +586,46 @@ impl ApiClient {
                 body: None,
             })?;
         Ok(Self {
-            base: server.trim_end_matches('/').to_string(),
+            base_url,
             token: token.trim().to_string(),
             http,
         })
     }
 
-    async fn send(
+    fn build_url(&self, segments: &[&str], query: &[(&str, String)]) -> Result<Url, CtlError> {
+        let mut url = self.base_url.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        {
+            let mut segs = url.path_segments_mut().map_err(|()| CtlError {
+                status: None,
+                message: "server URL cannot be used as a base URL".into(),
+                body: None,
+            })?;
+            segs.pop_if_empty();
+            for s in segments {
+                segs.push(s);
+            }
+        }
+        if !query.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (k, v) in query {
+                pairs.append_pair(k, v);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn send_segments(
         &self,
         method: Method,
-        path: &str,
+        segments: &[&str],
         query: &[(&str, String)],
         body: Option<Value>,
         auth: bool,
     ) -> Result<Value, CtlError> {
-        let url = format!("{}{}", self.base, path);
-        let mut req = self.http.request(method, &url);
-        if !query.is_empty() {
-            req = req.query(query);
-        }
+        let url = self.build_url(segments, query)?;
+        let mut req = self.http.request(method, url);
         if auth && !self.token.is_empty() {
             req = req.header(AUTHORIZATION, format!("Bearer {}", self.token));
         }
@@ -571,27 +677,32 @@ impl ApiClient {
 }
 
 pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
-    let client = ApiClient::new(&args.server, &args.token)?;
+    let token = resolve_token(&args.token, args.token_file.as_deref())?;
+    let client = ApiClient::new(&args.server, &token)?;
 
     match args.command {
-        CtlCommand::Health => client.send(Method::GET, "/healthz", &[], None, false).await,
+        CtlCommand::Health => {
+            client
+                .send_segments(Method::GET, &["healthz"], &[], None, false)
+                .await
+        }
         CtlCommand::Me => {
             client
-                .send(Method::GET, "/api/v1/me", &[], None, true)
+                .send_segments(Method::GET, &["api", "v1", "me"], &[], None, true)
                 .await
         }
         CtlCommand::Members { action } => match action {
             MemberCmd::List => {
                 client
-                    .send(Method::GET, "/api/v1/members", &[], None, true)
+                    .send_segments(Method::GET, &["api", "v1", "members"], &[], None, true)
                     .await
             }
             MemberCmd::Add { name, role } => {
                 let r: Role = role.into();
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/members",
+                        &["api", "v1", "members"],
                         &[],
                         Some(json!({ "display_name": name, "role": r })),
                         true,
@@ -599,11 +710,12 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             MemberCmd::SetRole { member_id, role } => {
+                let member_id = validate_path_segment("member_id", &member_id)?;
                 let r: Role = role.into();
                 client
-                    .send(
+                    .send_segments(
                         Method::PATCH,
-                        &format!("/api/v1/members/{member_id}"),
+                        &["api", "v1", "members", member_id],
                         &[],
                         Some(json!({ "role": r })),
                         true,
@@ -611,10 +723,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             MemberCmd::Disable { member_id } => {
+                let member_id = validate_path_segment("member_id", &member_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/members/{member_id}"),
+                        &["api", "v1", "members", member_id],
                         &[],
                         None,
                         true,
@@ -624,10 +737,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
         },
         CtlCommand::Tokens { action } => match action {
             TokenCmd::List { member_id } => {
+                let member_id = validate_path_segment("member_id", &member_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/members/{member_id}/tokens"),
+                        &["api", "v1", "members", member_id, "tokens"],
                         &[],
                         None,
                         true,
@@ -639,14 +753,15 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 label,
                 ttl_secs,
             } => {
+                let member_id = validate_path_segment("member_id", &member_id)?;
                 let mut body = json!({ "label": label });
                 if let Some(ttl) = ttl_secs {
                     body["ttl_secs"] = json!(ttl);
                 }
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/members/{member_id}/tokens"),
+                        &["api", "v1", "members", member_id, "tokens"],
                         &[],
                         Some(body),
                         true,
@@ -654,10 +769,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             TokenCmd::Revoke { token_id } => {
+                let token_id = validate_path_segment("token_id", &token_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/tokens/{token_id}"),
+                        &["api", "v1", "tokens", token_id],
                         &[],
                         None,
                         true,
@@ -666,29 +782,39 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
             }
         },
         CtlCommand::Harnesses { probe } => {
-            let path = if probe {
-                "/api/v1/harnesses/probe"
+            if probe {
+                client
+                    .send_segments(
+                        Method::GET,
+                        &["api", "v1", "harnesses", "probe"],
+                        &[],
+                        None,
+                        true,
+                    )
+                    .await
             } else {
-                "/api/v1/harnesses"
-            };
-            client.send(Method::GET, path, &[], None, true).await
+                client
+                    .send_segments(Method::GET, &["api", "v1", "harnesses"], &[], None, true)
+                    .await
+            }
         }
         CtlCommand::Providers => {
             client
-                .send(Method::GET, "/api/v1/providers", &[], None, true)
+                .send_segments(Method::GET, &["api", "v1", "providers"], &[], None, true)
                 .await
         }
         CtlCommand::Workspaces { action } => match action {
             WorkspaceCmd::List => {
                 client
-                    .send(Method::GET, "/api/v1/workspaces", &[], None, true)
+                    .send_segments(Method::GET, &["api", "v1", "workspaces"], &[], None, true)
                     .await
             }
             WorkspaceCmd::Get { id } => {
+                let id = validate_path_segment("workspace_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/workspaces/{id}"),
+                        &["api", "v1", "workspaces", id],
                         &[],
                         None,
                         true,
@@ -697,9 +823,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
             }
             WorkspaceCmd::Register { name, path } => {
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/workspaces",
+                        &["api", "v1", "workspaces"],
                         &[],
                         Some(json!({ "name": name, "repo_path": path })),
                         true,
@@ -710,18 +836,13 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
         CtlCommand::Sessions { action } => match action {
             SessionCmd::List => {
                 client
-                    .send(Method::GET, "/api/v1/sessions", &[], None, true)
+                    .send_segments(Method::GET, &["api", "v1", "sessions"], &[], None, true)
                     .await
             }
             SessionCmd::Get { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
-                        Method::GET,
-                        &format!("/api/v1/sessions/{id}"),
-                        &[],
-                        None,
-                        true,
-                    )
+                    .send_segments(Method::GET, &["api", "v1", "sessions", id], &[], None, true)
                     .await
             }
             SessionCmd::Create {
@@ -741,9 +862,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     title,
                 };
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/sessions",
+                        &["api", "v1", "sessions"],
                         &[],
                         Some(json!({ "config": config })),
                         true,
@@ -751,10 +872,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Resume { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/sessions/{id}/resume"),
+                        &["api", "v1", "sessions", id, "resume"],
                         &[],
                         None,
                         true,
@@ -762,10 +884,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Close { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/sessions/{id}"),
+                        &["api", "v1", "sessions", id],
                         &[],
                         None,
                         true,
@@ -777,14 +900,15 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 after_seq,
                 limit,
             } => {
+                let id = validate_path_segment("session_id", &id)?;
                 let mut q = vec![("after_seq", after_seq.to_string())];
                 if let Some(lim) = limit {
                     q.push(("limit", lim.to_string()));
                 }
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/events"),
+                        &["api", "v1", "sessions", id, "events"],
                         &q,
                         None,
                         true,
@@ -792,10 +916,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Worktree { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/worktree"),
+                        &["api", "v1", "sessions", id, "worktree"],
                         &[],
                         None,
                         true,
@@ -803,10 +928,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::RemoveWorktree { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/sessions/{id}/worktree"),
+                        &["api", "v1", "sessions", id, "worktree"],
                         &[],
                         None,
                         true,
@@ -814,10 +940,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Files { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/files"),
+                        &["api", "v1", "sessions", id, "files"],
                         &[],
                         None,
                         true,
@@ -825,10 +952,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::File { id, path } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/file"),
+                        &["api", "v1", "sessions", id, "file"],
                         &[("path", path)],
                         None,
                         true,
@@ -836,10 +964,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Diff { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/diff"),
+                        &["api", "v1", "sessions", id, "diff"],
                         &[],
                         None,
                         true,
@@ -847,10 +976,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::ProxyStats { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/proxy/stats"),
+                        &["api", "v1", "sessions", id, "proxy", "stats"],
                         &[],
                         None,
                         true,
@@ -858,10 +988,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::RemoteScreen { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/remote-screen"),
+                        &["api", "v1", "sessions", id, "remote-screen"],
                         &[],
                         None,
                         true,
@@ -869,10 +1000,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::Pty { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{id}/pty"),
+                        &["api", "v1", "sessions", id, "pty"],
                         &[],
                         None,
                         true,
@@ -880,10 +1012,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SessionCmd::KillPty { id } => {
+                let id = validate_path_segment("session_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/sessions/{id}/pty"),
+                        &["api", "v1", "sessions", id, "pty"],
                         &[],
                         None,
                         true,
@@ -896,15 +1029,16 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
             text,
             mode,
         } => {
+            let session_id = validate_path_segment("session_id", &session_id)?;
             let mut body = json!({ "prompt": Prompt::text(text) });
             if let Some(m) = mode {
                 let submit_mode: SubmitMode = m.into();
                 body["mode"] = serde_json::to_value(submit_mode).unwrap_or(Value::Null);
             }
             client
-                .send(
+                .send_segments(
                     Method::POST,
-                    &format!("/api/v1/sessions/{session_id}/prompts"),
+                    &["api", "v1", "sessions", session_id, "prompts"],
                     &[],
                     Some(body),
                     true,
@@ -912,10 +1046,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 .await
         }
         CtlCommand::Cancel { session_id } => {
+            let session_id = validate_path_segment("session_id", &session_id)?;
             client
-                .send(
+                .send_segments(
                     Method::POST,
-                    &format!("/api/v1/sessions/{session_id}/cancel"),
+                    &["api", "v1", "sessions", session_id, "cancel"],
                     &[],
                     None,
                     true,
@@ -924,10 +1059,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
         }
         CtlCommand::Queue { action } => match action {
             QueueCmd::List { session_id } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{session_id}/queue"),
+                        &["api", "v1", "sessions", session_id, "queue"],
                         &[],
                         None,
                         true,
@@ -938,10 +1074,12 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 session_id,
                 queued_id,
             } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
+                let queued_id = validate_path_segment("queued_id", &queued_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/sessions/{session_id}/queue/{queued_id}"),
+                        &["api", "v1", "sessions", session_id, "queue", queued_id],
                         &[],
                         None,
                         true,
@@ -953,10 +1091,20 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 queued_id,
                 position,
             } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
+                let queued_id = validate_path_segment("queued_id", &queued_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/sessions/{session_id}/queue/{queued_id}/move"),
+                        &[
+                            "api",
+                            "v1",
+                            "sessions",
+                            session_id,
+                            "queue",
+                            queued_id,
+                            "move",
+                        ],
                         &[],
                         Some(json!({ "position": position })),
                         true,
@@ -964,10 +1112,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             QueueCmd::Resume { session_id } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/sessions/{session_id}/queue/resume"),
+                        &["api", "v1", "sessions", session_id, "queue", "resume"],
                         &[],
                         None,
                         true,
@@ -980,15 +1129,16 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 session_id,
                 pending,
             } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 let q = if pending {
                     vec![("pending_only", "true".to_string())]
                 } else {
                     Vec::new()
                 };
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{session_id}/approvals"),
+                        &["api", "v1", "sessions", session_id, "approvals"],
                         &q,
                         None,
                         true,
@@ -1000,6 +1150,7 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 option,
                 cancel,
             } => {
+                let approval_id = validate_path_segment("approval_id", &approval_id)?;
                 let decision = if cancel {
                     ApprovalDecision::Cancelled
                 } else if let Some(option_id) = option {
@@ -1012,9 +1163,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     });
                 };
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/approvals/{approval_id}/resolve"),
+                        &["api", "v1", "approvals", approval_id, "resolve"],
                         &[],
                         Some(json!({ "decision": decision })),
                         true,
@@ -1022,10 +1173,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             ApprovalCmd::Rules { session_id } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{session_id}/approval-rules"),
+                        &["api", "v1", "sessions", session_id, "approval-rules"],
                         &[],
                         None,
                         true,
@@ -1033,10 +1185,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             ApprovalCmd::ClearRules { session_id } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/sessions/{session_id}/approval-rules"),
+                        &["api", "v1", "sessions", session_id, "approval-rules"],
                         &[],
                         None,
                         true,
@@ -1050,13 +1203,13 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 q.push(("target", t));
             }
             client
-                .send(Method::GET, "/api/v1/audit", &q, None, true)
+                .send_segments(Method::GET, &["api", "v1", "audit"], &q, None, true)
                 .await
         }
         CtlCommand::Schedules { action } => match action {
             ScheduleCmd::List => {
                 client
-                    .send(Method::GET, "/api/v1/schedules", &[], None, true)
+                    .send_segments(Method::GET, &["api", "v1", "schedules"], &[], None, true)
                     .await
             }
             ScheduleCmd::Create {
@@ -1065,11 +1218,26 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 session,
                 prompt,
             } => {
-                let start_at = om_core::now_ms() + (interval_secs as i64) * 1000;
+                if interval_secs == 0 {
+                    return Err(CtlError {
+                        status: None,
+                        message: "interval_secs must be greater than 0".into(),
+                        body: None,
+                    });
+                }
+                let start_at = i64::try_from(interval_secs)
+                    .ok()
+                    .and_then(|s| s.checked_mul(1000))
+                    .and_then(|ms| om_core::now_ms().checked_add(ms))
+                    .ok_or_else(|| CtlError {
+                        status: None,
+                        message: "interval_secs overflowed timestamp range".into(),
+                        body: None,
+                    })?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/schedules",
+                        &["api", "v1", "schedules"],
                         &[],
                         Some(json!({
                             "name": name,
@@ -1094,10 +1262,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 schedule_id,
                 enabled,
             } => {
+                let schedule_id = validate_path_segment("schedule_id", &schedule_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/schedules/{schedule_id}/enabled"),
+                        &["api", "v1", "schedules", schedule_id, "enabled"],
                         &[],
                         Some(json!({ "enabled": enabled })),
                         true,
@@ -1105,10 +1274,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             ScheduleCmd::Trigger { schedule_id } => {
+                let schedule_id = validate_path_segment("schedule_id", &schedule_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/schedules/{schedule_id}/trigger"),
+                        &["api", "v1", "schedules", schedule_id, "trigger"],
                         &[],
                         None,
                         true,
@@ -1116,10 +1286,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             ScheduleCmd::Runs { schedule_id, limit } => {
+                let schedule_id = validate_path_segment("schedule_id", &schedule_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/schedules/{schedule_id}/runs"),
+                        &["api", "v1", "schedules", schedule_id, "runs"],
                         &[("limit", limit.to_string())],
                         None,
                         true,
@@ -1127,10 +1298,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             ScheduleCmd::Delete { schedule_id } => {
+                let schedule_id = validate_path_segment("schedule_id", &schedule_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/schedules/{schedule_id}"),
+                        &["api", "v1", "schedules", schedule_id],
                         &[],
                         None,
                         true,
@@ -1140,10 +1312,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
         },
         CtlCommand::Goals { action } => match action {
             GoalCmd::List { session_id } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{session_id}/goals"),
+                        &["api", "v1", "sessions", session_id, "goals"],
                         &[],
                         None,
                         true,
@@ -1155,14 +1328,15 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 objective,
                 max_turns,
             } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 let mut body = json!({ "objective": objective });
                 if let Some(mt) = max_turns {
                     body["max_turns"] = json!(mt);
                 }
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/sessions/{session_id}/goals"),
+                        &["api", "v1", "sessions", session_id, "goals"],
                         &[],
                         Some(body),
                         true,
@@ -1170,10 +1344,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             GoalCmd::Stop { goal_id } => {
+                let goal_id = validate_path_segment("goal_id", &goal_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/goals/{goal_id}/stop"),
+                        &["api", "v1", "goals", goal_id, "stop"],
                         &[],
                         None,
                         true,
@@ -1183,10 +1358,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
         },
         CtlCommand::Dispatches { action } => match action {
             DispatchCmd::List { session_id, limit } => {
+                let session_id = validate_path_segment("session_id", &session_id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::GET,
-                        &format!("/api/v1/sessions/{session_id}/dispatches"),
+                        &["api", "v1", "sessions", session_id, "dispatches"],
                         &[("limit", limit.to_string())],
                         None,
                         true,
@@ -1201,9 +1377,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
             } => {
                 let m: SubmitMode = mode.into();
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/dispatches",
+                        &["api", "v1", "dispatches"],
                         &[],
                         Some(json!({
                             "from_session": from,
@@ -1229,7 +1405,7 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     q.push(("workspace_id", w));
                 }
                 client
-                    .send(Method::GET, "/api/v1/mcp/servers", &q, None, true)
+                    .send_segments(Method::GET, &["api", "v1", "mcp", "servers"], &q, None, true)
                     .await
             }
             McpCmd::Add {
@@ -1242,44 +1418,66 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 url,
                 env_keys,
                 description,
+                global_available,
             } => {
+                let mut body = json!({
+                    "name": name,
+                    "scope": scope,
+                    "workspace_id": workspace,
+                    "transport": transport,
+                    "command": command,
+                    "args": args,
+                    "url": url,
+                    "env_keys": env_keys,
+                    "description": description,
+                    "enabled": true,
+                });
+                if let Some(ga) = global_available {
+                    body["global_available"] = json!(ga);
+                }
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/mcp/servers",
+                        &["api", "v1", "mcp", "servers"],
                         &[],
-                        Some(json!({
-                            "name": name,
-                            "scope": scope,
-                            "workspace_id": workspace,
-                            "transport": transport,
-                            "command": command,
-                            "args": args,
-                            "url": url,
-                            "env_keys": env_keys,
-                            "description": description,
-                            "enabled": true,
-                        })),
+                        Some(body),
                         true,
                     )
                     .await
             }
             McpCmd::SetEnabled { id, enabled } => {
+                let id = validate_path_segment("mcp_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::PATCH,
-                        &format!("/api/v1/mcp/servers/{id}"),
+                        &["api", "v1", "mcp", "servers", id],
                         &[],
                         Some(json!({ "enabled": enabled })),
                         true,
                     )
                     .await
             }
-            McpCmd::Probe { id } => {
+            McpCmd::SetGlobal {
+                id,
+                global_available,
+            } => {
+                let id = validate_path_segment("mcp_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
+                        Method::PATCH,
+                        &["api", "v1", "mcp", "servers", id],
+                        &[],
+                        Some(json!({ "global_available": global_available })),
+                        true,
+                    )
+                    .await
+            }
+            McpCmd::Probe { id } => {
+                let id = validate_path_segment("mcp_id", &id)?;
+                client
+                    .send_segments(
                         Method::POST,
-                        &format!("/api/v1/mcp/servers/{id}/probe"),
+                        &["api", "v1", "mcp", "servers", id, "probe"],
                         &[],
                         None,
                         true,
@@ -1287,10 +1485,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             McpCmd::Delete { id } => {
+                let id = validate_path_segment("mcp_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/mcp/servers/{id}"),
+                        &["api", "v1", "mcp", "servers", id],
                         &[],
                         None,
                         true,
@@ -1308,7 +1507,7 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     q.push(("workspace_id", w));
                 }
                 client
-                    .send(Method::GET, "/api/v1/skills", &q, None, true)
+                    .send_segments(Method::GET, &["api", "v1", "skills"], &q, None, true)
                     .await
             }
             SkillCmd::Install {
@@ -1321,9 +1520,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 lifecycle,
             } => {
                 client
-                    .send(
+                    .send_segments(
                         Method::POST,
-                        "/api/v1/skills",
+                        &["api", "v1", "skills"],
                         &[],
                         Some(json!({
                             "name": name,
@@ -1344,6 +1543,7 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                 lifecycle,
                 enabled,
             } => {
+                let id = validate_path_segment("skill_id", &id)?;
                 let mut body = json!({});
                 if let Some(lc) = lifecycle {
                     body["lifecycle"] = json!(lc);
@@ -1352,9 +1552,9 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     body["enabled"] = json!(en);
                 }
                 client
-                    .send(
+                    .send_segments(
                         Method::PATCH,
-                        &format!("/api/v1/skills/{id}"),
+                        &["api", "v1", "skills", id],
                         &[],
                         Some(body),
                         true,
@@ -1362,10 +1562,11 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .await
             }
             SkillCmd::Delete { id } => {
+                let id = validate_path_segment("skill_id", &id)?;
                 client
-                    .send(
+                    .send_segments(
                         Method::DELETE,
-                        &format!("/api/v1/skills/{id}"),
+                        &["api", "v1", "skills", id],
                         &[],
                         None,
                         true,
@@ -1380,9 +1581,95 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     q.push(("workspace_id", w));
                 }
                 client
-                    .send(Method::GET, "/api/v1/hub/effective", &q, None, true)
+                    .send_segments(
+                        Method::GET,
+                        &["api", "v1", "hub", "effective"],
+                        &q,
+                        None,
+                        true,
+                    )
                     .await
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        ctl: CtlArgs,
+    }
+
+    #[test]
+    fn rejects_path_traversal_and_special_url_chars() {
+        for bad in ["", ".", "..", "../members/mem_admin#", "a/b", "id?x=1", "id#frag"] {
+            assert!(
+                validate_path_segment("id", bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert_eq!(
+            validate_path_segment("id", "sess_01abc-def").unwrap(),
+            "sess_01abc-def"
+        );
+    }
+
+    #[test]
+    fn set_enabled_and_set_global_accept_explicit_bool_values() {
+        let parsed = TestCli::try_parse_from([
+            "om-cli",
+            "--token",
+            "secret_should_redact",
+            "schedules",
+            "set-enabled",
+            "sched-1",
+            "--enabled",
+            "false",
+        ])
+        .unwrap();
+        let debug_str = format!("{:?}", parsed.ctl);
+        assert!(
+            !debug_str.contains("secret_should_redact"),
+            "Debug must redact token: {debug_str}"
+        );
+        match parsed.ctl.command {
+            CtlCommand::Schedules {
+                action: ScheduleCmd::SetEnabled {
+                    schedule_id,
+                    enabled,
+                },
+            } => {
+                assert_eq!(schedule_id, "sched-1");
+                assert!(!enabled);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let mcp_parsed = TestCli::try_parse_from([
+            "om-cli",
+            "mcp",
+            "set-global",
+            "mcp-1",
+            "--global-available",
+            "false",
+        ])
+        .unwrap();
+        match mcp_parsed.ctl.command {
+            CtlCommand::Mcp {
+                action: McpCmd::SetGlobal {
+                    id,
+                    global_available,
+                },
+            } => {
+                assert_eq!(id, "mcp-1");
+                assert!(!global_available);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
