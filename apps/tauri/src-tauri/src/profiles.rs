@@ -72,10 +72,9 @@ fn validate_server_url(raw: &str) -> Result<String, String> {
 
 fn ensure_not_symlink(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
-            "refusing to follow symlink at {}",
-            path.display()
-        )),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing to follow symlink at {}", path.display()))
+        }
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("stat {} failed: {e}", path.display())),

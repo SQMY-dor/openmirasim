@@ -530,7 +530,9 @@ fn validate_path_segment<'a>(label: &str, value: &'a str) -> Result<&'a str, Ctl
     {
         return Err(CtlError {
             status: None,
-            message: format!("invalid {label}: path separators and control characters are forbidden"),
+            message: format!(
+                "invalid {label}: path separators and control characters are forbidden"
+            ),
             body: None,
         });
     }
@@ -1097,13 +1099,7 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     .send_segments(
                         Method::POST,
                         &[
-                            "api",
-                            "v1",
-                            "sessions",
-                            session_id,
-                            "queue",
-                            queued_id,
-                            "move",
+                            "api", "v1", "sessions", session_id, "queue", queued_id, "move",
                         ],
                         &[],
                         Some(json!({ "position": position })),
@@ -1405,7 +1401,13 @@ pub async fn run(args: CtlArgs) -> Result<Value, CtlError> {
                     q.push(("workspace_id", w));
                 }
                 client
-                    .send_segments(Method::GET, &["api", "v1", "mcp", "servers"], &q, None, true)
+                    .send_segments(
+                        Method::GET,
+                        &["api", "v1", "mcp", "servers"],
+                        &q,
+                        None,
+                        true,
+                    )
                     .await
             }
             McpCmd::Add {
@@ -1607,7 +1609,15 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal_and_special_url_chars() {
-        for bad in ["", ".", "..", "../members/mem_admin#", "a/b", "id?x=1", "id#frag"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../members/mem_admin#",
+            "a/b",
+            "id?x=1",
+            "id#frag",
+        ] {
             assert!(
                 validate_path_segment("id", bad).is_err(),
                 "expected {bad:?} to be rejected"
@@ -1639,10 +1649,11 @@ mod tests {
         );
         match parsed.ctl.command {
             CtlCommand::Schedules {
-                action: ScheduleCmd::SetEnabled {
-                    schedule_id,
-                    enabled,
-                },
+                action:
+                    ScheduleCmd::SetEnabled {
+                        schedule_id,
+                        enabled,
+                    },
             } => {
                 assert_eq!(schedule_id, "sched-1");
                 assert!(!enabled);
@@ -1661,10 +1672,11 @@ mod tests {
         .unwrap();
         match mcp_parsed.ctl.command {
             CtlCommand::Mcp {
-                action: McpCmd::SetGlobal {
-                    id,
-                    global_available,
-                },
+                action:
+                    McpCmd::SetGlobal {
+                        id,
+                        global_available,
+                    },
             } => {
                 assert_eq!(id, "mcp-1");
                 assert!(!global_available);

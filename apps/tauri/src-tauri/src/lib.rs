@@ -45,9 +45,7 @@ fn sanitize_notification_text(raw: &str, max_chars: usize) -> String {
 
 fn allow_notification_now() -> bool {
     let now = Instant::now();
-    let mut queue = NOTIFY_TIMESTAMPS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut queue = NOTIFY_TIMESTAMPS.lock().unwrap_or_else(|e| e.into_inner());
     while let Some(&front) = queue.front() {
         if now.duration_since(front) >= NOTIFY_WINDOW {
             queue.pop_front();

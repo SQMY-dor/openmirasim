@@ -998,21 +998,18 @@ pub async fn run(args: TuiArgs) -> Result<(), String> {
                 KeyCode::Char('i') => {
                     state.input_mode = true;
                 }
-                KeyCode::Char('r') => {
-                    match fetch_sessions(&http, &base_url, &token).await {
-                        Ok(list) => {
-                            state.sessions = list;
-                            if state.selected >= state.sessions.len() && !state.sessions.is_empty()
-                            {
-                                state.selected = state.sessions.len() - 1;
-                            }
-                            state.status_line = "已刷新会话列表".into();
+                KeyCode::Char('r') => match fetch_sessions(&http, &base_url, &token).await {
+                    Ok(list) => {
+                        state.sessions = list;
+                        if state.selected >= state.sessions.len() && !state.sessions.is_empty() {
+                            state.selected = state.sessions.len() - 1;
                         }
-                        Err(e) => {
-                            state.status_line = format!("刷新会话列表失败: {e}");
-                        }
+                        state.status_line = "已刷新会话列表".into();
                     }
-                }
+                    Err(e) => {
+                        state.status_line = format!("刷新会话列表失败: {e}");
+                    }
+                },
                 KeyCode::Char('a') | KeyCode::Char('x') => {
                     if let Some(app) = state.current_approval().cloned() {
                         let opt = if key.code == KeyCode::Char('a') {
