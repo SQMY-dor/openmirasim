@@ -324,6 +324,16 @@ export function renderContentBlocks(blocks: readonly ContentBlock[]): string {
   return blocks.map(renderContentBlockText).join("");
 }
 
+export function isSafeHttpUrl(raw: string | undefined | null): boolean {
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /** Phase 4: Space / Workspace two-tier MCP Hub & Skills lifecycle types. */
 export type HubScopeLevel = "space" | "workspace";
 export type McpTransport = "stdio" | "sse" | "streamable_http";
@@ -334,6 +344,8 @@ export interface McpServerRecord {
   space_id: string;
   scope: HubScopeLevel;
   workspace_id?: string;
+  owner_member_id?: string;
+  global_available?: boolean;
   name: string;
   transport: McpTransport;
   command?: string;
@@ -358,10 +370,12 @@ export interface CreateMcpServerRequest {
   env_keys?: string[];
   description?: string;
   enabled?: boolean;
+  global_available?: boolean;
 }
 
 export interface UpdateMcpServerRequest {
   enabled?: boolean;
+  global_available?: boolean;
   description?: string;
   command?: string;
   args?: string[];

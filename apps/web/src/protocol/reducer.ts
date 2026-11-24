@@ -91,6 +91,7 @@ export interface SessionProjection {
 }
 
 const MAX_RAW_INSPECTOR_EVENTS = 250;
+const MAX_TIMELINE_ITEMS = 1000;
 
 export function createEmptyProjection(
   sessionId: string,
@@ -173,6 +174,14 @@ export function applySessionEvent(
   }
 
   const hasGap = state.lastSeq > 0 && record.seq > state.lastSeq + 1;
+  if (hasGap) {
+    // Hold `lastSeq` at the last contiguous sequence number so the caller triggers a
+    // `Subscribe { last_seq }` resync instead of silently skipping missing events.
+    return {
+      ...state,
+      gapDetectedCount: state.gapDetectedCount + 1,
+    };
+  }
   const items = state.items.slice();
   let status = state.status;
   let capabilities = state.capabilities;
@@ -264,25 +273,41 @@ export function applySessionEvent(
       const current = items[idx];
       if (current.kind === "assistant") {
         const tc = ev.tool_call;
-        const exists = current.toolCalls.some(
+        const existingIdx = current.toolCalls.findIndex(
           (t) => t.tool_call_id === tc.tool_call_id
         );
-        const toolCalls = exists
-          ? current.toolCalls
-          : [
-              ...current.toolCalls,
-              {
-                tool_call_id: tc.tool_call_id,
-                title: tc.title,
-                kind: tc.kind,
-                status: tc.status,
-                rawInput: formatJsonValue(tc.raw_input),
-                locations: tc.locations ?? [],
-                outputText: "",
-                startedAt: record.ts,
-                updatedAt: record.ts,
-              },
-            ];
+        const toolCalls =
+          existingIdx >= 0
+            ? current.toolCalls.map((t, i) =>
+                i === existingIdx
+                  ? {
+                      ...t,
+                      title: tc.title || t.title,
+                      kind: tc.kind,
+                      status: tc.status,
+                      rawInput: formatJsonValue(tc.raw_input) || t.rawInput,
+                      locations:
+                        tc.locations && tc.locations.length > 0
+                          ? tc.locations
+                          : t.locations,
+                      updatedAt: record.ts,
+                    }
+                  : t
+              )
+            : [
+                ...current.toolCalls,
+                {
+                  tool_call_id: tc.tool_call_id,
+                  title: tc.title,
+                  kind: tc.kind,
+                  status: tc.status,
+                  rawInput: formatJsonValue(tc.raw_input),
+                  locations: tc.locations ?? [],
+                  outputText: "",
+                  startedAt: record.ts,
+                  updatedAt: record.ts,
+                },
+              ];
         items[idx] = { ...current, toolCalls };
       }
       break;
@@ -301,11 +326,15 @@ export function applySessionEvent(
         const rawOut = formatJsonValue(upd.raw_output);
         const toolCalls = current.toolCalls.map((t) => {
           if (t.tool_call_id !== upd.tool_call_id) return t;
-          const nextOutput = chunkText
-            ? t.outputText
-              ? `${t.outputText}\n${chunkText}`
-              : chunkText
-            : rawOut || t.outputText;
+          let nextOutput = t.outputText;
+          if (chunkText) {
+            nextOutput = nextOutput ? `${nextOutput}\n${chunkText}` : chunkText;
+          } else if (rawOut) {
+            nextOutput =
+              nextOutput && nextOutput !== rawOut
+                ? `${nextOutput}\n${rawOut}`
+                : rawOut;
+          }
           return {
             ...t,
             title: upd.title ?? t.title,
@@ -335,6 +364,7 @@ export function applySessionEvent(
       break;
     }
     case "approval_requested": {
+      const syntheticTurn = !ev.turn_id;
       const turnId = ev.turn_id ?? `approval:${ev.approval.id}`;
       const idx = findOrCreateAssistantIndex(items, turnId, record.ts, record.seq);
       const current = items[idx];
@@ -343,7 +373,11 @@ export function applySessionEvent(
         const approvals = exists
           ? current.approvals
           : [...current.approvals, ev.approval];
-        items[idx] = { ...current, approvals };
+        items[idx] = {
+          ...current,
+          approvals,
+          completed: syntheticTurn ? true : current.completed,
+        };
       }
       break;
     }
@@ -409,6 +443,9 @@ export function applySessionEvent(
     }
     case "queue_item_removed": {
       queue = queue.filter((q) => q.id !== ev.queued_id);
+      if (queue.length === 0) {
+        queuePaused = false;
+      }
       break;
     }
     case "queue_reordered": {
@@ -470,6 +507,11 @@ export function applySessionEvent(
     }
   }
 
+  const boundedItems =
+    items.length > MAX_TIMELINE_ITEMS
+      ? items.slice(items.length - MAX_TIMELINE_ITEMS)
+      : items;
+
   const nextRaw =
     state.rawEvents.length >= MAX_RAW_INSPECTOR_EVENTS
       ? [...state.rawEvents.slice(-(MAX_RAW_INSPECTOR_EVENTS - 1)), record]
@@ -482,11 +524,11 @@ export function applySessionEvent(
     nativeSessionId,
     lastSeq: record.seq,
     dedupedCount: state.dedupedCount,
-    gapDetectedCount: state.gapDetectedCount + (hasGap ? 1 : 0),
+    gapDetectedCount: state.gapDetectedCount,
     queue,
     queuePaused,
     goal,
-    items,
+    items: boundedItems,
     rawEvents: nextRaw,
   };
 }

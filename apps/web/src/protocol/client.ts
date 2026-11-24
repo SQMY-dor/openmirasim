@@ -59,10 +59,12 @@ export interface EventSubscriptionHandlers {
   onHeadSeq?: (headSeq: number) => void;
   onReconnectAttempt?: (attempt: number) => void;
   onResync?: () => void;
+  onResetCursor?: () => void;
 }
 
 export interface EventSubscription {
   close: () => void;
+  resync?: () => void;
 }
 
 export interface OpenMirasimClient {

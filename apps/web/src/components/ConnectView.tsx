@@ -8,12 +8,14 @@ import {
   Sun,
   Trash2,
 } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
+  computeProfileId,
   deleteServerProfile,
   isTauriDesktop,
   listServerProfiles,
   loadProfileTokenFromKeychain,
+  normalizeServerUrl,
   saveProfileTokenToKeychain,
   saveServerProfile,
 } from "../desktop/tauriBridge";
@@ -26,7 +28,7 @@ interface ConnectViewProps {
   connecting: boolean;
   error: string | null;
   onToggleTheme: () => void;
-  onConnectServer: (serverUrl: string, token: string) => Promise<void>;
+  onConnectServer: (serverUrl: string, token: string) => Promise<boolean>;
   onEnterDemo: () => Promise<void>;
 }
 
@@ -44,50 +46,79 @@ export function ConnectView({
   const [token, setToken] = useState(initialToken);
   const [profiles, setProfiles] = useState<ServerProfile[]>([]);
   const [profileName, setProfileName] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const selectReqRef = useRef(0);
   const desktopMode = isTauriDesktop();
 
   useEffect(() => {
-    void listServerProfiles().then(setProfiles);
+    void listServerProfiles()
+      .then(setProfiles)
+      .catch((err) => {
+        setLocalError(err instanceof Error ? err.message : "读取服务器配置失败");
+      });
   }, []);
 
   const handleSelectProfile = async (profile: ServerProfile) => {
+    const reqId = ++selectReqRef.current;
+    setLocalError(null);
     setServerUrl(profile.serverUrl);
     setProfileName(profile.name);
+    // Clear the previous server's token immediately so it can never be sent to another host.
+    setToken("");
     const savedSecret = await loadProfileTokenFromKeychain(profile.id);
+    if (reqId !== selectReqRef.current) return;
     if (savedSecret) {
       setToken(savedSecret);
     }
   };
 
   const handleSaveProfile = async () => {
-    const cleanUrl = serverUrl.trim();
-    if (!cleanUrl) return;
-    const id = `prof_${cleanUrl.replace(/[^a-z0-9]/gi, "_").slice(0, 40)}`;
-    const name =
-      profileName.trim() ||
-      cleanUrl.replace(/^https?:\/\//i, "").slice(0, 28);
-    const updated = await saveServerProfile({ id, name, serverUrl: cleanUrl });
-    setProfiles(updated);
-    if (desktopMode && token.trim()) {
-      await saveProfileTokenToKeychain(id, token.trim());
+    setLocalError(null);
+    const rawUrl = serverUrl.trim();
+    if (!rawUrl) return;
+    try {
+      const cleanUrl = normalizeServerUrl(rawUrl);
+      const id = await computeProfileId(cleanUrl);
+      const name =
+        profileName.trim() ||
+        cleanUrl.replace(/^https?:\/\//i, "").slice(0, 28);
+      const updated = await saveServerProfile({ id, name, serverUrl: cleanUrl });
+      setProfiles(updated);
+      if (desktopMode && token.trim()) {
+        await saveProfileTokenToKeychain(id, token.trim());
+      }
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "保存服务器配置失败");
     }
   };
 
   const handleDeleteProfile = async (profileId: string) => {
-    const updated = await deleteServerProfile(profileId);
-    setProfiles(updated);
+    setLocalError(null);
+    try {
+      const updated = await deleteServerProfile(profileId);
+      setProfiles(updated);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "删除服务器配置失败");
+    }
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    setLocalError(null);
     if (!serverUrl.trim() || !token.trim()) return;
-    const cleanUrl = serverUrl.trim();
+    let cleanUrl: string;
+    try {
+      cleanUrl = normalizeServerUrl(serverUrl);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "服务器地址无效");
+      return;
+    }
     const cleanToken = token.trim();
-    if (desktopMode) {
-      const id = `prof_${cleanUrl.replace(/[^a-z0-9]/gi, "_").slice(0, 40)}`;
+    const ok = await onConnectServer(cleanUrl, cleanToken);
+    if (ok && desktopMode) {
+      const id = await computeProfileId(cleanUrl);
       await saveProfileTokenToKeychain(id, cleanToken);
     }
-    void onConnectServer(cleanUrl, cleanToken);
   };
 
   return (
@@ -149,10 +180,10 @@ export function ConnectView({
           </div>
         )}
 
-        {error && (
+        {(localError || error) && (
           <div className="error-banner" role="alert" id="connect-error">
             <AlertCircle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
-            <span>{error}</span>
+            <span>{localError || error}</span>
           </div>
         )}
 

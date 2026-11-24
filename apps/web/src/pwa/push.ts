@@ -109,11 +109,58 @@ export async function enableApprovalPush(
         return { ok: true, detail: "已启用 Web Push 远程审批推送" };
       }
     }
-  } catch {
-    // Fallback cleanly to local Service Worker notifications (e.g. HTTP localhost without VAPID)
+  } catch (err) {
+    return {
+      ok: true,
+      detail: `已启用本地浏览器审批通知（远程 Web Push 注册失败：${err instanceof Error ? err.message : "未知错误"}）`,
+    };
   }
 
   return { ok: true, detail: "已启用 PWA Service Worker 审批通知" };
+}
+
+/**
+ * Disables browser / PWA approval notifications, unsubscribes the local PushManager
+ * subscription, and removes the matching server-side push subscription record.
+ */
+export async function disableApprovalPush(
+  client: OpenMirasimClient
+): Promise<{ ok: boolean; detail: string }> {
+  savePushPreference(false);
+  let endpointToDelete: string | null = null;
+  if (typeof window !== "undefined" && "serviceWorker" in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg && "pushManager" in reg) {
+        const sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          endpointToDelete = sub.endpoint;
+          await sub.unsubscribe().catch(() => false);
+        }
+      }
+    } catch {
+      // ignore local PushManager cleanup errors
+    }
+  }
+  if (endpointToDelete) {
+    try {
+      const subs = await client.listPushSubscriptions();
+      for (const s of subs) {
+        if (s.endpoint === endpointToDelete) {
+          await client.deletePushSubscription(s.id);
+        }
+      }
+    } catch (err) {
+      return {
+        ok: false,
+        detail:
+          err instanceof Error
+            ? `已关闭本地通知，但服务端退订失败：${err.message}`
+            : "已关闭本地通知，但服务端退订失败",
+      };
+    }
+  }
+  return { ok: true, detail: "已关闭审批推送提醒并同步退订" };
 }
 
 /**
@@ -190,6 +237,7 @@ export function subscribeServiceWorkerActions(handlers: {
     return () => {};
   }
   const listener = (event: MessageEvent) => {
+    if (event.origin && event.origin !== window.location.origin) return;
     const payload = event.data as Record<string, unknown> | null;
     if (!payload || typeof payload !== "object") return;
     if (

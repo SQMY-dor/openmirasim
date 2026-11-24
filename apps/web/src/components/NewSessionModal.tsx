@@ -14,9 +14,10 @@ interface NewSessionModalProps {
   creating: boolean;
   harnesses: HarnessDescriptor[];
   workspaces: WorkspaceSummary[];
+  canManageWorkspaces?: boolean;
   onRegisterWorkspace: (name: string, repoPath: string) => Promise<WorkspaceSummary>;
   onClose: () => void;
-  onCreate: (req: CreateSessionRequest) => Promise<void>;
+  onCreate: (req: CreateSessionRequest) => Promise<boolean>;
 }
 
 export function NewSessionModal({
@@ -24,6 +25,7 @@ export function NewSessionModal({
   creating,
   harnesses,
   workspaces,
+  canManageWorkspaces = true,
   onRegisterWorkspace,
   onClose,
   onCreate,
@@ -46,6 +48,7 @@ export function NewSessionModal({
   const [newWsName, setNewWsName] = useState("");
   const [newWsPath, setNewWsPath] = useState("");
   const [wsError, setWsError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [registeringWs, setRegisteringWs] = useState(false);
 
   useEffect(() => {
@@ -53,6 +56,16 @@ export function NewSessionModal({
       setHarnessId(catalog[0].id);
     }
   }, [catalog, harnessId]);
+
+  useEffect(() => {
+    if (!open) return;
+    setCreateError(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   if (!open) return null;
 
@@ -80,8 +93,9 @@ export function NewSessionModal({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    setCreateError(null);
     const selectedWs = workspaces.find((w) => w.id === workspaceId);
-    await onCreate({
+    const ok = await onCreate({
       config: {
         harness_id: harnessId,
         cwd: selectedWs?.repo_path ?? (cwd.trim() || "/srv/workspaces/openmirasim"),
@@ -90,8 +104,12 @@ export function NewSessionModal({
         ...(title.trim() ? { title: title.trim() } : {}),
       },
     });
-    setTitle("");
-    onClose();
+    if (ok) {
+      setTitle("");
+      onClose();
+    } else {
+      setCreateError("创建会话失败，请检查顶部错误提示后重试");
+    }
   };
 
   return (
@@ -116,6 +134,11 @@ export function NewSessionModal({
         </div>
 
         <form onSubmit={(e) => void handleSubmit(e)}>
+          {createError && (
+            <div className="error-banner" role="alert" style={{ marginBottom: 10 }}>
+              <span>{createError}</span>
+            </div>
+          )}
           <div className="field">
             <label htmlFor="new-session-title">会话标题（可选）</label>
             <input
@@ -165,18 +188,20 @@ export function NewSessionModal({
           <div className="field">
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
               <label htmlFor="new-session-workspace">Git 工作区（自动隔离 Worktree）</label>
-              <button
-                type="button"
-                id="toggle-register-workspace-btn"
-                className="btn btn-ghost btn-sm"
-                onClick={() => {
-                  setAddingWs((v) => !v);
-                  setWsError(null);
-                }}
-              >
-                <Plus size={12} />
-                <span>{addingWs ? "收起" : "注册仓库"}</span>
-              </button>
+              {canManageWorkspaces && (
+                <button
+                  type="button"
+                  id="toggle-register-workspace-btn"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    setAddingWs((v) => !v);
+                    setWsError(null);
+                  }}
+                >
+                  <Plus size={12} />
+                  <span>{addingWs ? "收起" : "注册仓库"}</span>
+                </button>
+              )}
             </div>
             <select
               id="new-session-workspace"
@@ -210,6 +235,12 @@ export function NewSessionModal({
                   placeholder="工作区名称（如 openmirasim）"
                   value={newWsName}
                   onChange={(e) => setNewWsName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleRegisterWorkspace();
+                    }
+                  }}
                   style={{ marginBottom: 6 }}
                 />
                 <input
@@ -219,6 +250,12 @@ export function NewSessionModal({
                   placeholder="宿主机仓库绝对路径（如 /srv/repos/app）"
                   value={newWsPath}
                   onChange={(e) => setNewWsPath(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleRegisterWorkspace();
+                    }
+                  }}
                   style={{ marginBottom: 8 }}
                 />
                 <button

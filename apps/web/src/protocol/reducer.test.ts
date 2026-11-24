@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { computeProfileId, normalizeServerUrl } from "../desktop/tauriBridge";
 import { computeBackoffMs } from "./client";
 import {
   applySessionEvent,
   applySessionEvents,
   createEmptyProjection,
 } from "./reducer";
-import type { EventPayload, SessionEvent } from "./types";
+import { isSafeHttpUrl, type EventPayload, type SessionEvent } from "./types";
 
 const TS = 1_763_865_900_000;
 
@@ -327,8 +328,108 @@ describe("om-core SessionEvent projection (ts-rs contract)", () => {
         "s1"
       )
     );
-    expect(state.lastSeq).toBe(4);
+    // On a sequence gap, lastSeq MUST stay at the last contiguous sequence number
+    // so a Subscribe { last_seq: 1 } resync recovers events 2 and 3 without loss.
+    expect(state.lastSeq).toBe(1);
     expect(state.gapDetectedCount).toBe(1);
+
+    state = applySessionEvents(state, [
+      ev(2, {
+        type: "agent_message_chunk",
+        turn_id: "t1",
+        content: { type: "text", text: "," },
+      }),
+      ev(3, {
+        type: "agent_message_chunk",
+        turn_id: "t1",
+        content: { type: "text", text: " " },
+      }),
+      ev(4, {
+        type: "agent_message_chunk",
+        turn_id: "t1",
+        content: { type: "text", text: "world" },
+      }),
+    ]);
+    expect(state.lastSeq).toBe(4);
+    const assistant = state.items[0];
+    if (assistant.kind === "assistant") {
+      expect(assistant.text).toBe("hello, world");
+    }
+  });
+
+  it("preserves tool_call streamed output on raw_output update and clears queuePaused when emptied", () => {
+    let state = createEmptyProjection("s1", "running");
+    state = applySessionEvents(state, [
+      ev(1, {
+        type: "tool_call",
+        turn_id: "t1",
+        tool_call: {
+          tool_call_id: "c1",
+          title: "Run cargo test",
+          kind: "execute",
+          status: "in_progress",
+        },
+      }),
+      ev(2, {
+        type: "tool_call_update",
+        turn_id: "t1",
+        update: {
+          tool_call_id: "c1",
+          content: [{ type: "text", text: "stream line 1" }],
+        },
+      }),
+      ev(3, {
+        type: "tool_call_update",
+        turn_id: "t1",
+        update: {
+          tool_call_id: "c1",
+          status: "completed",
+          raw_output: { exit_code: 0 },
+        },
+      }),
+      ev(4, {
+        type: "prompt_queued",
+        position: 0,
+        queued: {
+          id: "q1",
+          member_id: "alice",
+          prompt: { content: [{ type: "text", text: "next" }] },
+          mode: "queue",
+          created_at: TS,
+        },
+      }),
+      ev(5, { type: "queue_paused", paused: true }),
+      ev(6, {
+        type: "queue_item_removed",
+        queued_id: "q1",
+        reason: { reason: "withdrawn" },
+      }),
+    ]);
+
+    expect(state.queue).toHaveLength(0);
+    expect(state.queuePaused).toBe(false);
+    const assistant = state.items[0];
+    if (assistant.kind === "assistant") {
+      expect(assistant.toolCalls[0].outputText).toContain("stream line 1");
+      expect(assistant.toolCalls[0].outputText).toContain("exit_code");
+    }
+  });
+
+  it("validates http/https URLs and derives collision-free profile IDs", async () => {
+    expect(isSafeHttpUrl("https://om.internal:4939/takeover/1")).toBe(true);
+    expect(isSafeHttpUrl("http://127.0.0.1:4939/takeover/1")).toBe(true);
+    expect(isSafeHttpUrl("javascript:alert(1)")).toBe(false);
+    expect(isSafeHttpUrl("data:text/html,<script>alert(1)</script>")).toBe(false);
+
+    expect(normalizeServerUrl("https://om.internal:4939///")).toBe(
+      "https://om.internal:4939"
+    );
+    expect(() => normalizeServerUrl("javascript:alert(1)")).toThrow();
+
+    const idA = await computeProfileId("https://very-long-internal-host-a.corp.example.com:4939/env/alpha");
+    const idB = await computeProfileId("https://very-long-internal-host-a.corp.example.com:4939/env/beta");
+    expect(idA).not.toBe(idB);
+    expect(idA).toMatch(/^srv_[a-z0-9_]+$/);
   });
 
   it("caps reconnect backoff", () => {

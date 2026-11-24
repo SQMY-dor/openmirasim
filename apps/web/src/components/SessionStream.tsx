@@ -14,7 +14,7 @@ import {
   Wrench,
   XCircle,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { ProjectedToolCall, TimelineItem } from "../protocol/reducer";
 import type {
   ApprovalDecision,
@@ -27,6 +27,8 @@ import { MarkdownContent } from "./MarkdownContent";
 interface SessionStreamProps {
   harnessId: string;
   items: TimelineItem[];
+  canResolveApproval?: boolean;
+  highlightedApprovalId?: string | null;
   onResolveApproval: (
     approvalId: ApprovalId,
     decision: ApprovalDecision
@@ -140,19 +142,33 @@ function ToolCallCard({ tool }: { tool: ProjectedToolCall }) {
   );
 }
 
-function ApprovalCard({
+const ApprovalCard = memo(function ApprovalCard({
   approval,
+  canResolve,
+  highlighted,
   onResolve,
 }: {
   approval: ApprovalRecord;
+  canResolve: boolean;
+  highlighted: boolean;
   onResolve: (
     approvalId: ApprovalId,
     decision: ApprovalDecision
   ) => Promise<void>;
 }) {
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (highlighted && cardRef.current && typeof cardRef.current.scrollIntoView === "function") {
+      cardRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [highlighted]);
 
   const handleSelectOption = async (optionId: string) => {
+    if (!canResolve || submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await onResolve(approval.id, {
@@ -160,6 +176,7 @@ function ApprovalCard({
         option_id: optionId,
       });
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
@@ -180,7 +197,9 @@ function ApprovalCard({
 
   return (
     <div
+      ref={cardRef}
       className={`approval-card ${resolved ? (rejected ? "rejected" : "resolved") : ""}`}
+      style={highlighted ? { outline: "2px solid var(--accent)" } : undefined}
       data-approval-id={approval.id}
     >
       <div className="approval-head">
@@ -213,6 +232,10 @@ function ApprovalCard({
           {approval.resolved_by ? ` · 处理人：${approval.resolved_by}` : ""}
           {approval.resolved_at ? ` · ${formatTime(approval.resolved_at)}` : ""}
         </div>
+      ) : !canResolve ? (
+        <div className="approval-resolved-note">
+          只读观察者模式（Viewer）：等待有权限的成员确认审批。
+        </div>
       ) : (
         <div className="approval-actions">
           {approval.options.map((opt) => {
@@ -241,7 +264,7 @@ function ApprovalCard({
       )}
     </div>
   );
-}
+});
 
 function ThinkingStrip({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
@@ -261,9 +284,77 @@ function ThinkingStrip({ text }: { text: string }) {
   );
 }
 
+const AssistantTurn = memo(function AssistantTurn({
+  harnessId,
+  item,
+  canResolveApproval,
+  highlightedApprovalId,
+  onResolveApproval,
+}: {
+  harnessId: string;
+  item: Extract<TimelineItem, { kind: "assistant" }>;
+  canResolveApproval: boolean;
+  highlightedApprovalId: string | null;
+  onResolveApproval: (
+    approvalId: ApprovalId,
+    decision: ApprovalDecision
+  ) => Promise<void>;
+}) {
+  return (
+    <article
+      className="turn-assistant"
+      data-turn-kind="assistant"
+      data-completed={item.completed ? "true" : "false"}
+    >
+      <div className="turn-assistant-meta">
+        <strong>{harnessId}</strong>
+        <span>seq #{item.seq}</span>
+        <span>{formatTime(item.ts)}</span>
+        {item.completed && item.stopReason === "cancelled" && (
+          <span className="chip err">已中断</span>
+        )}
+        {item.completed && item.stopReason === "failed" && (
+          <span className="chip err">执行失败</span>
+        )}
+      </div>
+
+      {item.plan.length > 0 && <PlanStrip entries={item.plan} />}
+
+      {item.thinking && <ThinkingStrip text={item.thinking} />}
+
+      {item.toolCalls.map((tool) => (
+        <ToolCallCard key={tool.tool_call_id} tool={tool} />
+      ))}
+
+      {item.approvals.map((approval) => (
+        <ApprovalCard
+          key={approval.id}
+          approval={approval}
+          canResolve={canResolveApproval}
+          highlighted={highlightedApprovalId === approval.id}
+          onResolve={onResolveApproval}
+        />
+      ))}
+
+      {item.turnError && (
+        <div className="error-banner" role="alert">
+          <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+          <span>{item.turnError}</span>
+        </div>
+      )}
+
+      {(item.text || !item.completed) && (
+        <MarkdownContent text={item.text} streaming={!item.completed} />
+      )}
+    </article>
+  );
+});
+
 export function SessionStream({
   harnessId,
   items,
+  canResolveApproval = true,
+  highlightedApprovalId = null,
   onResolveApproval,
 }: SessionStreamProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -384,51 +475,14 @@ export function SessionStream({
           }
 
           return (
-            <article
+            <AssistantTurn
               key={item.id}
-              className="turn-assistant"
-              data-turn-kind="assistant"
-              data-completed={item.completed ? "true" : "false"}
-            >
-              <div className="turn-assistant-meta">
-                <strong>{harnessId}</strong>
-                <span>seq #{item.seq}</span>
-                <span>{formatTime(item.ts)}</span>
-                {item.completed && item.stopReason === "cancelled" && (
-                  <span className="chip err">已中断</span>
-                )}
-                {item.completed && item.stopReason === "failed" && (
-                  <span className="chip err">执行失败</span>
-                )}
-              </div>
-
-              {item.plan.length > 0 && <PlanStrip entries={item.plan} />}
-
-              {item.thinking && <ThinkingStrip text={item.thinking} />}
-
-              {item.toolCalls.map((tool) => (
-                <ToolCallCard key={tool.tool_call_id} tool={tool} />
-              ))}
-
-              {item.approvals.map((approval) => (
-                <ApprovalCard
-                  key={approval.id}
-                  approval={approval}
-                  onResolve={onResolveApproval}
-                />
-              ))}
-
-              {item.turnError && (
-                <div className="error-banner" role="alert">
-                  <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-                  <span>{item.turnError}</span>
-                </div>
-              )}
-
-              {(item.text || !item.completed) && (
-                <MarkdownContent text={item.text} streaming={!item.completed} />
-              )}
-            </article>
+              harnessId={harnessId}
+              item={item}
+              canResolveApproval={canResolveApproval}
+              highlightedApprovalId={highlightedApprovalId}
+              onResolveApproval={onResolveApproval}
+            />
           );
         })}
       </div>

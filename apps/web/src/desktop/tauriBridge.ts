@@ -28,6 +28,46 @@ export function isTauriDesktop(): boolean {
   return getTauriInternals() !== null;
 }
 
+export function normalizeServerUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error("服务器地址无效，请使用完整的 http:// 或 https:// URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("仅允许 http:// 或 https:// 服务器地址");
+  }
+  return trimmed;
+}
+
+/** Deterministic, collision-free ASCII profile ID derived from the normalized server URL. */
+export async function computeProfileId(rawUrl: string): Promise<string> {
+  const normalized = rawUrl.trim().replace(/\/+$/, "").toLowerCase();
+  if (typeof crypto !== "undefined" && crypto.subtle) {
+    try {
+      const data = new TextEncoder().encode(normalized);
+      const digest = await crypto.subtle.digest("SHA-256", data);
+      const hex = Array.from(new Uint8Array(digest))
+        .slice(0, 16)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      return `srv_${hex}`;
+    } catch {
+      // fall through to deterministic dual-64-bit hash when subtle crypto is unavailable
+    }
+  }
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < normalized.length; i += 1) {
+    const code = normalized.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 0x01000193);
+    h2 = Math.imul(h2 ^ (code + i), 0x85ebca6b);
+  }
+  return `srv_${(h1 >>> 0).toString(16).padStart(8, "0")}${(h2 >>> 0).toString(16).padStart(8, "0")}_${normalized.length}`;
+}
+
 function readBrowserProfiles(): ServerProfile[] {
   try {
     const raw = window.localStorage.getItem(PROFILES_STORAGE_KEY);
@@ -50,11 +90,7 @@ function writeBrowserProfiles(profiles: ServerProfile[]): void {
 export async function listServerProfiles(): Promise<ServerProfile[]> {
   const tauri = getTauriInternals();
   if (tauri) {
-    try {
-      return await tauri.invoke<ServerProfile[]>("list_server_profiles");
-    } catch {
-      // fallback to browser storage if desktop command unavailable
-    }
+    return await tauri.invoke<ServerProfile[]>("list_server_profiles");
   }
   return readBrowserProfiles();
 }
@@ -62,21 +98,18 @@ export async function listServerProfiles(): Promise<ServerProfile[]> {
 export async function saveServerProfile(
   profile: Omit<ServerProfile, "lastUsedAt">
 ): Promise<ServerProfile[]> {
+  const serverUrl = normalizeServerUrl(profile.serverUrl);
   const entry: ServerProfile = {
     ...profile,
-    serverUrl: profile.serverUrl.trim().replace(/\/+$/, ""),
+    serverUrl,
     lastUsedAt: Date.now(),
   };
 
   const tauri = getTauriInternals();
   if (tauri) {
-    try {
-      return await tauri.invoke<ServerProfile[]>("save_server_profile", {
-        profile: entry,
-      });
-    } catch {
-      // fallback
-    }
+    return await tauri.invoke<ServerProfile[]>("save_server_profile", {
+      profile: entry,
+    });
   }
 
   const existing = readBrowserProfiles().filter(
@@ -92,14 +125,10 @@ export async function deleteServerProfile(
 ): Promise<ServerProfile[]> {
   const tauri = getTauriInternals();
   if (tauri) {
-    try {
-      await tauri.invoke("delete_profile_token", { profileId }).catch(() => {});
-      return await tauri.invoke<ServerProfile[]>("delete_server_profile", {
-        profileId,
-      });
-    } catch {
-      // fallback
-    }
+    await tauri.invoke("delete_profile_token", { profileId });
+    return await tauri.invoke<ServerProfile[]>("delete_server_profile", {
+      profileId,
+    });
   }
   const next = readBrowserProfiles().filter((p) => p.id !== profileId);
   writeBrowserProfiles(next);
