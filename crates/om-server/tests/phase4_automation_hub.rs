@@ -26,7 +26,8 @@ use om_core::session::{SessionConfig, SessionSummary};
 use om_core::workspace::WorkspaceSummary;
 use om_server::api::hub::{
     CreateMcpServerRequest, CreateSkillRequest, EffectiveHubResponse, HubScopeLevel,
-    McpProbeResult, McpServerRecord, McpTransport, SkillLifecycle, SkillRecord, UpdateSkillRequest,
+    McpProbeResult, McpServerRecord, McpTransport, SkillLifecycle, SkillRecord,
+    UpdateMcpServerRequest, UpdateSkillRequest,
 };
 use om_server::api::{ApiConfig, ApiExtensions, AppState, build_router_with_extensions};
 use om_server::auth::Auth;

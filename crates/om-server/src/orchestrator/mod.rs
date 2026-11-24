@@ -741,7 +741,8 @@ impl Orchestrator {
         self.live_sender(id).is_some()
     }
 
-    /// Gracefully stops all live actors during server shutdown.
+    /// Gracefully stops all live actors during server shutdown without permanently
+    /// closing sessions (so interrupted sessions remain resumable after restart).
     pub async fn shutdown_all(&self) {
         let senders: Vec<mpsc::Sender<Command>> = {
             let map = self
@@ -750,11 +751,17 @@ impl Orchestrator {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.values().filter_map(|e| e.tx.clone()).collect()
         };
+        let mut waiters = Vec::with_capacity(senders.len());
         for tx in senders {
             let (reply, rx) = oneshot::channel();
-            if tx.send(Command::Close { reply }).await.is_ok() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), rx).await;
+            if tx.send(Command::Shutdown { reply }).await.is_ok() {
+                waiters.push(rx);
             }
         }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            futures::future::join_all(waiters),
+        )
+        .await;
     }
 }

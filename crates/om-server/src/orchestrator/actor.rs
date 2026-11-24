@@ -41,6 +41,10 @@ pub(crate) enum Command {
     Close {
         reply: oneshot::Sender<CoreResult<()>>,
     },
+    /// Server shutdown: terminate the live harness process without permanently closing the session.
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
     Send {
         member: Option<MemberId>,
         prompt: Prompt,
@@ -909,6 +913,7 @@ pub(crate) async fn run(
     const MAX_STARTUP_BUFFERED: usize = 64;
     let mut buffered = Vec::new();
     let mut close_reply = None;
+    let mut shutdown_reply = None;
     let start_ctx = StartContext {
         session_id: spec.session_id.clone(),
         config: spec.config.clone(),
@@ -925,6 +930,10 @@ pub(crate) async fn run(
                 cmd = commands.recv() => match cmd {
                     Some(Command::Close { reply }) => {
                         close_reply = Some(reply);
+                        break None;
+                    }
+                    Some(Command::Shutdown { reply }) => {
+                        shutdown_reply = Some(reply);
                         break None;
                     }
                     Some(other) => {
@@ -1004,8 +1013,13 @@ pub(crate) async fn run(
                     actor.status = s.status;
                 }
                 let _ = reply.send(actor.on_close().await);
-            } else if let Some(s) = actor.session.take() {
-                let _ = s.shutdown().await;
+            } else {
+                if let Some(s) = actor.session.take() {
+                    let _ = s.shutdown().await;
+                }
+                if let Some(reply) = shutdown_reply {
+                    let _ = reply.send(());
+                }
             }
             commands.close();
             for cmd in buffered {
@@ -1102,6 +1116,13 @@ async fn handle_command(actor: &mut Actor, cmd: Command) -> bool {
             let _ = reply.send(actor.on_close().await);
             true
         }
+        Command::Shutdown { reply } => {
+            if let Some(s) = actor.session.take() {
+                let _ = s.shutdown().await;
+            }
+            let _ = reply.send(());
+            true
+        }
         Command::Send {
             member,
             prompt,
@@ -1163,6 +1184,9 @@ fn reject(cmd: Command, err: CoreError) {
         }
         Command::ResolveApproval { reply, .. } => {
             let _ = reply.send(Err(CoreError::InvalidInput(msg)));
+        }
+        Command::Shutdown { reply } => {
+            let _ = reply.send(());
         }
     }
 }
