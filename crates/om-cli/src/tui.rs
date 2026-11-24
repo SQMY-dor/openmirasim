@@ -640,8 +640,14 @@ fn spawn_event_watcher(
                                 break;
                             }
                         }
-                        ServerMessage::Error { session_id: err_sid, error } => {
-                            if err_sid.as_ref().is_some_and(|sid| sid.as_str() != session_id) {
+                        ServerMessage::Error {
+                            session_id: err_sid,
+                            error,
+                        } => {
+                            if err_sid
+                                .as_ref()
+                                .is_some_and(|sid| sid.as_str() != session_id)
+                            {
                                 continue;
                             }
                             let code = format!("{:?}", error.code).to_lowercase();
